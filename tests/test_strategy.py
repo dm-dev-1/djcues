@@ -1,5 +1,5 @@
 import pytest
-from djcues.models import BeatGrid, CuePoint, Phrase, Track, CueProposal
+from djcues.models import BeatGrid, CuePoint, Phrase, Track, CueProposal, WaveformPoint
 from djcues.strategy import CueStrategy
 
 
@@ -235,3 +235,111 @@ def test_no_chorus_flags_low_confidence(beat_grid: BeatGrid):
     assert 8 in kinds  # G (Outro)
     if 5 in kinds:
         assert proposal.confidence["D"] < 0.5
+
+
+def test_drop_threshold_is_20_percent_not_25_percent(beat_grid: BeatGrid):
+    """Drop's minimum threshold is 20% into the track (empirically tuned,
+    see commit 2b6cd36), not 25% — the docstring used to say otherwise."""
+    bg = beat_grid
+    duration_ms = 100000.0
+    chorus_pos = duration_ms * 0.22  # included at 20%, would be excluded at 25%
+    phrases = [
+        Phrase(beat_start=1, beat_end=100, kind=1, label="Intro",
+               position_ms=0.0, duration_ms=chorus_pos),
+        Phrase(beat_start=100, beat_end=400, kind=5, label="Chorus",
+               position_ms=chorus_pos, duration_ms=duration_ms - chorus_pos),
+    ]
+    track = Track(
+        id=99, title="Threshold Test", artist="Test", bpm=128.0,
+        duration_ms=duration_ms, analysis_path="", cues=[], phrases=phrases,
+        beat_grid=bg,
+    )
+    strategy = CueStrategy()
+    proposal = strategy.propose(track)
+    hot_d = next(c for c in proposal.hot_cues if c.kind == 5)
+    assert hot_d.position_ms == chorus_pos
+
+
+def test_loop_out_confidence_follows_outro_when_real_outro_found(world_gone_wild: Track):
+    """H's confidence should match G's when a real Outro phrase was found."""
+    strategy = CueStrategy()
+    proposal = strategy.propose(world_gone_wild)
+    assert proposal.confidence["G"] == 0.9
+    assert proposal.confidence["H"] == proposal.confidence["G"]
+
+
+def test_loop_out_confidence_follows_outro_fallback(beat_grid: BeatGrid):
+    """H's confidence should match G's fallback confidence when no Outro phrase exists."""
+    bg = beat_grid
+    phrases = [
+        Phrase(beat_start=1, beat_end=65, kind=1, label="Intro",
+               position_ms=bg.beat_to_ms(1), duration_ms=bg.bars_to_ms(16)),
+        Phrase(beat_start=65, beat_end=129, kind=5, label="Chorus",
+               position_ms=bg.beat_to_ms(65), duration_ms=bg.bars_to_ms(16)),
+    ]
+    track = Track(
+        id=99, title="No Outro", artist="Test", bpm=128.0,
+        duration_ms=120000.0, analysis_path="", cues=[], phrases=phrases,
+        beat_grid=bg,
+    )
+    strategy = CueStrategy()
+    proposal = strategy.propose(track)
+    assert proposal.confidence["G"] == 0.4
+    assert proposal.confidence["H"] == 0.4
+
+
+def test_loop_out_confidence_zero_with_no_phrases(beat_grid: BeatGrid):
+    """H stays at confidence 0.0 when there's no G to anchor from."""
+    track = Track(
+        id=99, title="Empty", artist="Test", bpm=128.0,
+        duration_ms=60000.0, analysis_path="", cues=[], phrases=[],
+        beat_grid=beat_grid,
+    )
+    strategy = CueStrategy()
+    proposal = strategy.propose(track)
+    assert proposal.confidence["G"] == 0.0
+    assert proposal.confidence["H"] == 0.0
+
+
+def test_special_uses_waveform_energy_recovery_with_scaled_confidence(beat_grid: BeatGrid):
+    """F's primary energy-recovery path (previously untested — the shared
+    world_gone_wild fixture has no waveform data) should place the cue at
+    the recovery phrase and scale confidence by how decisively energy
+    returned to peak, not a flat constant."""
+    bg = beat_grid
+    duration_ms = 200000.0
+    # 5 equal phrases: Intro / Chorus(Drop) / Down(dip) / Chorus(recovery) / Outro
+    phrases = [
+        Phrase(beat_start=1, beat_end=100, kind=1, label="Intro",
+               position_ms=0.0, duration_ms=40000.0),
+        Phrase(beat_start=100, beat_end=200, kind=5, label="Chorus",
+               position_ms=40000.0, duration_ms=40000.0),
+        Phrase(beat_start=200, beat_end=300, kind=3, label="Down",
+               position_ms=80000.0, duration_ms=40000.0),
+        Phrase(beat_start=300, beat_end=400, kind=5, label="Chorus",
+               position_ms=120000.0, duration_ms=40000.0),
+        Phrase(beat_start=400, beat_end=500, kind=6, label="Outro",
+               position_ms=160000.0, duration_ms=40000.0),
+    ]
+    # 100 waveform points, each covering 1% of the track (2000ms).
+    heights = (
+        [0.5] * 20   # Intro: 0-20%
+        + [0.9] * 20  # Chorus/Drop: 20-40% -> sets peak_energy
+        + [0.3] * 20  # Down: 40-60% -> dip, well below 0.75*peak
+        + [0.9] * 20  # Chorus/recovery: 60-80% -> full return to peak
+        + [0.5] * 20  # Outro: 80-100%
+    )
+    waveform = [WaveformPoint(height=h, red=4, green=4, blue=4) for h in heights]
+    track = Track(
+        id=99, title="Waveform Test", artist="Test", bpm=128.0,
+        duration_ms=duration_ms, analysis_path="", cues=[], phrases=phrases,
+        beat_grid=bg, waveform=waveform,
+    )
+    strategy = CueStrategy()
+    proposal = strategy.propose(track)
+    hot_f = next(c for c in proposal.hot_cues if c.kind == 7)
+    assert hot_f.position_ms == 120000.0  # the recovery Chorus, not the fallback
+    # peak_energy=0.9, recovery_threshold=0.765; the recovery phrase's energy
+    # (0.9) fully cleared it, so confidence should be at the top of the
+    # scaled 0.6-0.85 band, and strictly above the old flat 0.75.
+    assert proposal.confidence["F"] == pytest.approx(0.85)

@@ -3,101 +3,7 @@
 from __future__ import annotations
 
 from djcues.constants import CUE_SYSTEM, CUE_SYSTEM_BY_PAD
-from djcues.models import BeatGrid, CuePoint, CueProposal, Phrase, Track
-
-
-def _spectral_similarity(wf_points: list, i0: int, i_mid: int, i1: int) -> float:
-    """Compare the RGB (bass/mid/treble) profile of two halves of a waveform section.
-
-    Returns a similarity score from 0.0 (completely different) to 1.0 (identical).
-    Uses mean-squared-error of the per-point RGB values, normalized.
-    """
-    half_len = min(i_mid - i0, i1 - i_mid)
-    if half_len < 2:
-        return 0.0
-
-    first_half = wf_points[i0 : i0 + half_len]
-    second_half = wf_points[i_mid : i_mid + half_len]
-
-    total_mse = 0.0
-    for a, b in zip(first_half, second_half):
-        # RGB values are 0-7, normalize to 0-1
-        dr = (a.red - b.red) / 7
-        dg = (a.green - b.green) / 7
-        db = (a.blue - b.blue) / 7
-        dh = a.height - b.height  # already 0-1
-        total_mse += dr * dr + dg * dg + db * db + dh * dh
-
-    # Max possible MSE per point = 4 (all channels off by 1.0)
-    mse = total_mse / half_len / 4
-    return max(0.0, 1.0 - mse)
-
-
-def _find_stable_loop(
-    track: Track,
-    search_start_ms: float,
-    search_end_ms: float,
-    bar_sizes: tuple[int, ...] = (8, 4, 2, 1),
-    min_energy: float = 0.05,
-    min_similarity: float = 0.7,
-) -> tuple[float, int, float] | None:
-    """Find a stable, loopable region using waveform energy and spectral similarity.
-
-    Scans bar-aligned windows from search_start_ms forward. Tries 8 bars first,
-    then falls back to 4, 2, 1. A good loop has non-trivial energy AND the
-    second half spectrally matches the first half (so the loop repeats cleanly).
-
-    Returns (position_ms, loop_bars, similarity_score) or None if nothing found.
-    """
-    if not track.waveform:
-        return None
-
-    bg = track.beat_grid
-    n = len(track.waveform)
-    total_ms = track.duration_ms
-    if total_ms <= 0 or n == 0:
-        return None
-
-    for loop_bars in bar_sizes:
-        loop_ms = bg.bars_to_ms(loop_bars)
-        best_pos = None
-        best_score = 0.0
-
-        # Snap search start to bar boundary
-        start_beat = bg.ms_to_beat(search_start_ms)
-        bar_start = ((start_beat - 1) // 4) * 4 + 1
-        pos_ms = bg.beat_to_ms(bar_start)
-
-        while pos_ms + loop_ms <= search_end_ms and pos_ms + loop_ms <= total_ms:
-            # Map to waveform indices
-            i0 = int(n * pos_ms / total_ms)
-            i1 = int(n * (pos_ms + loop_ms) / total_ms)
-            i_mid = (i0 + i1) // 2
-            if i1 - i0 < 4:
-                pos_ms += bg.bars_to_ms(1)
-                continue
-
-            # Check energy
-            heights = [p.height for p in track.waveform[i0:i1]]
-            mean_e = sum(heights) / len(heights)
-            if mean_e < min_energy:
-                pos_ms += bg.bars_to_ms(1)
-                continue
-
-            # Check spectral similarity between halves
-            similarity = _spectral_similarity(track.waveform, i0, i_mid, i1)
-            if similarity > best_score:
-                best_score = similarity
-                best_pos = pos_ms
-
-            pos_ms += bg.bars_to_ms(1)
-
-        if best_pos is not None and best_score >= min_similarity:
-            return (best_pos, loop_bars, best_score)
-
-            pos_ms += bg.bars_to_ms(1)  # slide by 1 bar
-
-    return None
+from djcues.models import CuePoint, CueProposal, Phrase, Track
 
 
 class CueStrategy:
@@ -130,16 +36,18 @@ class CueStrategy:
 
         # --- B: Loop In (same as First Beat) ---
         # Data shows 88% of the time users loop at the First Beat.
-        # Spectral similarity is noted for reference but doesn't override.
+        # A spectral-similarity-based position override was tried and reverted
+        # after measurably hurting accuracy (88% -> 56%); see commit 9a70f78.
         positions["B"] = positions["A"]
         confidence["B"] = 0.6
         notes.append("B (Loop In): same position as First Beat")
 
-        # --- D: Drop (first Chorus or Up after ~25% of track) ---
+        # --- D: Drop (first Chorus or Up after 20% of track) ---
         # The Drop is the first major energy peak after the intro section.
         # Data shows it's typically around 30% into the track (median).
         # Look for the first Chorus (or Up preceded by a Chorus) that's
-        # at least 25% into the track. Fallback to first Chorus after
+        # at least 20% into the track — empirically tuned (D accuracy
+        # 54% -> 71%, see commit 2b6cd36). Fallback to first Chorus after
         # the first Up→Chorus cycle.
         choruses = [p for p in phrases if p.label == "Chorus"]
         drop_candidates = [p for p in phrases if p.label in ("Chorus", "Up")]
@@ -298,7 +206,7 @@ class CueStrategy:
 
                 # Find ALL dip→recovery cycles after the Drop.
                 # The second drop is the LAST recovery before the Outro.
-                recoveries: list[Phrase] = []
+                recoveries: list[tuple[Phrase, float]] = []
                 dip_found = False
                 for p, energy in phrase_energy:
                     if p.position_ms <= drop_ms:
@@ -306,15 +214,22 @@ class CueStrategy:
                     if energy < dip_threshold:
                         dip_found = True
                     elif dip_found and energy >= recovery_threshold:
-                        recoveries.append(p)
+                        recoveries.append((p, energy))
                         dip_found = False  # reset to find next cycle
 
                 if recoveries:
                     # Prefer the second recovery (the "second drop")
                     # but use the first if there's only one
-                    pick = recoveries[1] if len(recoveries) >= 2 else recoveries[0]
+                    pick, pick_energy = recoveries[1] if len(recoveries) >= 2 else recoveries[0]
                     positions["F"] = pick.position_ms
-                    confidence["F"] = 0.75
+                    # Scale confidence by how decisively the recovery cleared
+                    # the threshold — bare-minimum clearance (right at
+                    # recovery_threshold) scores 0.6, a full return to peak
+                    # energy scores 0.85.
+                    recovery_strength = (pick_energy - recovery_threshold) / max(
+                        peak_energy - recovery_threshold, 1e-9
+                    )
+                    confidence["F"] = 0.6 + 0.25 * min(1.0, max(0.0, recovery_strength))
                     notes.append(
                         f"F (Special): energy recovery #{min(2, len(recoveries))}"
                         f"/{len(recoveries)} at {pick.label} beat {pick.beat_start}"
@@ -366,7 +281,7 @@ class CueStrategy:
         # positions hurts accuracy. Keeping at Outro start as the safest default.
         if "G" in positions:
             positions["H"] = positions["G"]
-            confidence["H"] = 0.4
+            confidence["H"] = confidence["G"]
             notes.append("H (Loop Out): same position as Outro")
         else:
             confidence["H"] = 0.0
