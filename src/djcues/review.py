@@ -467,43 +467,53 @@ document.addEventListener('keydown', function(e) {{
     // Clamp to track bounds
     newPos = Math.max(0, Math.min(newPos, durationMs));
 
-    // Update the cue data
+    // Update local state immediately so rapid key presses accumulate
+    // correctly (each press builds on the last); roll back and flag an
+    // error if the server rejects or fails the write instead of leaving
+    // the marker showing a move that never actually persisted.
+    const previousPos = cueInfo.position_ms;
+    const marker = selectedMarker;
     cueInfo.position_ms = newPos;
     card.setAttribute('data-cues', JSON.stringify(cuesData));
-
-    // Update marker visual position
     const leftPct = (newPos / durationMs) * 100;
-    selectedMarker.style.left = leftPct.toFixed(4) + '%';
-
-    // Update loop range if present
-    if (cueInfo.loop_end_ms !== null) {{
-      const loopDelta = cueInfo.loop_end_ms - (cueInfo.position_ms - direction * msPerBar + direction * msPerBar);
-      // Keep same loop length
-    }}
-
-    // Mark track as adjusted
+    marker.style.left = leftPct.toFixed(4) + '%';
     setTrackStatus(trackId, 'adjusted');
 
-    // POST to server
     fetch(SERVER + '/session/track/' + trackId + '/cue/' + pad, {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify({{ position_ms: newPos, status: 'adjusted' }})
+    }}).then(res => {{
+      if (!res.ok) throw new Error('server returned ' + res.status);
+    }}).catch(err => {{
+      console.error('Failed to adjust cue ' + pad + ':', err);
+      cueInfo.position_ms = previousPos;
+      card.setAttribute('data-cues', JSON.stringify(cuesData));
+      const revertPct = (previousPos / durationMs) * 100;
+      marker.style.left = revertPct.toFixed(4) + '%';
+      setTrackStatus(trackId, 'error');
     }});
   }}
 
   if (e.key === 'Delete' || e.key === 'Backspace') {{
     e.preventDefault();
-    // Skip this cue
+    const previousOpacity = selectedMarker.style.opacity;
+    const marker = selectedMarker;
+    marker.style.opacity = '0.3';
+    deselectMarker();
+    setTrackStatus(trackId, 'adjusted');
+
     fetch(SERVER + '/session/track/' + trackId + '/cue/' + pad, {{
       method: 'POST',
       headers: {{ 'Content-Type': 'application/json' }},
       body: JSON.stringify({{ status: 'skipped' }})
+    }}).then(res => {{
+      if (!res.ok) throw new Error('server returned ' + res.status);
+    }}).catch(err => {{
+      console.error('Failed to skip cue ' + pad + ':', err);
+      marker.style.opacity = previousOpacity;
+      setTrackStatus(trackId, 'error');
     }});
-    // Visually hide the marker
-    selectedMarker.style.opacity = '0.3';
-    deselectMarker();
-    setTrackStatus(trackId, 'adjusted');
   }}
 
   if (e.key === 'Escape') {{
