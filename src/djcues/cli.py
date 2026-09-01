@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import warnings
 import click
 
@@ -150,7 +151,12 @@ def _print_comparison(proposal, track):
 @click.group()
 def cli():
     """djcues — automated rekordbox cue placement based on phrase analysis."""
-    pass
+    # Windows consoles default stdout/stderr to the system codepage (e.g. cp1252),
+    # which can't encode characters like → used in cue output.
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
 
 
 @cli.command()
