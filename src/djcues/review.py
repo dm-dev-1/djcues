@@ -162,6 +162,7 @@ def render_review_html(
         <span class="summary-item" id="count-accepted">0 accepted</span>
         <span class="summary-item" id="count-skipped">0 skipped</span>
         <span class="summary-item" id="count-adjusted">0 adjusted</span>
+        <span class="summary-item" id="count-error">0 error</span>
       </div>
     </div>
     <div class="sticky-header-right">
@@ -217,6 +218,7 @@ _REVIEW_CSS = """
   #count-accepted { color: #28a745; }
   #count-skipped { color: #dc3545; }
   #count-adjusted { color: #17a2b8; }
+  #count-error { color: #ff4136; }
 
   /* Apply command */
   .apply-command {
@@ -279,6 +281,7 @@ _REVIEW_CSS = """
   .status-indicator[data-status="accepted"] { background: #28a74533; color: #28a745; }
   .status-indicator[data-status="skipped"] { background: #dc354533; color: #dc3545; }
   .status-indicator[data-status="adjusted"] { background: #17a2b833; color: #17a2b8; }
+  .status-indicator[data-status="error"] { background: #ff413633; color: #ff4136; }
 
   /* Overwrite warning badge */
   .overwrite-badge {
@@ -324,7 +327,7 @@ let selectedTrackCard = null;
 
 function updateSummaryCounts() {{
   const cards = document.querySelectorAll('.review-card');
-  const counts = {{ pending: 0, accepted: 0, skipped: 0, adjusted: 0 }};
+  const counts = {{ pending: 0, accepted: 0, skipped: 0, adjusted: 0, error: 0 }};
   cards.forEach(card => {{
     const indicator = card.querySelector('.status-indicator');
     const status = indicator.getAttribute('data-status');
@@ -334,6 +337,8 @@ function updateSummaryCounts() {{
   document.getElementById('count-accepted').textContent = counts.accepted + ' accepted';
   document.getElementById('count-skipped').textContent = counts.skipped + ' skipped';
   document.getElementById('count-adjusted').textContent = counts.adjusted + ' adjusted';
+  const errEl = document.getElementById('count-error');
+  if (errEl) errEl.textContent = counts.error + ' error';
 }}
 
 function setTrackStatus(trackId, status) {{
@@ -347,33 +352,40 @@ function setTrackStatus(trackId, status) {{
 
 // --- Track actions ---
 
-function acceptTrack(trackId) {{
-  setTrackStatus(trackId, 'accepted');
-  fetch(SERVER + '/session/track/' + trackId + '/status', {{
+function postTrackStatus(trackId, status) {{
+  return fetch(SERVER + '/session/track/' + trackId + '/status', {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify({{ status: 'accepted' }})
+    body: JSON.stringify({{ status: status }})
+  }}).then(res => {{
+    if (!res.ok) throw new Error('server returned ' + res.status);
+    setTrackStatus(trackId, status);
+  }}).catch(err => {{
+    console.error('Failed to set track ' + trackId + ' to ' + status + ':', err);
+    setTrackStatus(trackId, 'error');
   }});
+}}
+
+function acceptTrack(trackId) {{
+  return postTrackStatus(trackId, 'accepted');
 }}
 
 function skipTrack(trackId) {{
-  setTrackStatus(trackId, 'skipped');
-  fetch(SERVER + '/session/track/' + trackId + '/status', {{
-    method: 'POST',
-    headers: {{ 'Content-Type': 'application/json' }},
-    body: JSON.stringify({{ status: 'skipped' }})
-  }});
+  return postTrackStatus(trackId, 'skipped');
 }}
 
-function acceptAll() {{
-  document.querySelectorAll('.review-card').forEach(card => {{
+async function acceptAll() {{
+  const btn = document.querySelector('.btn-accept-all');
+  const cards = Array.from(document.querySelectorAll('.review-card'));
+  if (btn) {{ btn.disabled = true; btn.textContent = 'Accepting…'; }}
+  for (const card of cards) {{
     const trackId = card.getAttribute('data-track-id');
     const indicator = card.querySelector('.status-indicator');
-    const current = indicator.getAttribute('data-status');
-    if (current === 'pending') {{
-      acceptTrack(trackId);
+    if (indicator.getAttribute('data-status') === 'pending') {{
+      await acceptTrack(trackId);
     }}
-  }});
+  }}
+  if (btn) {{ btn.disabled = false; btn.textContent = 'Accept All'; }}
 }}
 
 // --- Copy apply command ---
