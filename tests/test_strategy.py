@@ -343,3 +343,64 @@ def test_special_uses_waveform_energy_recovery_with_scaled_confidence(beat_grid:
     # (0.9) fully cleared it, so confidence should be at the top of the
     # scaled 0.6-0.85 band, and strictly above the old flat 0.75.
     assert proposal.confidence["F"] == pytest.approx(0.85)
+
+
+def test_loop_out_confidence_unchanged_with_clean_spectral_similarity(beat_grid: BeatGrid):
+    """H's confidence should stay at G's value when the loop region's two
+    halves are spectrally identical (a clean, stable loop point)."""
+    bg = beat_grid
+    duration_ms = 200000.0
+    phrases = [
+        Phrase(beat_start=1, beat_end=100, kind=1, label="Intro",
+               position_ms=0.0, duration_ms=160000.0),
+        Phrase(beat_start=100, beat_end=200, kind=6, label="Outro",
+               position_ms=160000.0, duration_ms=40000.0),
+    ]
+    n_wf = 1000
+    waveform = [WaveformPoint(height=0.5, red=4, green=4, blue=4) for _ in range(n_wf)]
+    # Loop region for H (4 bars at 128 BPM = 7500ms) maps to waveform
+    # indices ~800-835; make both halves identical.
+    for i in range(800, 836):
+        waveform[i] = WaveformPoint(height=1.0, red=7, green=7, blue=7)
+    track = Track(
+        id=99, title="Clean Loop", artist="Test", bpm=128.0,
+        duration_ms=duration_ms, analysis_path="", cues=[], phrases=phrases,
+        beat_grid=bg, waveform=waveform,
+    )
+    strategy = CueStrategy()
+    proposal = strategy.propose(track)
+    assert proposal.confidence["G"] == 0.9
+    assert proposal.confidence["H"] == pytest.approx(0.9)
+
+
+def test_loop_out_confidence_reduced_by_poor_spectral_similarity(beat_grid: BeatGrid):
+    """H's confidence should be reduced (but not zeroed, and position stays
+    phrase-anchored) when the loop region's two halves are spectrally very
+    different -- a poor loop point, even though G itself was confident."""
+    bg = beat_grid
+    duration_ms = 200000.0
+    phrases = [
+        Phrase(beat_start=1, beat_end=100, kind=1, label="Intro",
+               position_ms=0.0, duration_ms=160000.0),
+        Phrase(beat_start=100, beat_end=200, kind=6, label="Outro",
+               position_ms=160000.0, duration_ms=40000.0),
+    ]
+    n_wf = 1000
+    waveform = [WaveformPoint(height=0.5, red=4, green=4, blue=4) for _ in range(n_wf)]
+    # First half of the loop region is loud/bright, second half is silent --
+    # a maximally poor spectral match.
+    for i in range(800, 818):
+        waveform[i] = WaveformPoint(height=1.0, red=7, green=7, blue=7)
+    for i in range(818, 836):
+        waveform[i] = WaveformPoint(height=0.0, red=0, green=0, blue=0)
+    track = Track(
+        id=99, title="Unstable Loop", artist="Test", bpm=128.0,
+        duration_ms=duration_ms, analysis_path="", cues=[], phrases=phrases,
+        beat_grid=bg, waveform=waveform,
+    )
+    strategy = CueStrategy()
+    proposal = strategy.propose(track)
+    assert proposal.confidence["G"] == 0.9
+    hot_h = next(c for c in proposal.hot_cues if c.kind == 9)
+    assert hot_h.position_ms == 160000.0  # position stays phrase-anchored
+    assert proposal.confidence["H"] == pytest.approx(0.45)  # 0.9 * (0.5 + 0.5*0.0)

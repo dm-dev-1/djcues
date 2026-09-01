@@ -6,6 +6,38 @@ from djcues.constants import CUE_SYSTEM, CUE_SYSTEM_BY_PAD
 from djcues.models import CuePoint, CueProposal, Phrase, Track
 
 
+def _spectral_similarity(wf_points: list, i0: int, i_mid: int, i1: int) -> float:
+    """Compare the RGB (bass/mid/treble) profile of two halves of a waveform section.
+
+    Returns a similarity score from 0.0 (completely different) to 1.0 (identical).
+    Uses mean-squared-error of the per-point RGB values, normalized.
+
+    Originally added in commit 9a70f78 to override B/H *positions* directly —
+    that measurably hurt accuracy (B: 88%->56%, H: 42%->27%) and was reverted.
+    Reintroduced here purely as a *confidence* input for H (see below), which
+    is an untested, different claim from the one that failed.
+    """
+    half_len = min(i_mid - i0, i1 - i_mid)
+    if half_len < 2:
+        return 0.0
+
+    first_half = wf_points[i0 : i0 + half_len]
+    second_half = wf_points[i_mid : i_mid + half_len]
+
+    total_mse = 0.0
+    for a, b in zip(first_half, second_half):
+        # RGB values are 0-7, normalize to 0-1
+        dr = (a.red - b.red) / 7
+        dg = (a.green - b.green) / 7
+        db = (a.blue - b.blue) / 7
+        dh = a.height - b.height  # already 0-1
+        total_mse += dr * dr + dg * dg + db * db + dh * dh
+
+    # Max possible MSE per point = 4 (all channels off by 1.0)
+    mse = total_mse / half_len / 4
+    return max(0.0, 1.0 - mse)
+
+
 class CueStrategy:
     """Proposes cue placements based on phrase analysis and the cue system."""
 
@@ -277,11 +309,28 @@ class CueStrategy:
             notes.append("G (Outro): no phrases at all")
 
         # --- H: Loop Out (same as Outro) ---
-        # Spectral similarity analysis showed that overriding phrase-based
-        # positions hurts accuracy. Keeping at Outro start as the safest default.
+        # Position-overriding with spectral similarity hurt accuracy (see
+        # _spectral_similarity's docstring) — position stays phrase-anchored.
+        # Used here only to modulate confidence: a clean, stable loop should
+        # have similar spectral content in both halves; a poor match doesn't
+        # mean the position is wrong (it's still anchored to a real Outro),
+        # just that it's less likely to be a clean loop point.
         if "G" in positions:
             positions["H"] = positions["G"]
-            confidence["H"] = confidence["G"]
+            base_confidence = confidence["G"]
+            similarity = None
+            if track.waveform and track.duration_ms > 0:
+                n_wf = len(track.waveform)
+                loop_ms = bg.bars_to_ms(self.loop_length_bars)
+                i0 = int(n_wf * positions["H"] / track.duration_ms)
+                i1 = int(n_wf * (positions["H"] + loop_ms) / track.duration_ms)
+                i_mid = (i0 + i1) // 2
+                if i1 - i0 >= 4:
+                    similarity = _spectral_similarity(track.waveform, i0, i_mid, i1)
+            if similarity is None:
+                confidence["H"] = base_confidence
+            else:
+                confidence["H"] = base_confidence * (0.5 + 0.5 * similarity)
             notes.append("H (Loop Out): same position as Outro")
         else:
             confidence["H"] = 0.0
