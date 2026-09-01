@@ -8,10 +8,27 @@ recalculation.
 from __future__ import annotations
 
 import json
+import socketserver
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+
+
+class ReviewServer(socketserver.ThreadingMixIn, HTTPServer):
+    """Threaded HTTPServer with a larger listen backlog.
+
+    Single-threaded handling meant serving the large initial page (all
+    proposals + waveforms for a big playlist) blocked every other request
+    — including the review UI's own accept/skip calls — for as long as
+    that transfer took. Threading lets those proceed concurrently. The
+    stdlib backlog default (5) also drops connections outright when the
+    review page fires many concurrent fetch() calls at once (e.g.
+    "Accept All"), so it's raised too.
+    """
+
+    request_queue_size = 128
+    daemon_threads = True
 
 
 class ReviewHandler(BaseHTTPRequestHandler):
@@ -19,10 +36,13 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     Class-level attributes ``html_path`` and ``session_path`` must be set
     before the handler is used (set by ``start_server`` via dynamic subclass).
+    Session file reads/writes are serialized via ``_session_lock`` since the
+    server now handles requests concurrently across threads.
     """
 
     html_path: Path
     session_path: Path
+    _session_lock = threading.Lock()
 
     # --- helpers --------------------------------------------------------
 
@@ -114,17 +134,18 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     def _handle_accept_all(self) -> None:
         """Set all pending tracks and their cues to accepted."""
-        session = self._read_session()
-        for tdata in session.get("tracks", {}).values():
-            if tdata.get("status") == "pending":
-                tdata["status"] = "accepted"
-                for cue in tdata.get("cues", {}).values():
-                    if cue.get("status") == "pending":
-                        cue["status"] = "accepted"
-                for mc in tdata.get("memory_cues", {}).values():
-                    if mc.get("status") == "pending":
-                        mc["status"] = "accepted"
-        self._write_session(session)
+        with self._session_lock:
+            session = self._read_session()
+            for tdata in session.get("tracks", {}).values():
+                if tdata.get("status") == "pending":
+                    tdata["status"] = "accepted"
+                    for cue in tdata.get("cues", {}).values():
+                        if cue.get("status") == "pending":
+                            cue["status"] = "accepted"
+                    for mc in tdata.get("memory_cues", {}).values():
+                        if mc.get("status") == "pending":
+                            mc["status"] = "accepted"
+            self._write_session(session)
         self._send_json({"ok": True})
 
     def _route_track_post(self, path: str) -> None:
@@ -154,21 +175,22 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid status"}, status=400)
             return
 
-        session = self._read_session()
-        tracks = session.get("tracks", {})
-        if track_id not in tracks:
-            self._send_json({"error": "track not found"}, status=404)
-            return
+        with self._session_lock:
+            session = self._read_session()
+            tracks = session.get("tracks", {})
+            if track_id not in tracks:
+                self._send_json({"error": "track not found"}, status=404)
+                return
 
-        tdata = tracks[track_id]
-        tdata["status"] = new_status
-        # Cascade to all cues and memory cues
-        for cue in tdata.get("cues", {}).values():
-            cue["status"] = new_status
-        for mc in tdata.get("memory_cues", {}).values():
-            mc["status"] = new_status
+            tdata = tracks[track_id]
+            tdata["status"] = new_status
+            # Cascade to all cues and memory cues
+            for cue in tdata.get("cues", {}).values():
+                cue["status"] = new_status
+            for mc in tdata.get("memory_cues", {}).values():
+                mc["status"] = new_status
 
-        self._write_session(session)
+            self._write_session(session)
         self._send_json({"ok": True})
 
     def _handle_cue_update(self, track_id: str, pad: str) -> None:
@@ -181,69 +203,70 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "invalid status"}, status=400)
             return
 
-        session = self._read_session()
-        tracks = session.get("tracks", {})
-        if track_id not in tracks:
-            self._send_json({"error": "track not found"}, status=404)
-            return
+        with self._session_lock:
+            session = self._read_session()
+            tracks = session.get("tracks", {})
+            if track_id not in tracks:
+                self._send_json({"error": "track not found"}, status=404)
+                return
 
-        tdata = tracks[track_id]
-        cues = tdata.get("cues", {})
-        if pad not in cues:
-            self._send_json({"error": "cue not found"}, status=404)
-            return
+            tdata = tracks[track_id]
+            cues = tdata.get("cues", {})
+            if pad not in cues:
+                self._send_json({"error": "cue not found"}, status=404)
+                return
 
-        pads = list("ABCDEFGH")
-        if pad not in pads:
-            self._send_json({"error": "invalid pad"}, status=400)
-            return
-        slot_idx = pads.index(pad)
-        slot = CUE_SYSTEM[slot_idx]
-        memory_key = str(slot_idx + 1)
+            pads = list("ABCDEFGH")
+            if pad not in pads:
+                self._send_json({"error": "invalid pad"}, status=400)
+                return
+            slot_idx = pads.index(pad)
+            slot = CUE_SYSTEM[slot_idx]
+            memory_key = str(slot_idx + 1)
 
-        memory_cues = tdata.get("memory_cues", {})
-        cue_entry = cues[pad]
+            memory_cues = tdata.get("memory_cues", {})
+            cue_entry = cues[pad]
 
-        if new_status == "adjusted":
-            # Store original position if not already stored
-            if "original_ms" not in cue_entry:
-                cue_entry["original_ms"] = cue_entry["position_ms"]
+            if new_status == "adjusted":
+                # Store original position if not already stored
+                if "original_ms" not in cue_entry:
+                    cue_entry["original_ms"] = cue_entry["position_ms"]
 
-            # Update position
-            new_position = body.get("position_ms", cue_entry["position_ms"])
-            new_loop_end = body.get("loop_end_ms", cue_entry.get("loop_end_ms"))
-            cue_entry["position_ms"] = new_position
-            cue_entry["loop_end_ms"] = new_loop_end
-            cue_entry["status"] = "adjusted"
+                # Update position
+                new_position = body.get("position_ms", cue_entry["position_ms"])
+                new_loop_end = body.get("loop_end_ms", cue_entry.get("loop_end_ms"))
+                cue_entry["position_ms"] = new_position
+                cue_entry["loop_end_ms"] = new_loop_end
+                cue_entry["status"] = "adjusted"
 
-            # Recalculate corresponding memory cue
-            offset_bars = session.get("settings", {}).get(
-                "memory_offset_bars", 16
-            )
-            if memory_key in memory_cues:
-                mc = memory_cues[memory_key]
-                if slot.memory_offset_bars == 0:
-                    mc["position_ms"] = new_position
-                    mc["loop_end_ms"] = new_loop_end
-                else:
-                    bpm = tdata.get("bpm", 128.0)
-                    bar_ms = (60_000 / bpm) * 4
-                    mem_pos = new_position - offset_bars * bar_ms
-                    first_beat = tdata.get("first_beat_ms", 0)
-                    mc["position_ms"] = max(mem_pos, first_beat)
-                    mc["loop_end_ms"] = None
-                mc["status"] = "auto"
+                # Recalculate corresponding memory cue
+                offset_bars = session.get("settings", {}).get(
+                    "memory_offset_bars", 16
+                )
+                if memory_key in memory_cues:
+                    mc = memory_cues[memory_key]
+                    if slot.memory_offset_bars == 0:
+                        mc["position_ms"] = new_position
+                        mc["loop_end_ms"] = new_loop_end
+                    else:
+                        bpm = tdata.get("bpm", 128.0)
+                        bar_ms = (60_000 / bpm) * 4
+                        mem_pos = new_position - offset_bars * bar_ms
+                        first_beat = tdata.get("first_beat_ms", 0)
+                        mc["position_ms"] = max(mem_pos, first_beat)
+                        mc["loop_end_ms"] = None
+                    mc["status"] = "auto"
 
-        elif new_status == "skipped":
-            cue_entry["status"] = "skipped"
-            # Also skip the corresponding memory cue
-            if memory_key in memory_cues:
-                memory_cues[memory_key]["status"] = "skipped"
+            elif new_status == "skipped":
+                cue_entry["status"] = "skipped"
+                # Also skip the corresponding memory cue
+                if memory_key in memory_cues:
+                    memory_cues[memory_key]["status"] = "skipped"
 
-        # Set track status to adjusted
-        tdata["status"] = "adjusted"
+            # Set track status to adjusted
+            tdata["status"] = "adjusted"
 
-        self._write_session(session)
+            self._write_session(session)
         self._send_json({"ok": True})
 
 
@@ -266,7 +289,7 @@ def start_server(
         {"html_path": html_path, "session_path": session_path},
     )
 
-    server = HTTPServer(("127.0.0.1", port), handler)
+    server = ReviewServer(("127.0.0.1", port), handler)
     actual_port = server.server_address[1]
     server._last_activity = time.monotonic()  # type: ignore[attr-defined]
     server._shutdown_flag = False  # type: ignore[attr-defined]
