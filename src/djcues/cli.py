@@ -15,6 +15,7 @@ warnings.filterwarnings("ignore", module="pyrekordbox")
 
 from djcues.constants import CUE_SYSTEM_BY_PAD, KIND_TO_PAD
 from djcues.db import find_playlist, load_playlist_tracks
+from djcues.metrics import compare_cues, merge_pad_stats, overall_stats
 from djcues.strategy import CueStrategy
 
 
@@ -90,22 +91,11 @@ def _print_comparison(proposal, track):
     click.echo(f"  BPM: {track.bpm:.1f}")
     click.echo(f"{'=' * 60}")
 
-    # Build lookup of existing hot cues by kind
-    existing_by_kind = {}
-    for c in track.cues:
-        if c.kind > 0:  # hot cues only (kind > 0)
-            existing_by_kind[c.kind] = c
-
-    # Build lookup of proposed hot cues by kind
-    proposed_by_kind = {}
-    for c in proposal.hot_cues:
-        proposed_by_kind[c.kind] = c
-
-    # Get all kinds present in either set
+    existing_by_kind = {c.kind: c for c in track.cues if c.kind > 0}
+    proposed_by_kind = {c.kind: c for c in proposal.hot_cues}
     all_kinds = sorted(set(existing_by_kind.keys()) | set(proposed_by_kind.keys()))
 
-    matches = 0
-    total = 0
+    pad_stats = compare_cues(track.cues, proposal.hot_cues)
 
     click.echo(f"\n  {'Pad':<5s} {'Label':<20s} {'Existing':<12s} {'Proposed':<12s} {'Delta':>8s}")
     click.echo(f"  {'-' * 5} {'-' * 20} {'-' * 12} {'-' * 12} {'-' * 8}")
@@ -123,29 +113,31 @@ def _print_comparison(proposal, track):
 
         delta_str = ""
         if existing and proposed:
-            total += 1
             delta_ms = proposed.position_ms - existing.position_ms
             delta_str = f"{delta_ms:+.0f}ms"
             if abs(delta_ms) <= 1000:
-                matches += 1
                 delta_str += " ✓"
         elif existing:
-            total += 1
             delta_str = "missing"
         elif proposed:
-            delta_str = "new"
+            delta_str = "new (unmatched)"
 
         click.echo(
             f"  [{pad}]   {label:<20s} {existing_str:<12s} {proposed_str:<12s} {delta_str:>8s}"
         )
 
-    if total > 0:
-        pct = matches / total * 100
-        click.echo(f"\n  Match rate: {matches}/{total} ({pct:.0f}%) within 1s tolerance")
+    total = overall_stats(pad_stats)
+    denom = total.matches + total.misses + total.false_positives
+    if denom > 0:
+        click.echo(
+            f"\n  Precision: {total.precision:.0%}  Recall: {total.recall:.0%}  "
+            f"F1: {total.f1:.0%}  ({total.matches} matched, {total.misses} missed, "
+            f"{total.false_positives} unmatched proposals)"
+        )
     else:
         click.echo(f"\n  No existing hot cues to compare.")
 
-    return matches, total
+    return pad_stats
 
 
 @click.group()
@@ -216,19 +208,33 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars):
 
     strategy = CueStrategy(memory_offset_bars=offset, loop_length_bars=loop_bars)
 
-    total_matches = 0
-    total_cues = 0
-
     if all_tracks:
+        per_track_stats = []
         for t in tracks:
             proposal = strategy.propose(t)
-            m, c = _print_comparison(proposal, t)
-            total_matches += m
-            total_cues += c
-        if total_cues > 0:
-            pct = total_matches / total_cues * 100
+            per_track_stats.append(_print_comparison(proposal, t))
+
+        merged = merge_pad_stats(per_track_stats)
+        total = overall_stats(merged)
+        denom = total.matches + total.misses + total.false_positives
+        if denom > 0:
             click.echo(f"\n{'=' * 60}")
-            click.echo(f"  Overall accuracy: {total_matches}/{total_cues} ({pct:.0f}%)")
+            click.echo(
+                f"  Overall — Precision: {total.precision:.0%}  "
+                f"Recall: {total.recall:.0%}  F1: {total.f1:.0%}"
+            )
+            click.echo(
+                f"  ({total.matches} matched, {total.misses} missed, "
+                f"{total.false_positives} unmatched proposals)"
+            )
+            click.echo(f"\n  {'Pad':<5s} {'Matched':<9s} {'Missed':<8s} {'Unmatched':<11s} {'Precision':<11s} {'Recall':<8s}")
+            click.echo(f"  {'-' * 5} {'-' * 9} {'-' * 8} {'-' * 11} {'-' * 11} {'-' * 8}")
+            for pad in sorted(merged):
+                s = merged[pad]
+                click.echo(
+                    f"  {pad:<5s} {s.matches:<9d} {s.misses:<8d} {s.false_positives:<11d} "
+                    f"{s.precision:<11.0%} {s.recall:<8.0%}"
+                )
             click.echo(f"{'=' * 60}")
     elif track_name:
         matched = [t for t in tracks if track_name.lower() in t.title.lower()]
@@ -429,3 +435,25 @@ def apply(session_file, dry_run, force):
         dry_run=dry_run,
         force=force,
     )
+
+
+@cli.command()
+def history():
+    """Show correction-history stats logged from applied review sessions."""
+    from djcues.history import default_db_path, summary
+
+    stats = summary()
+    db_path = default_db_path()
+    if not stats:
+        click.echo(f"No correction history yet at {db_path}.")
+        click.echo("This fills in as you review and apply sessions — nothing to show yet.")
+        return
+
+    click.echo(f"Correction history: {db_path}\n")
+    click.echo(f"  {'Pad':<5s} {'Total':<8s} {'Corrected':<11s} {'First seen':<20s} {'Last seen':<20s}")
+    click.echo(f"  {'-' * 5} {'-' * 8} {'-' * 11} {'-' * 20} {'-' * 20}")
+    for row in stats:
+        click.echo(
+            f"  {row['pad']:<5s} {row['total']:<8d} {row['corrected']:<11d} "
+            f"{row['first_seen']:<20s} {row['last_seen']:<20s}"
+        )

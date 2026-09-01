@@ -38,6 +38,7 @@ def create_session(
                 "position_ms": hc.position_ms,
                 "loop_end_ms": hc.loop_end_ms,
                 "status": "pending",
+                "confidence": proposal.confidence.get(pad, 0.0),
             }
 
         # Memory cues keyed by 1-indexed string
@@ -51,7 +52,12 @@ def create_session(
 
         tracks_dict[str(track.id)] = {
             "title": track.title,
+            "artist": track.artist,
             "bpm": track.bpm,
+            "duration_ms": track.duration_ms,
+            "phrase_count": len(track.phrases),
+            "has_vocal_data": track.vocal_track is not None,
+            "has_waveform_data": track.waveform is not None,
             "first_beat_ms": track.beat_grid.first_beat_ms,
             "status": "pending",
             "has_existing_cues": has_existing_cues,

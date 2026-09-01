@@ -146,6 +146,7 @@ def apply_session(session_path, dry_run=False, force=False) -> dict:
     """
     import click
     from djcues.db import get_db
+    from djcues.history import log_session_corrections
 
     session_path = pathlib.Path(session_path)
     with open(session_path) as f:
@@ -254,10 +255,22 @@ def apply_session(session_path, dry_run=False, force=False) -> dict:
         count = write_cues_for_track(db, content, hot_rows, mem_rows, overwrite=overwrite)
         db.commit()
 
+        # Log immediately after this track's own commit succeeds, so a
+        # failure partway through the loop only logs what was actually
+        # written to Rekordbox, not tracks that never got there.
+        log_session_corrections({"tracks": {track_id: track_data}}, str(session_path))
+
         title = track_data.get("title", f"ID {track_id}")
         click.echo(f"  Wrote {count} cues for {title}")
         written += 1
         cues_written += count
+
+    # Whole-track skips never reach the loop above (they're excluded by the
+    # accepted/adjusted status filter), but they're still a real correction
+    # signal — the algorithm's proposals were rejected outright.
+    for track_id, track_data in tracks.items():
+        if track_data.get("status") == "skipped":
+            log_session_corrections({"tracks": {track_id: track_data}}, str(session_path))
 
     result["written"] = written
     result["cues_written"] = cues_written
