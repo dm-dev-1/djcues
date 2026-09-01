@@ -164,12 +164,9 @@ def _extract_vocal_track(track_content: Any) -> list[int] | None:
     where each frame covers 1024/22050 ≈ 46.4ms.
     """
     import struct
-    anlz_rel = track_content.AnalysisDataPath
-    if not anlz_rel:
-        return None
-    base = __import__("pathlib").Path.home() / "Library/Pioneer/rekordbox/share"
-    ex2_path = base / anlz_rel.lstrip("/").replace("ANLZ0000.DAT", "ANLZ0000.2EX")
-    if not ex2_path.exists():
+    db = get_db()
+    ex2_path = db.get_anlz_paths(track_content).get("2EX")
+    if not ex2_path or not ex2_path.exists():
         return None
     try:
         with open(ex2_path, "rb") as f:
