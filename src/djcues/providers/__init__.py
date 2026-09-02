@@ -73,6 +73,20 @@ DEFAULT_MODEL: dict[str, str] = {
     "gemini": "gemini-2.5-flash-lite",
 }
 
+# A separate, stronger recommendation from live-testing this against real
+# djcues cue-placement output (see the plan doc's "real-world accuracy
+# tuning" sections) -- not just "cheapest," but empirically the best
+# accuracy/cost balance found so far. Deliberately not merged into
+# DEFAULT_MODEL: that constant is also the last-resort fallback
+# _resolve_agentic_provider() uses when nothing else is configured, and
+# should stay the safe, cheap, no-surprises choice. Only providers this
+# has actually been measured for get an entry here -- no equivalent
+# Anthropic-model comparison has been run yet, so it's intentionally
+# absent rather than guessed.
+RECOMMENDED_FOR_ACCURACY: dict[str, str] = {
+    "gemini": "gemini-3.7-flash",
+}
+
 
 class ModelProvider(Protocol):
     """Common interface every provider adapter implements."""

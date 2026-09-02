@@ -666,7 +666,7 @@ def auth():
 def auth_set(provider):
     """Configure an API key and default model, with a live model list."""
     from djcues.auth import KeyringUnavailableError, load_config, save_config, set_api_key
-    from djcues.providers import DEFAULT_MODEL, get_provider
+    from djcues.providers import DEFAULT_MODEL, RECOMMENDED_FOR_ACCURACY, get_provider
 
     api_key = click.prompt(f"Enter your {provider} API key", hide_input=True)
 
@@ -683,17 +683,32 @@ def auth_set(provider):
         raise SystemExit(1)
 
     default_model_id = DEFAULT_MODEL.get(provider)
-    # Recommended lightweight default first, then alphabetical.
-    models_sorted = sorted(models, key=lambda m: (m.id != default_model_id, m.id))
+    accuracy_model_id = RECOMMENDED_FOR_ACCURACY.get(provider)
+    # Accuracy pick first when this provider has one measured, then the
+    # cheap default, then alphabetical.
+    models_sorted = sorted(
+        models, key=lambda m: (m.id != accuracy_model_id, m.id != default_model_id, m.id)
+    )
 
     click.echo("\nAvailable models (pricing from djcues' local table, not live):")
     default_choice = 1
     for i, m in enumerate(models_sorted, 1):
-        marker = " (recommended, lightweight)" if m.id == default_model_id else ""
-        if m.id == default_model_id:
+        if m.id == accuracy_model_id:
+            marker = " (recommended -- best accuracy in testing)"
+        elif m.id == default_model_id:
+            marker = " (cheapest, lightweight default)"
+        else:
+            marker = ""
+        if m.id == accuracy_model_id or (m.id == default_model_id and not accuracy_model_id):
             default_choice = i
         ctx = f", {m.context_window} context" if m.context_window else ""
         click.echo(f"  {i}. {m.display_name} [{m.id}{ctx}]{marker}")
+    if accuracy_model_id:
+        click.echo(
+            f"  Note: {accuracy_model_id} tested meaningfully more accurate for djcues' "
+            f"cue-placement task than the cheaper lightweight tiers, at a still-small "
+            f"real cost (well under a cent per track)."
+        )
 
     choice = click.prompt(
         "Choose a model number", type=click.IntRange(1, len(models_sorted)), default=default_choice

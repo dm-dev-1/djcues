@@ -29,7 +29,12 @@ from dataclasses import dataclass, field
 
 from djcues.models import CueProposal, Track
 from djcues.providers import GenerationResult, ModelProvider, estimate_cost as price_estimate
-from djcues.strategy import CueStrategy, build_cue_points, compute_phrase_energy
+from djcues.strategy import (
+    CueStrategy,
+    build_cue_points,
+    compute_phrase_energy,
+    find_energy_recoveries,
+)
 
 _VOCAL_FRAME_MS = 1024 / 22050 * 1000  # ~46.4ms per PVDI frame, matches strategy.py
 _MIN_VOCAL_REGION_MS = 2000  # matches strategy.py's C-slot min_frames threshold
@@ -127,6 +132,23 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
             (i for i, p in enumerate(track.phrases) if p.position_ms == cue.position_ms), None
         )
 
+    # Pre-computed dip-then-recovery candidates for the Energy/Special
+    # specialist to judge, instead of asking it to derive the same
+    # multi-step numeric procedure itself from raw energy values -- real
+    # testing showed that unreliable. Uses the exact same detection
+    # find_energy_recoveries() gives the heuristic, so the LLM's
+    # candidate set matches what the heuristic itself would have found.
+    drop_cue = next(
+        (c for c in heuristic_proposal.hot_cues if KIND_TO_PAD.get(c.kind) == "D"), None
+    )
+    recovery_candidates: list[dict] = []
+    if drop_cue is not None:
+        recoveries, _peak, _threshold = find_energy_recoveries(track, drop_cue.position_ms)
+        recovery_candidates = [
+            {"phrase_index": i, "mean_energy": round(e, 3), "cycle_number": n}
+            for n, (i, _p, e) in enumerate(recoveries, start=1)
+        ]
+
     return {
         "bpm": track.bpm,
         "duration_ms": round(track.duration_ms),
@@ -135,6 +157,7 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
         "phrase_energy": energy_by_index,
         "heuristic_confidence": heuristic_by_pad,
         "heuristic_phrase_index": heuristic_phrase_index,
+        "energy_recovery_candidates": recovery_candidates,
     }
 
 
@@ -221,7 +244,13 @@ _STRUCTURE_SYSTEM = (
     "and picking one of those is a common mistake to avoid. If you agree "
     "with the heuristic's choice, say so with matching confidence; if you "
     "see a clearly better phrase that still satisfies the 20% constraint, "
-    "pick it and explain why."
+    "pick it and explain why.\n\n"
+    "Rule for Breakdown: it must be a Down- or Bridge-labeled phrase whose "
+    "position_ms is strictly after the Drop's position_ms. Among phrases "
+    "that qualify, pick the EARLIEST one, not a later one that might look "
+    "like a bigger energy drop. If no Down/Bridge phrase exists after the "
+    "Drop, decline (phrase_index -1) rather than guessing at an unrelated "
+    "phrase."
 )
 
 _VOCAL_SYSTEM = (
@@ -251,11 +280,24 @@ _VOCAL_SYSTEM = (
 _ENERGY_SYSTEM = (
     "You place a single DJ cue point, Special (also called the 'second "
     "drop'): the point where energy returns to near-peak after dipping "
-    "following the main Drop. You are given per-phrase mean energy values "
-    "(0.0-1.0), the phrase structure, and the local heuristic's own choice "
-    "(heuristic_phrase_index) for reference. This is a pattern-judgment "
-    "call, not a fixed threshold -- look for a genuine dip-then-recovery "
-    "shape after the Drop, not just any high-energy phrase."
+    "following the main Drop. You are given energy_recovery_candidates: "
+    "a list of phrases already detected as genuine dip-then-recovery "
+    "moments after the Drop (computed from the track's real energy data "
+    "-- you do not need to compute this yourself), each with a "
+    "cycle_number (1 = first recovery after the Drop, 2 = second, in "
+    "track order). You are also given the phrase structure and the "
+    "local heuristic's own choice (heuristic_phrase_index) for "
+    "reference.\n\n"
+    "Rule: if a candidate with cycle_number 2 exists, pick it -- that's "
+    "the genuine second drop, not the first energy bump after the main "
+    "Drop. If only cycle_number 1 exists, pick that one. Trust these "
+    "pre-computed candidates by default; only override the rule if the "
+    "phrase structure gives you a clear, specific reason to prefer a "
+    "different one, and say why. If energy_recovery_candidates is "
+    "empty, fall back to the first Chorus-labeled phrase after the "
+    "Breakdown (heuristic_phrase_index.E, if not null -- otherwise "
+    "after the Drop instead); if none of those exist either, decline "
+    "(phrase_index -1)."
 )
 
 _CRITIC_SYSTEM = (

@@ -374,7 +374,7 @@ class AuthSetupHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "not found"}, status=404)
 
     def _handle_models(self) -> None:
-        from djcues.providers import DEFAULT_MODEL, PRICING, get_provider
+        from djcues.providers import DEFAULT_MODEL, PRICING, RECOMMENDED_FOR_ACCURACY, get_provider
 
         body = self._read_body()
         provider_name = body.get("provider")
@@ -394,7 +394,12 @@ class AuthSetupHandler(BaseHTTPRequestHandler):
             return
 
         default_id = DEFAULT_MODEL.get(provider_name)
-        models_sorted = sorted(models, key=lambda m: (m.id != default_id, m.id))
+        accuracy_id = RECOMMENDED_FOR_ACCURACY.get(provider_name)
+        # Accuracy pick sorts first when this provider has one measured,
+        # then the cheap default, then alphabetical.
+        models_sorted = sorted(
+            models, key=lambda m: (m.id != accuracy_id, m.id != default_id, m.id)
+        )
         payload = []
         for m in models_sorted:
             price = PRICING.get(m.id)
@@ -403,10 +408,15 @@ class AuthSetupHandler(BaseHTTPRequestHandler):
                 "display_name": m.display_name,
                 "context_window": m.context_window,
                 "recommended": m.id == default_id,
+                "recommended_accuracy": m.id == accuracy_id,
                 "price_input_per_million": price.input_per_million if price else None,
                 "price_output_per_million": price.output_per_million if price else None,
             })
-        self._send_json({"models": payload, "default_model": default_id})
+        self._send_json({
+            "models": payload,
+            "default_model": default_id,
+            "recommended_accuracy_model": accuracy_id,
+        })
 
     def _handle_save(self) -> None:
         from djcues.auth import KeyringUnavailableError, load_config, save_config, set_api_key

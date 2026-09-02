@@ -62,6 +62,46 @@ def compute_phrase_energy(track: Track) -> list[tuple[Phrase, float]]:
     return phrase_energy
 
 
+def find_energy_recoveries(
+    track: Track, drop_ms: float
+) -> tuple[list[tuple[int, Phrase, float]], float, float]:
+    """Find all dip-then-recovery energy cycles strictly after drop_ms —
+    slot F's core pattern-detection, extracted so both the heuristic and
+    the agentic mode compute it identically instead of one re-deriving
+    it from raw energy values (which real testing showed an LLM doing
+    unreliably -- this shifts that arithmetic to Python and leaves the
+    LLM specialist a short pre-computed list to judge instead).
+
+    Uses the same peak-relative thresholds slot F has always used: a dip
+    is energy below 75% of the track's peak; a recovery is the next
+    phrase after a dip whose energy reaches 85% of peak.
+
+    Returns (recoveries, peak_energy, recovery_threshold). recoveries is
+    a list of (phrase_index, phrase, energy) triples in track order —
+    phrase_index is into compute_phrase_energy(track)/track.phrases,
+    which share the same order. Empty if no cycle was found or there's
+    no usable energy data.
+    """
+    phrase_energy = compute_phrase_energy(track)
+    peak_energy = max((e for _, e in phrase_energy), default=0.0)
+    if peak_energy <= 0:
+        return [], 0.0, 0.0
+    dip_threshold = peak_energy * 0.75
+    recovery_threshold = peak_energy * 0.85
+
+    recoveries: list[tuple[int, Phrase, float]] = []
+    dip_found = False
+    for i, (p, energy) in enumerate(phrase_energy):
+        if p.position_ms <= drop_ms:
+            continue
+        if energy < dip_threshold:
+            dip_found = True
+        elif dip_found and energy >= recovery_threshold:
+            recoveries.append((i, p, energy))
+            dip_found = False  # reset to find next cycle
+    return recoveries, peak_energy, recovery_threshold
+
+
 def build_cue_points(
     positions: dict[str, float],
     confidence: dict[str, float],
@@ -306,46 +346,28 @@ class CueStrategy:
         # Find the first phrase where energy returns to peak levels after
         # a dip following the Drop. This is the "second drop" in the track.
         f_placed = False
-        phrase_energy = compute_phrase_energy(track)
-        if "D" in positions and phrase_energy:
+        if "D" in positions:
             drop_ms = positions["D"]
+            recoveries, peak_energy, recovery_threshold = find_energy_recoveries(track, drop_ms)
 
-            peak_energy = max((e for _, e in phrase_energy), default=0)
-            if peak_energy > 0:
-                dip_threshold = peak_energy * 0.75
-                recovery_threshold = peak_energy * 0.85
-
-                # Find ALL dip→recovery cycles after the Drop.
-                # The second drop is the LAST recovery before the Outro.
-                recoveries: list[tuple[Phrase, float]] = []
-                dip_found = False
-                for p, energy in phrase_energy:
-                    if p.position_ms <= drop_ms:
-                        continue
-                    if energy < dip_threshold:
-                        dip_found = True
-                    elif dip_found and energy >= recovery_threshold:
-                        recoveries.append((p, energy))
-                        dip_found = False  # reset to find next cycle
-
-                if recoveries:
-                    # Prefer the second recovery (the "second drop")
-                    # but use the first if there's only one
-                    pick, pick_energy = recoveries[1] if len(recoveries) >= 2 else recoveries[0]
-                    positions["F"] = pick.position_ms
-                    # Scale confidence by how decisively the recovery cleared
-                    # the threshold — bare-minimum clearance (right at
-                    # recovery_threshold) scores 0.6, a full return to peak
-                    # energy scores 0.85.
-                    recovery_strength = (pick_energy - recovery_threshold) / max(
-                        peak_energy - recovery_threshold, 1e-9
-                    )
-                    confidence["F"] = 0.6 + 0.25 * min(1.0, max(0.0, recovery_strength))
-                    notes.append(
-                        f"F (Special): energy recovery #{min(2, len(recoveries))}"
-                        f"/{len(recoveries)} at {pick.label} beat {pick.beat_start}"
-                    )
-                    f_placed = True
+            if recoveries:
+                # Prefer the second recovery (the "second drop")
+                # but use the first if there's only one
+                _pick_idx, pick, pick_energy = recoveries[1] if len(recoveries) >= 2 else recoveries[0]
+                positions["F"] = pick.position_ms
+                # Scale confidence by how decisively the recovery cleared
+                # the threshold — bare-minimum clearance (right at
+                # recovery_threshold) scores 0.6, a full return to peak
+                # energy scores 0.85.
+                recovery_strength = (pick_energy - recovery_threshold) / max(
+                    peak_energy - recovery_threshold, 1e-9
+                )
+                confidence["F"] = 0.6 + 0.25 * min(1.0, max(0.0, recovery_strength))
+                notes.append(
+                    f"F (Special): energy recovery #{min(2, len(recoveries))}"
+                    f"/{len(recoveries)} at {pick.label} beat {pick.beat_start}"
+                )
+                f_placed = True
 
         if not f_placed:
             # Fallback: first Chorus after Breakdown or Drop

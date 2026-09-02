@@ -227,6 +227,44 @@ def test_build_track_payload_empty_vocal_track_gives_no_regions(beat_grid, phras
     assert payload["phrase_energy"] == []
 
 
+def test_build_track_payload_energy_recovery_candidates_are_precomputed(beat_grid):
+    """The Energy specialist shouldn't have to derive the dip/recovery
+    procedure itself from raw energy values -- real testing showed that
+    unreliable. This is the same fixture shape as
+    test_strategy.py's test_special_uses_waveform_energy_recovery_with_
+    scaled_confidence, so the expected candidate is known precisely."""
+    bg = beat_grid
+    duration_ms = 200000.0
+    phrases = [
+        Phrase(beat_start=1, beat_end=100, kind=1, label="Intro",
+               position_ms=0.0, duration_ms=40000.0),
+        Phrase(beat_start=100, beat_end=200, kind=5, label="Chorus",
+               position_ms=40000.0, duration_ms=40000.0),
+        Phrase(beat_start=200, beat_end=300, kind=3, label="Down",
+               position_ms=80000.0, duration_ms=40000.0),
+        Phrase(beat_start=300, beat_end=400, kind=5, label="Chorus",
+               position_ms=120000.0, duration_ms=40000.0),
+        Phrase(beat_start=400, beat_end=500, kind=6, label="Outro",
+               position_ms=160000.0, duration_ms=40000.0),
+    ]
+    heights = [0.5] * 20 + [0.9] * 20 + [0.3] * 20 + [0.9] * 20 + [0.5] * 20
+    waveform = [WaveformPoint(height=h, red=4, green=4, blue=4) for h in heights]
+    track = Track(
+        id=99, title="Waveform Test", artist="Test", bpm=128.0,
+        duration_ms=duration_ms, analysis_path="", cues=[], phrases=phrases,
+        beat_grid=bg, waveform=waveform,
+    )
+
+    heuristic = CueStrategy().propose(track)
+    payload = agentic.build_track_payload(track, heuristic)
+
+    candidates = payload["energy_recovery_candidates"]
+    assert len(candidates) == 1
+    assert candidates[0]["phrase_index"] == 3  # the recovery Chorus at 120000ms
+    assert candidates[0]["cycle_number"] == 1
+    assert candidates[0]["mean_energy"] == pytest.approx(0.9)
+
+
 # --- estimate_track_cost --------------------------------------------------
 # Real per-track estimate: input tokens come from live count_tokens() calls
 # against the actual constructed payload (via the fake provider here),

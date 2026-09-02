@@ -56,6 +56,7 @@ def render_auth_setup_html() -> str:
     <label for="model">Model</label>
     <select id="model"></select>
     <p id="model-price" class="meta small"></p>
+    <p id="model-guidance" class="meta small"></p>
   </div>
 
   <div id="status" class="status"></div>
@@ -131,6 +132,7 @@ _CSS = """
   .status.error { color: #dc3545; }
   .status.success { color: #28a745; }
   .status.info { color: #888; }
+  #model-guidance { color: #17a2b8; }
   .next-steps { margin-top: 8px; padding-top: 18px; border-top: 1px solid #2a2a3e; }
   .cmd-row {
     display: flex;
@@ -163,6 +165,7 @@ const fetchModelsBtn = document.getElementById('fetch-models');
 const modelsSection = document.getElementById('models-section');
 const modelEl = document.getElementById('model');
 const modelPriceEl = document.getElementById('model-price');
+const modelGuidanceEl = document.getElementById('model-guidance');
 const statusEl = document.getElementById('status');
 const saveBtn = document.getElementById('save');
 const nextStepsEl = document.getElementById('next-steps');
@@ -193,13 +196,18 @@ toggleKeyBtn.addEventListener('click', function() {
 
 function updatePriceLabel() {
   const chosen = lastModels.find(m => m.id === modelEl.value);
-  if (!chosen) { modelPriceEl.textContent = ''; return; }
+  if (!chosen) { modelPriceEl.textContent = ''; modelGuidanceEl.textContent = ''; return; }
   if (chosen.price_input_per_million == null) {
     modelPriceEl.textContent = 'Pricing not in the local table -- check the provider\\'s site.';
   } else {
     modelPriceEl.textContent = '$' + chosen.price_input_per_million.toFixed(2) + ' / $' +
       chosen.price_output_per_million.toFixed(2) + ' per 1M tokens (in/out)';
   }
+  modelGuidanceEl.textContent = chosen.recommended_accuracy
+    ? 'Recommended: tested meaningfully more accurate for djcues\\' cue-placement task ' +
+      'than the cheaper lightweight tiers, at a still-small real cost (well under a cent ' +
+      'per track).'
+    : '';
 }
 modelEl.addEventListener('change', updatePriceLabel);
 
@@ -242,10 +250,15 @@ fetchModelsBtn.addEventListener('click', async function() {
     data.models.forEach(m => {
       const opt = document.createElement('option');
       opt.value = m.id;
-      opt.textContent = m.display_name + (m.recommended ? ' (recommended, lightweight)' : '');
+      let label = m.display_name;
+      if (m.recommended_accuracy) label += ' (recommended -- best accuracy in testing)';
+      else if (m.recommended) label += ' (cheapest, lightweight default)';
+      opt.textContent = label;
       modelEl.appendChild(opt);
     });
-    if (data.default_model) modelEl.value = data.default_model;
+    // Prefer the accuracy pick when this provider has one measured;
+    // otherwise fall back to the cheap default.
+    modelEl.value = data.recommended_accuracy_model || data.default_model || modelEl.value;
     updatePriceLabel();
 
     modelsSection.classList.remove('hidden');
