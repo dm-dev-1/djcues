@@ -140,6 +140,84 @@ def _print_comparison(proposal, track):
     return pad_stats
 
 
+def _resolve_agentic_provider(provider_name, model):
+    """Resolve (provider_name, api_key, model) for --agentic, or exit
+    with a clear error if no key is configured. Shared by propose/
+    compare/review so the "run `djcues auth set`" message and the
+    config/env-var resolution logic live in exactly one place."""
+    from djcues.auth import load_config, resolve_api_key
+    from djcues.providers import DEFAULT_MODEL
+
+    config = load_config()
+    provider_name = provider_name or config.get("provider", "anthropic")
+    api_key, _source = resolve_api_key(provider_name)
+    if not api_key:
+        click.echo(
+            f"Error: no API key configured for '{provider_name}'. "
+            f"Run: djcues auth set",
+            err=True,
+        )
+        raise SystemExit(1)
+    resolved_model = model or config.get("model") or DEFAULT_MODEL.get(provider_name)
+    return provider_name, api_key, resolved_model
+
+
+def _get_proposer(agentic, provider_name, model, offset, loop_bars, skip_critic):
+    """Returns (proposer, telemetry_list, resolved_model). `proposer(track)`
+    returns a CueProposal, either from the local heuristic or agentic
+    analysis. telemetry_list/resolved_model are None for the heuristic
+    path; telemetry_list accumulates one AgenticTelemetry per call for
+    the agentic path's cost summary."""
+    if not agentic:
+        strategy = CueStrategy(memory_offset_bars=offset, loop_length_bars=loop_bars)
+        return strategy.propose, None, None
+
+    from djcues.providers import get_provider
+    from djcues.agentic import propose_with_telemetry
+
+    provider_name, api_key, resolved_model = _resolve_agentic_provider(provider_name, model)
+    provider = get_provider(provider_name)
+    telemetry_list = []
+
+    def proposer(track):
+        proposal, telemetry = propose_with_telemetry(
+            track,
+            provider,
+            api_key,
+            resolved_model,
+            memory_offset_bars=offset,
+            loop_length_bars=loop_bars,
+            skip_critic=skip_critic,
+        )
+        telemetry_list.append(telemetry)
+        return proposal
+
+    return proposer, telemetry_list, resolved_model
+
+
+def _print_cost_summary(telemetry_list, model, track_count):
+    """Print the post-run cost summary for an --agentic run, in the
+    same voice as apply's 'Done: N tracks, M cues written.' line."""
+    total_calls = sum(t.calls_made for t in telemetry_list)
+    total_input = sum(t.input_tokens for t in telemetry_list)
+    total_output = sum(t.output_tokens for t in telemetry_list)
+    total_errors = sum(len(t.errors) for t in telemetry_list)
+
+    from djcues.providers import estimate_cost
+
+    cost = estimate_cost(model, total_input, total_output)
+    cost_str = f"${cost:.4f}" if cost is not None else "unknown (model not in local price table)"
+    click.echo(
+        f"\nDone: {track_count} tracks analyzed. "
+        f"Actual cost: {cost_str} ({total_calls} calls, {model})."
+    )
+    if total_errors:
+        click.echo(
+            f"  {total_errors} specialist/critic call(s) fell back to the heuristic "
+            f"value for their pad — see notes above for which."
+        )
+
+
 @click.group()
 def cli():
     """djcues — automated rekordbox cue placement based on phrase analysis."""
@@ -157,8 +235,29 @@ def cli():
 @click.option("--all", "all_tracks", is_flag=True, help="Process all tracks in the playlist.")
 @click.option("--offset", default=16, show_default=True, help="Memory cue offset in bars.")
 @click.option("--loop-bars", default=4, show_default=True, help="Loop length in bars.")
-def propose(playlist_name, track_name, all_tracks, offset, loop_bars):
+@click.option("--agentic", is_flag=True, help="Use LLM-based multi-agent analysis instead of the local heuristic (BYOK — run 'djcues auth set' first).")
+@click.option("--provider", default=None, help="Provider for --agentic: 'anthropic' or 'gemini'. Defaults to your configured provider.")
+@click.option("--model", default=None, help="Model for --agentic. Defaults to your configured model.")
+@click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
+@click.option("--estimate-only", is_flag=True, help="Print an estimated --agentic cost and exit without calling the model.")
+def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, estimate_only):
     """Propose cue placements for tracks in a playlist."""
+    if estimate_only and not agentic:
+        click.echo("Error: --estimate-only only applies with --agentic.", err=True)
+        raise SystemExit(1)
+
+    if estimate_only:
+        from djcues.agentic import estimate_cost as estimate_agentic_cost
+
+        _provider_name, _api_key, resolved_model = _resolve_agentic_provider(provider, model)
+        in_tok, out_tok, cost = estimate_agentic_cost(resolved_model, skip_critic)
+        cost_str = f"${cost:.4f}" if cost is not None else "unknown (model not in local price table)"
+        click.echo(
+            f"Estimated cost per track: {cost_str} "
+            f"(~{in_tok} input / ~{out_tok} output tokens, {resolved_model})"
+        )
+        return
+
     playlist = find_playlist(playlist_name)
     if playlist is None:
         click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
@@ -169,23 +268,27 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars):
         click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
         raise SystemExit(1)
 
-    strategy = CueStrategy(memory_offset_bars=offset, loop_length_bars=loop_bars)
+    proposer, telemetry_list, resolved_model = _get_proposer(
+        agentic, provider, model, offset, loop_bars, skip_critic
+    )
 
     if all_tracks:
-        for t in tracks:
-            proposal = strategy.propose(t)
-            _print_proposal(proposal, t)
+        selected = tracks
     elif track_name:
-        matched = [t for t in tracks if track_name.lower() in t.title.lower()]
-        if not matched:
+        selected = [t for t in tracks if track_name.lower() in t.title.lower()]
+        if not selected:
             click.echo(f"Error: no track matching '{track_name}' in playlist.", err=True)
             raise SystemExit(1)
-        for t in matched:
-            proposal = strategy.propose(t)
-            _print_proposal(proposal, t)
     else:
         click.echo("Error: provide a track name or use --all.", err=True)
         raise SystemExit(1)
+
+    for t in selected:
+        proposal = proposer(t)
+        _print_proposal(proposal, t)
+
+    if telemetry_list is not None:
+        _print_cost_summary(telemetry_list, resolved_model, len(selected))
 
 
 @cli.command()
@@ -194,7 +297,11 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars):
 @click.option("--all", "all_tracks", is_flag=True, help="Compare all tracks in the playlist.")
 @click.option("--offset", default=16, show_default=True, help="Memory cue offset in bars.")
 @click.option("--loop-bars", default=4, show_default=True, help="Loop length in bars.")
-def compare(playlist_name, track_name, all_tracks, offset, loop_bars):
+@click.option("--agentic", is_flag=True, help="Use LLM-based multi-agent analysis instead of the local heuristic (BYOK — run 'djcues auth set' first).")
+@click.option("--provider", default=None, help="Provider for --agentic: 'anthropic' or 'gemini'. Defaults to your configured provider.")
+@click.option("--model", default=None, help="Model for --agentic. Defaults to your configured model.")
+@click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
+def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic):
     """Compare existing cues with proposed placements."""
     playlist = find_playlist(playlist_name)
     if playlist is None:
@@ -206,13 +313,18 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars):
         click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
         raise SystemExit(1)
 
-    strategy = CueStrategy(memory_offset_bars=offset, loop_length_bars=loop_bars)
+    proposer, telemetry_list, resolved_model = _get_proposer(
+        agentic, provider, model, offset, loop_bars, skip_critic
+    )
 
     if all_tracks:
         per_track_stats = []
         for t in tracks:
-            proposal = strategy.propose(t)
+            proposal = proposer(t)
             per_track_stats.append(_print_comparison(proposal, t))
+
+        if telemetry_list is not None:
+            _print_cost_summary(telemetry_list, resolved_model, len(tracks))
 
         merged = merge_pad_stats(per_track_stats)
         total = overall_stats(merged)
@@ -242,8 +354,10 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars):
             click.echo(f"Error: no track matching '{track_name}' in playlist.", err=True)
             raise SystemExit(1)
         for t in matched:
-            proposal = strategy.propose(t)
+            proposal = proposer(t)
             _print_comparison(proposal, t)
+        if telemetry_list is not None:
+            _print_cost_summary(telemetry_list, resolved_model, len(matched))
     else:
         click.echo("Error: provide a track name or use --all.", err=True)
         raise SystemExit(1)
@@ -320,7 +434,11 @@ def viz(playlist, track_name, all_tracks, compare_mode, offset, loop_bars, outpu
 @click.option("--offset", default=16, help="Memory cue offset in bars (default: 16)")
 @click.option("--loop-bars", default=4, help="Loop length in bars (default: 4)")
 @click.option("--output", "-o", default=None, help="Output directory (default: current dir)")
-def review(playlist, track_name, all_tracks, offset, loop_bars, output):
+@click.option("--agentic", is_flag=True, help="Use LLM-based multi-agent analysis instead of the local heuristic (BYOK — run 'djcues auth set' first).")
+@click.option("--provider", default=None, help="Provider for --agentic: 'anthropic' or 'gemini'. Defaults to your configured provider.")
+@click.option("--model", default=None, help="Model for --agentic. Defaults to your configured model.")
+@click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
+def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic, provider, model, skip_critic):
     """Launch interactive review session in browser."""
     import pathlib
     import time
@@ -338,7 +456,9 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output):
         click.echo(f"No tracks found in playlist '{playlist}'.", err=True)
         raise SystemExit(1)
 
-    strategy = CueStrategy(memory_offset_bars=offset, loop_length_bars=loop_bars)
+    proposer, telemetry_list, resolved_model = _get_proposer(
+        agentic, provider, model, offset, loop_bars, skip_critic
+    )
 
     if all_tracks:
         selected = tracks
@@ -354,9 +474,12 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output):
     pairs = []
     for t in selected:
         if t.phrases:
-            pairs.append((t, strategy.propose(t)))
+            pairs.append((t, proposer(t)))
         else:
             click.echo(f"  Skipping {t.title} (no phrase data)", err=True)
+
+    if telemetry_list is not None:
+        _print_cost_summary(telemetry_list, resolved_model, len(pairs))
 
     if not pairs:
         click.echo("No tracks with phrase data to review.", err=True)
@@ -457,3 +580,148 @@ def history():
             f"  {row['pad']:<5s} {row['total']:<8d} {row['corrected']:<11d} "
             f"{row['first_seen']:<20s} {row['last_seen']:<20s}"
         )
+
+
+@cli.group()
+def auth():
+    """Manage BYOK API keys and settings for --agentic analysis.
+
+    Keys are stored in your OS credential store (Windows Credential
+    Manager / macOS Keychain / Linux Secret Service) via the `keyring`
+    package — never in a plaintext file. Requires the 'agentic' extra:
+    pip install djcues[agentic]
+    """
+
+
+@auth.command("set")
+@click.option(
+    "--provider",
+    type=click.Choice(["anthropic", "gemini"]),
+    prompt=True,
+    help="Which provider to configure.",
+)
+def auth_set(provider):
+    """Configure an API key and default model, with a live model list."""
+    from djcues.auth import KeyringUnavailableError, load_config, save_config, set_api_key
+    from djcues.providers import DEFAULT_MODEL, get_provider
+
+    api_key = click.prompt(f"Enter your {provider} API key", hide_input=True)
+
+    provider_adapter = get_provider(provider)
+    click.echo("Fetching available models...")
+    try:
+        models = provider_adapter.list_models(api_key)
+    except Exception as e:
+        click.echo(f"Error: could not validate key / fetch models: {e}", err=True)
+        raise SystemExit(1)
+
+    if not models:
+        click.echo("Error: no models returned — check your key and try again.", err=True)
+        raise SystemExit(1)
+
+    default_model_id = DEFAULT_MODEL.get(provider)
+    # Recommended lightweight default first, then alphabetical.
+    models_sorted = sorted(models, key=lambda m: (m.id != default_model_id, m.id))
+
+    click.echo("\nAvailable models (pricing from djcues' local table, not live):")
+    default_choice = 1
+    for i, m in enumerate(models_sorted, 1):
+        marker = " (recommended, lightweight)" if m.id == default_model_id else ""
+        if m.id == default_model_id:
+            default_choice = i
+        ctx = f", {m.context_window} context" if m.context_window else ""
+        click.echo(f"  {i}. {m.display_name} [{m.id}{ctx}]{marker}")
+
+    choice = click.prompt(
+        "Choose a model number", type=click.IntRange(1, len(models_sorted)), default=default_choice
+    )
+    chosen_model = models_sorted[choice - 1].id
+
+    try:
+        set_api_key(provider, api_key)
+    except KeyringUnavailableError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    config = load_config()
+    config["provider"] = provider
+    config["model"] = chosen_model
+    save_config(config)
+
+    click.echo(
+        f"\nSaved. Provider: {provider}, model: {chosen_model}. "
+        f"Key stored in your OS credential store, not in any djcues file."
+    )
+
+
+@auth.command("status")
+def auth_status():
+    """Show the configured provider/model and where the key came from (never the key itself)."""
+    from djcues.auth import load_config, resolve_api_key
+
+    config = load_config()
+    provider = config.get("provider")
+    model = config.get("model")
+    if not provider:
+        click.echo("No agentic provider configured. Run: djcues auth set")
+        return
+
+    api_key, source = resolve_api_key(provider)
+    click.echo(f"Provider: {provider}")
+    click.echo(f"Model: {model}")
+    if api_key:
+        click.echo(f"API key: configured (source: {source})")
+    else:
+        click.echo("API key: not found (checked OS credential store and environment variable)")
+
+
+@auth.command("clear")
+@click.option(
+    "--provider",
+    type=click.Choice(["anthropic", "gemini"]),
+    prompt=True,
+    help="Which provider's key to remove.",
+)
+def auth_clear(provider):
+    """Remove a stored API key from the OS credential store."""
+    from djcues.auth import KeyringUnavailableError, clear_api_key
+
+    if not click.confirm(f"Remove the stored {provider} API key?"):
+        return
+    try:
+        clear_api_key(provider)
+    except KeyringUnavailableError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+    click.echo(f"Removed the {provider} API key from your OS credential store.")
+
+
+@auth.command("models")
+@click.option(
+    "--provider",
+    type=click.Choice(["anthropic", "gemini"]),
+    default=None,
+    help="Provider to list models for (defaults to your configured provider).",
+)
+def auth_models(provider):
+    """Re-list live models for a provider without changing your saved config."""
+    from djcues.auth import load_config, resolve_api_key
+    from djcues.providers import get_provider
+
+    config = load_config()
+    provider = provider or config.get("provider")
+    if not provider:
+        click.echo("Error: no provider configured or specified. Use --provider.", err=True)
+        raise SystemExit(1)
+
+    api_key, _source = resolve_api_key(provider)
+    if not api_key:
+        click.echo(f"Error: no API key configured for '{provider}'. Run: djcues auth set", err=True)
+        raise SystemExit(1)
+
+    provider_adapter = get_provider(provider)
+    models = provider_adapter.list_models(api_key)
+    click.echo(f"Available {provider} models:")
+    for m in models:
+        ctx = f", {m.context_window} context" if m.context_window else ""
+        click.echo(f"  {m.id} ({m.display_name}{ctx})")

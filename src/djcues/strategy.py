@@ -38,6 +38,98 @@ def _spectral_similarity(wf_points: list, i0: int, i_mid: int, i1: int) -> float
     return max(0.0, 1.0 - mse)
 
 
+def compute_phrase_energy(track: Track) -> list[tuple[Phrase, float]]:
+    """Mean waveform energy per phrase, downsampled from track.waveform.
+
+    Shared between the heuristic (slot F's dip/recovery detection) and
+    the agentic mode (which reuses this same compact summary instead of
+    shipping raw per-frame waveform data to an LLM). Returns an empty
+    list if the track has no waveform data.
+    """
+    if not track.waveform or not track.phrases or track.duration_ms <= 0:
+        return []
+
+    n_wf = len(track.waveform)
+    phrase_energy: list[tuple[Phrase, float]] = []
+    for p in track.phrases:
+        i0 = int(n_wf * p.position_ms / track.duration_ms)
+        i1 = int(n_wf * (p.position_ms + p.duration_ms) / track.duration_ms)
+        if i1 > i0:
+            heights = [pt.height for pt in track.waveform[i0:i1]]
+            phrase_energy.append((p, sum(heights) / len(heights)))
+        else:
+            phrase_energy.append((p, 0.0))
+    return phrase_energy
+
+
+def build_cue_points(
+    positions: dict[str, float],
+    confidence: dict[str, float],
+    track: Track,
+    memory_offset_bars: int,
+    loop_length_bars: int,
+) -> tuple[list[CuePoint], list[CuePoint]]:
+    """Turn a positions/confidence dict into (hot_cues, memory_cues).
+
+    Shared cue-assembly logic (loop-end calculation, memory-cue
+    offset/snapping) so the heuristic and agentic engines can't diverge
+    on how a pad/position pair becomes real CuePoint objects. Pads with
+    no entry in `positions` are silently skipped, matching the
+    heuristic's existing "omit on zero confidence" behavior.
+    """
+    bg = track.beat_grid
+    hot_cues: list[CuePoint] = []
+    memory_cues: list[CuePoint] = []
+
+    for slot in CUE_SYSTEM:
+        pad = slot.pad
+        if pad not in positions:
+            continue
+
+        pos_ms = positions[pad]
+        loop_end = None
+        if slot.is_loop:
+            loop_end = pos_ms + bg.bars_to_ms(loop_length_bars)
+
+        hot_cues.append(CuePoint(
+            kind=slot.kind,
+            position_ms=pos_ms,
+            loop_end_ms=loop_end,
+            color_table_index=slot.hot_cue_color_table_index,
+            color=slot.hot_cue_color,
+            comment=slot.hot_cue_label,
+        ))
+
+        # Memory cue
+        if slot.memory_offset_bars == 0:
+            mem_pos = pos_ms
+        else:
+            mem_pos = pos_ms - bg.bars_to_ms(memory_offset_bars)
+            first_beat_ms = bg.beat_to_ms(1)
+            if mem_pos < first_beat_ms:
+                mem_pos = first_beat_ms
+            else:
+                # Snap to nearest downbeat (bar start)
+                mem_beat = bg.ms_to_beat(mem_pos)
+                bar_beat = ((mem_beat - 1) // 4) * 4 + 1
+                mem_pos = bg.beat_to_ms(bar_beat)
+
+        mem_loop_end = None
+        if slot.is_loop:
+            mem_loop_end = mem_pos + bg.bars_to_ms(loop_length_bars)
+
+        memory_cues.append(CuePoint(
+            kind=0,
+            position_ms=mem_pos,
+            loop_end_ms=mem_loop_end,
+            color_table_index=slot.memory_cue_color_table_index,
+            color=slot.memory_cue_color,
+            comment=slot.memory_cue_label,
+        ))
+
+    return hot_cues, memory_cues
+
+
 class CueStrategy:
     """Proposes cue placements based on phrase analysis and the cue system."""
 
@@ -53,8 +145,6 @@ class CueStrategy:
         """Generate a cue proposal for a track based on its phrase structure."""
         bg = track.beat_grid
         phrases = track.phrases
-        hot_cues: list[CuePoint] = []
-        memory_cues: list[CuePoint] = []
         confidence: dict[str, float] = {}
         notes: list[str] = []
 
@@ -216,20 +306,9 @@ class CueStrategy:
         # Find the first phrase where energy returns to peak levels after
         # a dip following the Drop. This is the "second drop" in the track.
         f_placed = False
-        if "D" in positions and track.waveform and phrases:
+        phrase_energy = compute_phrase_energy(track)
+        if "D" in positions and phrase_energy:
             drop_ms = positions["D"]
-            n_wf = len(track.waveform)
-
-            # Compute per-phrase energy
-            phrase_energy: list[tuple[Phrase, float]] = []
-            for p in phrases:
-                i0 = int(n_wf * p.position_ms / track.duration_ms)
-                i1 = int(n_wf * (p.position_ms + p.duration_ms) / track.duration_ms)
-                if i1 > i0:
-                    heights = [pt.height for pt in track.waveform[i0:i1]]
-                    phrase_energy.append((p, sum(heights) / len(heights)))
-                else:
-                    phrase_energy.append((p, 0.0))
 
             peak_energy = max((e for _, e in phrase_energy), default=0)
             if peak_energy > 0:
@@ -336,52 +415,9 @@ class CueStrategy:
             confidence["H"] = 0.0
             notes.append("H (Loop Out): no Outro to anchor from")
 
-        # --- Build CuePoint objects ---
-        for slot in CUE_SYSTEM:
-            pad = slot.pad
-            if pad not in positions:
-                continue
-
-            pos_ms = positions[pad]
-            loop_end = None
-            if slot.is_loop:
-                loop_end = pos_ms + bg.bars_to_ms(self.loop_length_bars)
-
-            hot_cues.append(CuePoint(
-                kind=slot.kind,
-                position_ms=pos_ms,
-                loop_end_ms=loop_end,
-                color_table_index=slot.hot_cue_color_table_index,
-                color=slot.hot_cue_color,
-                comment=slot.hot_cue_label,
-            ))
-
-            # Memory cue
-            if slot.memory_offset_bars == 0:
-                mem_pos = pos_ms
-            else:
-                mem_pos = pos_ms - bg.bars_to_ms(self.memory_offset_bars)
-                first_beat_ms = bg.beat_to_ms(1)
-                if mem_pos < first_beat_ms:
-                    mem_pos = first_beat_ms
-                else:
-                    # Snap to nearest downbeat (bar start)
-                    mem_beat = bg.ms_to_beat(mem_pos)
-                    bar_beat = ((mem_beat - 1) // 4) * 4 + 1
-                    mem_pos = bg.beat_to_ms(bar_beat)
-
-            mem_loop_end = None
-            if slot.is_loop:
-                mem_loop_end = mem_pos + bg.bars_to_ms(self.loop_length_bars)
-
-            memory_cues.append(CuePoint(
-                kind=0,
-                position_ms=mem_pos,
-                loop_end_ms=mem_loop_end,
-                color_table_index=slot.memory_cue_color_table_index,
-                color=slot.memory_cue_color,
-                comment=slot.memory_cue_label,
-            ))
+        hot_cues, memory_cues = build_cue_points(
+            positions, confidence, track, self.memory_offset_bars, self.loop_length_bars
+        )
 
         return CueProposal(
             track=track,

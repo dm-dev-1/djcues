@@ -24,6 +24,13 @@ dependencies = [
     "click>=8.0",
 ]
 
+[project.optional-dependencies]
+agentic = [
+    "anthropic>=0.40",
+    "google-genai>=1.0",
+    "keyring>=25.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/mcroydon/djcues"
 Repository = "https://github.com/mcroydon/djcues"
@@ -31,6 +38,9 @@ Repository = "https://github.com/mcroydon/djcues"
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "anthropic>=0.40",
+    "google-genai>=1.0",
+    "keyring>=25.0",
 ]
 
 [project.scripts]

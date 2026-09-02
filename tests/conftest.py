@@ -1,3 +1,4 @@
+import os
 import pathlib
 import pytest
 
@@ -9,6 +10,15 @@ REKORDBOX_DB_EXISTS = pathlib.Path.home().joinpath(
 
 requires_rekordbox = pytest.mark.skipif(
     not REKORDBOX_DB_EXISTS, reason="Rekordbox database not found"
+)
+
+# For tests that need a real provider API key (live model list, real
+# generate_structured calls, ...) -- not used by the mocked agentic/auth
+# unit tests, only by anything that deliberately exercises a live provider.
+HAS_API_KEY = bool(os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+
+requires_api_key = pytest.mark.skipif(
+    not HAS_API_KEY, reason="No ANTHROPIC_API_KEY or GEMINI_API_KEY set"
 )
 
 
