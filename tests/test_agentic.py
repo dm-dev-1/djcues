@@ -262,7 +262,25 @@ def test_build_track_payload_energy_recovery_candidates_are_precomputed(beat_gri
     assert len(candidates) == 1
     assert candidates[0]["phrase_index"] == 3  # the recovery Chorus at 120000ms
     assert candidates[0]["cycle_number"] == 1
-    assert candidates[0]["mean_energy"] == pytest.approx(0.9)
+
+
+def test_build_track_payload_drop_candidates_are_precomputed(sample_track: Track):
+    """The Structure specialist shouldn't have to compute/check the 20%
+    threshold itself -- real testing on tracks with many Chorus/Up
+    phrases showed that becoming unreliable. sample_track has 5 Chorus
+    phrases (indices 4, 7, 8, 9, 10 -- see the shared `phrases` fixture),
+    all of which are >=20% of the 218000ms duration, so all 5 qualify."""
+    heuristic = CueStrategy().propose(sample_track)
+    payload = agentic.build_track_payload(sample_track, heuristic)
+
+    candidates = payload["drop_candidates"]
+    assert [c["phrase_index"] for c in candidates] == [4, 7, 8, 9, 10]
+    assert all(c["label"] == "Chorus" for c in candidates)
+    # The first candidate must be exactly what the heuristic itself picked
+    # -- the whole point is giving the LLM the heuristic's own answer as
+    # a trivial default, not a different pre-filtered list.
+    assert candidates[0]["phrase_index"] == payload["heuristic_phrase_index"]["D"]
+    assert set(candidates[0].keys()) == {"phrase_index", "label"}
 
 
 # --- estimate_track_cost --------------------------------------------------

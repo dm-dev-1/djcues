@@ -33,6 +33,7 @@ from djcues.strategy import (
     CueStrategy,
     build_cue_points,
     compute_phrase_energy,
+    find_drop_candidates,
     find_energy_recoveries,
 )
 
@@ -149,6 +150,19 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
             for n, (i, _p, e) in enumerate(recoveries, start=1)
         ]
 
+    # Pre-computed Drop candidates (already passing the empirically-tuned
+    # 20%-of-duration rule, or the correct fallback if none do), for the
+    # same reason: real testing on tracks with many (15+) Chorus/Up
+    # phrases showed the model unreliably computing/checking that
+    # percentage itself when scanning the full phrase list.
+    drop_phrase_candidates, _drop_rule = find_drop_candidates(track)
+    drop_candidate_ids = {id(p) for p in drop_phrase_candidates}
+    drop_candidates_payload = [
+        {"phrase_index": i, "label": p.label}
+        for i, p in enumerate(track.phrases)
+        if id(p) in drop_candidate_ids
+    ]
+
     return {
         "bpm": track.bpm,
         "duration_ms": round(track.duration_ms),
@@ -158,6 +172,7 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
         "heuristic_confidence": heuristic_by_pad,
         "heuristic_phrase_index": heuristic_phrase_index,
         "energy_recovery_candidates": recovery_candidates,
+        "drop_candidates": drop_candidates_payload,
     }
 
 
@@ -232,19 +247,20 @@ _STRUCTURE_SYSTEM = (
     "after the intro), Breakdown (the drop in energy after the Drop), and "
     "Outro (where the track's ending section begins). You are given the "
     "track's phrase structure (intro/up/chorus/down/outro-style labels with "
-    "beat positions and position_ms), its total duration_ms, and the local "
-    "heuristic's own choice (heuristic_phrase_index) and confidence "
-    "(heuristic_confidence) per pad for reference. Pick a phrase_index for "
-    "each from the provided list -- never invent a position outside it.\n\n"
-    "Hard constraint for Drop: it must be a Chorus (or Up) phrase whose "
-    "position_ms is at least 20% of duration_ms. This threshold was "
-    "measured on real DJ corrections and materially improved accuracy, so "
-    "do not place the Drop on the first Chorus just because it's first -- "
-    "a track commonly has one or more early Choruses before the real Drop, "
-    "and picking one of those is a common mistake to avoid. If you agree "
-    "with the heuristic's choice, say so with matching confidence; if you "
-    "see a clearly better phrase that still satisfies the 20% constraint, "
-    "pick it and explain why.\n\n"
+    "beat positions and position_ms), its total duration_ms, drop_candidates "
+    "(phrases already filtered to the ones that qualify for the Drop -- see "
+    "below), and the local heuristic's own choice (heuristic_phrase_index) "
+    "and confidence (heuristic_confidence) per pad for reference. Pick a "
+    "phrase_index for each from the provided list -- never invent a "
+    "position outside it.\n\n"
+    "Rule for Drop: drop_candidates is already filtered to phrases "
+    "satisfying an empirically-measured rule (at least 20% into the track, "
+    "or the correct fallback if none qualify) -- pick the FIRST entry in "
+    "drop_candidates by default; you do not need to compute or check the "
+    "percentage yourself, it's already been done. Only pick a different "
+    "phrase_index if you have a clear, specific reason from the phrase "
+    "structure, and say why -- don't second-guess the filtering by "
+    "re-deriving it from position_ms/duration_ms.\n\n"
     "Rule for Breakdown: it must be a Down- or Bridge-labeled phrase whose "
     "position_ms is strictly after the Drop's position_ms. Among phrases "
     "that qualify, pick the EARLIEST one, not a later one that might look "

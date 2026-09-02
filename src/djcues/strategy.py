@@ -102,6 +102,44 @@ def find_energy_recoveries(
     return recoveries, peak_energy, recovery_threshold
 
 
+def find_drop_candidates(track: Track) -> tuple[list[Phrase], str]:
+    """Chorus/Up phrases qualifying for slot D's empirically-tuned rule:
+    at least 20% into the track (commit 2b6cd36, D accuracy 54% -> 71%),
+    in track order. Extracted so the agentic specialist gets this exact,
+    already-filtered list instead of re-deriving the percentage check
+    itself -- live testing showed that check becoming unreliable on
+    tracks with many (15+) Chorus/Up phrases (dense breakbeat edits in
+    particular): the model would sometimes pick a phrase that doesn't
+    actually clear the 20% line, or a later one instead of the first
+    qualifying one, when scanning a long candidate list itself.
+
+    Returns (candidates, rule) where rule is which tier of the fallback
+    chain produced them: "late_chorus" (the common case -- one or more
+    Choruses at/after 20%), "up_after_early_chorus" (no Chorus reaches
+    20%, but an Up phrase follows the last early one), "last_chorus_
+    fallback" (neither of the above), or "none" (no Chorus phrase at
+    all). Empty candidates only when rule is "none".
+    """
+    choruses = [p for p in track.phrases if p.label == "Chorus"]
+    if not choruses:
+        return [], "none"
+
+    min_drop_ms = track.duration_ms * 0.20
+    late_choruses = [c for c in choruses if c.position_ms >= min_drop_ms]
+    if late_choruses:
+        return late_choruses, "late_chorus"
+
+    last_early_chorus = choruses[-1]
+    ups_after = [
+        p for p in track.phrases
+        if p.label == "Up" and p.position_ms > last_early_chorus.position_ms
+    ]
+    if ups_after:
+        return ups_after, "up_after_early_chorus"
+
+    return [choruses[-1]], "last_chorus_fallback"
+
+
 def build_cue_points(
     positions: dict[str, float],
     confidence: dict[str, float],
@@ -207,34 +245,17 @@ class CueStrategy:
         # --- D: Drop (first Chorus or Up after 20% of track) ---
         # The Drop is the first major energy peak after the intro section.
         # Data shows it's typically around 30% into the track (median).
-        # Look for the first Chorus (or Up preceded by a Chorus) that's
-        # at least 20% into the track — empirically tuned (D accuracy
-        # 54% -> 71%, see commit 2b6cd36). Fallback to first Chorus after
-        # the first Up→Chorus cycle.
-        choruses = [p for p in phrases if p.label == "Chorus"]
-        drop_candidates = [p for p in phrases if p.label in ("Chorus", "Up")]
-        min_drop_ms = track.duration_ms * 0.20  # at least 20% into track
-        if choruses:
-            # Primary: first Chorus at or after 20% mark
-            late_choruses = [c for c in choruses if c.position_ms >= min_drop_ms]
-            if late_choruses:
-                drop_phrase = late_choruses[0]
+        drop_candidates, drop_rule = find_drop_candidates(track)
+        if drop_candidates:
+            drop_phrase = drop_candidates[0]
+            if drop_rule == "late_chorus":
                 notes.append(f"D (Drop): first Chorus after 20% at beat {drop_phrase.beat_start}")
+            elif drop_rule == "up_after_early_chorus":
+                notes.append(
+                    f"D (Drop): Up after early Chorus, beat {drop_phrase.beat_start}"
+                )
             else:
-                # All choruses are early — check for an Up after the last early Chorus
-                last_early_chorus = choruses[-1]
-                ups_after = [p for p in phrases
-                             if p.label == "Up"
-                             and p.position_ms > last_early_chorus.position_ms]
-                if ups_after:
-                    drop_phrase = ups_after[0]
-                    notes.append(
-                        f"D (Drop): Up after early Chorus, beat {drop_phrase.beat_start}"
-                    )
-                else:
-                    # Last resort: last Chorus
-                    drop_phrase = choruses[-1]
-                    notes.append(f"D (Drop): last Chorus at beat {drop_phrase.beat_start}")
+                notes.append(f"D (Drop): last Chorus at beat {drop_phrase.beat_start}")
             positions["D"] = drop_phrase.position_ms
             confidence["D"] = 0.85
         else:
