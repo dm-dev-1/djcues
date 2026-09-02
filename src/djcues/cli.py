@@ -645,6 +645,115 @@ def history():
         )
 
 
+_BEATGRID_STATUS_LABELS = {
+    "flagged": "flagged by audio check",
+    "no_grid_data": "no grid data",
+    "audio_unavailable": "audio unavailable",
+    "audio_extra_missing": "djcues[ml] not installed",
+    "decode_failed": "could not decode audio",
+}
+
+
+def _print_beatgrid_report(report) -> None:
+    """Print one track's beat-grid verification result."""
+    sc = report.self_consistency
+    consistency_label = "self-consistent" if sc.is_consistent else "INCONSISTENT"
+
+    audio_label = ""
+    if report.audio is not None:
+        a = report.audio
+        verdict_label = "consistent" if a.verdict == "consistent" else a.verdict.upper()
+        audio_label = (
+            f"  audio={verdict_label} ({a.pct_within_tolerance:.1f}% within tolerance, "
+            f"mean drift {a.mean_abs_drift_ms:.1f}ms)"
+        )
+    elif report.status == "audio_unavailable":
+        audio_label = "  (audio unavailable -- file missing or moved)"
+    elif report.status == "audio_extra_missing":
+        audio_label = "  (audio check skipped -- run: pip install djcues[ml])"
+    elif report.status == "decode_failed":
+        audio_label = "  (audio check skipped -- could not decode the file)"
+    elif report.status == "no_grid_data":
+        audio_label = "  (no beat-grid data found for this track)"
+
+    click.echo(f"  {report.title[:45]:45s} {consistency_label:16s}{audio_label}")
+    for note in sc.notes:
+        click.echo(f"      {note}")
+
+
+def _print_beatgrid_summary(reports) -> None:
+    """Aggregate summary across multiple tracks, mirroring compare
+    --all's per-track-then-aggregate style."""
+    from collections import Counter
+
+    counts = Counter(r.status for r in reports)
+    total = len(reports)
+
+    click.echo(f"\n{'=' * 60}")
+    click.echo(f"  Overall — {total} tracks checked, {counts.get('ok', 0)} OK")
+    extra = [
+        f"{counts[status]} {label}"
+        for status, label in _BEATGRID_STATUS_LABELS.items()
+        if counts.get(status)
+    ]
+    if extra:
+        click.echo(f"  {', '.join(extra)}")
+    click.echo(f"{'=' * 60}")
+
+
+@cli.command()
+@click.argument("playlist_name")
+@click.argument("track_name", required=False)
+@click.option("--all", "all_tracks", is_flag=True, help="Check all tracks in the playlist.")
+@click.option("--deep", is_flag=True, help="Force real audio-based verification even when the free check already looks fine.")
+@click.option("--tolerance-ms", default=30.0, show_default=True, help="Audio-based drift tolerance in ms.")
+def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms):
+    """Verify Rekordbox's stored beat grid is still trustworthy.
+
+    Always runs a free, audio-independent self-consistency check first
+    (no extra install needed) using Rekordbox's own full per-beat grid
+    data. Only escalates to real audio-based verification -- which
+    needs the 'ml' extra (pip install djcues[ml]) -- when the free
+    check looks suspicious, or --deep forces it regardless. Never
+    writes anything to Rekordbox.
+    """
+    from djcues.beat_verify import verify_beat_grid
+    from djcues.db import extract_raw_beat_grid, get_db
+
+    playlist = find_playlist(playlist_name)
+    if playlist is None:
+        click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    tracks = load_playlist_tracks(playlist.ID)
+    if not tracks:
+        click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
+        raise SystemExit(1)
+
+    if all_tracks:
+        selected = tracks
+    elif track_name:
+        selected = [t for t in tracks if track_name.lower() in t.title.lower()]
+        if not selected:
+            click.echo(f"Error: no track matching '{track_name}' in playlist.", err=True)
+            raise SystemExit(1)
+    else:
+        click.echo("Error: provide a track name or use --all.", err=True)
+        raise SystemExit(1)
+
+    db = get_db()
+    reports = []
+    for t in selected:
+        content = db.get_content(ID=t.id)
+        entries = extract_raw_beat_grid(content)
+        report = verify_beat_grid(t, entries, force_deep=deep, audio_tolerance_ms=tolerance_ms)
+        reports.append(report)
+        _print_beatgrid_report(report)
+
+    if len(selected) > 1:
+        _print_beatgrid_summary(reports)
+
+
 @cli.group()
 def auth():
     """Manage BYOK API keys and settings for --agentic analysis.
