@@ -221,7 +221,14 @@ def _print_cost_summary(telemetry_list, model, track_count):
     from djcues.providers import estimate_cost
 
     cost = estimate_cost(model, total_input, total_output)
-    cost_str = f"${cost:.4f}" if cost is not None else "unknown (model not in local price table)"
+    if cost is not None:
+        cost_str = f"${cost:.4f}"
+    else:
+        # Still show the raw counts even when the model isn't in the
+        # local price table -- "unknown" alone leaves nothing to work
+        # with; the real token totals at least let someone price it
+        # against the provider's own current page by hand.
+        cost_str = f"unknown ({total_input} input / {total_output} output tokens, not in local price table)"
     click.echo(
         f"\nDone: {track_count} tracks analyzed. "
         f"Actual cost: {cost_str} ({total_calls} calls, {model})."

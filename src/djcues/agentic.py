@@ -85,6 +85,8 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
     condensed vocal-onset region list, and per-phrase energy (via the
     same compute_phrase_energy() the heuristic itself uses).
     """
+    from djcues.constants import KIND_TO_PAD
+
     phrases = [
         {
             "index": i,
@@ -105,6 +107,20 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
         pad: round(conf, 3) for pad, conf in heuristic_proposal.confidence.items()
     }
 
+    # Which phrase (by index into the list above) the heuristic itself
+    # picked per pad -- a concrete anchor for a specialist to agree or
+    # disagree with, not just a bare confidence number with nothing to
+    # compare it against. Heuristic positions always land exactly on a
+    # phrase boundary, so matching by position_ms is safe.
+    heuristic_phrase_index: dict[str, int | None] = {}
+    for cue in heuristic_proposal.hot_cues:
+        pad = KIND_TO_PAD.get(cue.kind)
+        if pad is None:
+            continue
+        heuristic_phrase_index[pad] = next(
+            (i for i, p in enumerate(track.phrases) if p.position_ms == cue.position_ms), None
+        )
+
     return {
         "bpm": track.bpm,
         "duration_ms": round(track.duration_ms),
@@ -112,6 +128,7 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
         "vocal_regions": _summarize_vocal_onsets(track),
         "phrase_energy": energy_by_index,
         "heuristic_confidence": heuristic_by_pad,
+        "heuristic_phrase_index": heuristic_phrase_index,
     }
 
 
@@ -186,29 +203,40 @@ _STRUCTURE_SYSTEM = (
     "after the intro), Breakdown (the drop in energy after the Drop), and "
     "Outro (where the track's ending section begins). You are given the "
     "track's phrase structure (intro/up/chorus/down/outro-style labels with "
-    "beat positions) and the local heuristic's own confidence per pad for "
-    "reference. Pick a phrase_index for each from the provided list -- never "
-    "invent a position outside it. If you agree with a low-confidence "
-    "heuristic guess, say so with matching low confidence; if you see a "
-    "clearly better phrase, pick it and explain why."
+    "beat positions and position_ms), its total duration_ms, and the local "
+    "heuristic's own choice (heuristic_phrase_index) and confidence "
+    "(heuristic_confidence) per pad for reference. Pick a phrase_index for "
+    "each from the provided list -- never invent a position outside it.\n\n"
+    "Hard constraint for Drop: it must be a Chorus (or Up) phrase whose "
+    "position_ms is at least 20% of duration_ms. This threshold was "
+    "measured on real DJ corrections and materially improved accuracy, so "
+    "do not place the Drop on the first Chorus just because it's first -- "
+    "a track commonly has one or more early Choruses before the real Drop, "
+    "and picking one of those is a common mistake to avoid. If you agree "
+    "with the heuristic's choice, say so with matching confidence; if you "
+    "see a clearly better phrase that still satisfies the 20% constraint, "
+    "pick it and explain why."
 )
 
 _VOCAL_SYSTEM = (
     "You place a single DJ cue point, Vocal/Buildup, marking where the "
     "pre-drop buildup or first strong vocal begins. You are given the "
-    "track's phrase structure and a list of detected strong-vocal time "
-    "regions (from vocal-detection analysis, not a transcript). Pick a "
-    "phrase_index from the provided list, preferring one that aligns with "
-    "the first substantial vocal region before the drop, if any."
+    "track's phrase structure, a list of detected strong-vocal time "
+    "regions (from vocal-detection analysis, not a transcript), and the "
+    "local heuristic's own choice (heuristic_phrase_index) for reference. "
+    "Pick a phrase_index from the provided list, preferring one that "
+    "aligns with the first substantial vocal region before the drop, if "
+    "any."
 )
 
 _ENERGY_SYSTEM = (
     "You place a single DJ cue point, Special (also called the 'second "
     "drop'): the point where energy returns to near-peak after dipping "
     "following the main Drop. You are given per-phrase mean energy values "
-    "(0.0-1.0) and the phrase structure. This is a pattern-judgment call, "
-    "not a fixed threshold -- look for a genuine dip-then-recovery shape "
-    "after the Drop, not just any high-energy phrase."
+    "(0.0-1.0), the phrase structure, and the local heuristic's own choice "
+    "(heuristic_phrase_index) for reference. This is a pattern-judgment "
+    "call, not a fixed threshold -- look for a genuine dip-then-recovery "
+    "shape after the Drop, not just any high-energy phrase."
 )
 
 _CRITIC_SYSTEM = (

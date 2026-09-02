@@ -161,6 +161,20 @@ def test_build_track_payload_includes_heuristic_confidence(sample_track: Track):
     assert payload["heuristic_confidence"].keys() == heuristic.confidence.keys()
 
 
+def test_build_track_payload_includes_heuristic_phrase_index_as_a_real_anchor(sample_track: Track):
+    """A specialist needs a concrete phrase to agree/disagree with, not
+    just a bare confidence number with nothing to compare it against."""
+    heuristic = CueStrategy().propose(sample_track)
+    payload = agentic.build_track_payload(sample_track, heuristic)
+
+    heuristic_idx = payload["heuristic_phrase_index"]
+    assert heuristic_idx.keys() == heuristic.confidence.keys()
+
+    hot_d = next(c for c in heuristic.hot_cues if c.kind == 5)  # Drop = pad D
+    resolved_phrase = sample_track.phrases[heuristic_idx["D"]]
+    assert resolved_phrase.position_ms == hot_d.position_ms
+
+
 def test_build_track_payload_is_json_serializable(sample_track: Track):
     heuristic = CueStrategy().propose(sample_track)
     payload = agentic.build_track_payload(sample_track, heuristic)
