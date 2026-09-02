@@ -122,3 +122,31 @@ class CueProposal:
     memory_cues: list[CuePoint]
     confidence: dict[str, float]  # pad letter -> 0.0-1.0
     notes: list[str]  # human-readable explanations
+
+
+@dataclass
+class RawBeatGridEntry:
+    """One entry from Rekordbox's own full per-beat PQTZ array -- the
+    beat-in-bar position (1-4), the tempo Rekordbox recorded at this
+    specific beat, and its timestamp. djcues's BeatGrid collapses all of
+    this into one constant (first_beat_ms, bpm); this preserves what
+    Rekordbox's own analysis actually stored, entry by entry."""
+
+    beat_in_bar: int
+    bpm: float
+    time_ms: float
+
+
+@dataclass
+class SelfConsistencyResult:
+    """Whether Rekordbox's own full beat grid is internally consistent
+    with the constant-tempo model djcues currently assumes -- computed
+    purely from RawBeatGridEntry data already extracted from Rekordbox.
+    No audio file needed."""
+
+    is_consistent: bool
+    tempo_varies: bool
+    max_pairwise_gap_error_ms: float
+    cumulative_drift_at_end_ms: float
+    entry_count: int
+    notes: list[str]

@@ -8,7 +8,7 @@ from typing import Any
 from pyrekordbox import Rekordbox6Database
 
 from djcues.constants import resolve_phrase_label
-from djcues.models import BeatGrid, CuePoint, Phrase, Track, WaveformPoint
+from djcues.models import BeatGrid, CuePoint, Phrase, RawBeatGridEntry, Track, WaveformPoint
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,38 @@ def _extract_beat_grid(track_content: Any) -> BeatGrid:
         logger.warning("Could not read beat grid for %s: %s", track_content.Title, e)
 
     return BeatGrid(first_beat_ms=first_beat_ms, bpm=bpm)
+
+
+def extract_raw_beat_grid(track_content: Any) -> list[RawBeatGridEntry] | None:
+    """Full per-beat array from the PQTZ tag -- beat-in-bar, tempo, and
+    timestamp for every beat Rekordbox's own analysis recorded, not just
+    the first one _extract_beat_grid() collapses everything down to.
+    Same tag, same file, same failure handling as _extract_beat_grid().
+
+    Returns None (not an empty list) if the grid couldn't be read at
+    all, so callers can tell "no data available" apart from "a real,
+    empty grid" -- not called from load_track()'s hot path, so this
+    costs nothing unless a caller actually asks for it.
+    """
+    db = get_db()
+    try:
+        anlz_files = db.read_anlz_files(track_content)
+        for path, af in anlz_files.items():
+            if path.suffix == ".DAT":
+                for tag in af.tags:
+                    if type(tag).__name__ == "PQTZAnlzTag":
+                        beats = tag.get_beats()
+                        bpms = tag.get_bpms()
+                        times = tag.get_times()
+                        return [
+                            RawBeatGridEntry(
+                                beat_in_bar=int(b), bpm=float(p), time_ms=float(t) * 1000
+                            )
+                            for b, p, t in zip(beats, bpms, times)
+                        ]
+    except Exception as e:
+        logger.warning("Could not read raw beat grid for %s: %s", track_content.Title, e)
+    return None
 
 
 def _extract_phrases(track_content: Any, beat_grid: BeatGrid) -> list[Phrase]:
