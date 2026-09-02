@@ -22,6 +22,28 @@ requires_api_key = pytest.mark.skipif(
 )
 
 
+def _importable(*module_names: str) -> bool:
+    import importlib
+
+    for name in module_names:
+        try:
+            importlib.import_module(name)
+        except ImportError:
+            return False
+    return True
+
+
+# For tests that need the `audio` extra (librosa/soundfile -- real audio
+# decode) or the `ml` extra (beat_this/demucs/torch -- real model
+# inference). Neither is required for djcues's core install.
+requires_audio = pytest.mark.skipif(
+    not _importable("librosa", "soundfile"), reason="djcues[audio] not installed"
+)
+requires_ml = pytest.mark.skipif(
+    not _importable("beat_this", "demucs", "torch"), reason="djcues[ml] not installed"
+)
+
+
 @pytest.fixture
 def sample_beat_grid() -> BeatGrid:
     """128 BPM beat grid with first beat at 77ms (World Gone Wild)."""

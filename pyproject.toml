@@ -30,6 +30,31 @@ agentic = [
     "google-genai>=1.0",
     "keyring>=25.0",
 ]
+# Local audio-ML analysis (beat-grid verification, drop enhancement).
+# Split into two tiers deliberately: `audio` alone (no torch) covers
+# real-audio decoding plus the fast, CPU-friendly analysis paths;
+# `ml` is the heavier superset needed for real model inference
+# (beat_this for beat tracking, demucs for source separation). Neither
+# is required for djcues's core install or for --agentic.
+#
+# beat_this/demucs replace an original BeatNet/madmom plan: madmom
+# (last released 2018) is confirmed broken on modern Python/numpy --
+# `from collections import MutableSequence` (removed in Python 3.10)
+# and `np.float` (removed in numpy 1.24) both appear in code it imports
+# unconditionally, with no maintained fork available. beat_this
+# (github.com/CPJKU/beat_this, MIT, ISMIR 2024) is a from-scratch
+# replacement from the same research group specifically built without
+# that dependency, and was verified end-to-end (real CPU inference,
+# correct output) against this project's actual dependency versions.
+audio = [
+    "librosa>=0.10",
+    "soundfile>=0.12",
+]
+ml = [
+    "djcues[audio]",
+    "beat-this>=1.1",
+    "demucs>=4.1",
+]
 
 [project.urls]
 Homepage = "https://github.com/mcroydon/djcues"

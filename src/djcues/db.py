@@ -239,6 +239,7 @@ def load_track(track_content: Any) -> Track:
         beat_grid=beat_grid,
         waveform=waveform,
         vocal_track=vocal_track,
+        audio_path=track_content.FolderPath or None,
     )
 
 

@@ -95,6 +95,7 @@ class Track:
     beat_grid: BeatGrid
     waveform: list[WaveformPoint] | None = None  # color waveform data
     vocal_track: list[int] | None = None  # per-frame vocal confidence (0-4), ~46ms per frame
+    audio_path: str | None = None  # real audio file path (DjmdContent.FolderPath), for audio.py
 
 
 @dataclass
