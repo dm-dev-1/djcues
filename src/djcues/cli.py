@@ -725,3 +725,51 @@ def auth_models(provider):
     for m in models:
         ctx = f", {m.context_window} context" if m.context_window else ""
         click.echo(f"  {m.id} ({m.display_name}{ctx})")
+
+
+@auth.command("web")
+def auth_web():
+    """Configure a provider/key/model from a local browser page instead
+    of the terminal prompt.
+
+    Opens a page served only on 127.0.0.1 — the key is sent once, in a
+    POST body, straight to that local server and stored via the same
+    OS-credential-store path as `djcues auth set`. Nothing is written to
+    disk in plaintext and the key never leaves this machine.
+    """
+    import time
+    import webbrowser
+
+    from djcues.auth_web import render_auth_setup_html
+    from djcues.server import start_auth_server
+
+    html = render_auth_setup_html()
+    server, port = start_auth_server(html_body=html.encode("utf-8"))
+    server_url = f"http://127.0.0.1:{port}"
+
+    webbrowser.open(server_url)
+    click.echo(f"Opened {server_url} in your browser.")
+    click.echo("Enter your API key there, fetch models, and save. Ctrl+C to cancel.")
+
+    try:
+        while not server._setup_complete and not server._shutdown_flag and not server._timed_out:
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        server._shutdown_flag = True
+        click.echo("\nCancelled — nothing was saved.", err=True)
+        return
+
+    if server._timed_out:
+        click.echo(
+            "\nTimed out waiting (30 min of inactivity) — the local server has "
+            "shut down, so the page will now show 'Failed to fetch' if you try "
+            "it. Run 'djcues auth web' again.",
+            err=True,
+        )
+        raise SystemExit(1)
+
+    if server._setup_complete:
+        from djcues.auth import load_config
+
+        config = load_config()
+        click.echo(f"\nSaved. Provider: {config.get('provider')}, model: {config.get('model')}.")
