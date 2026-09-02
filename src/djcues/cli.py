@@ -180,15 +180,30 @@ def _get_proposer(agentic, provider_name, model, offset, loop_bars, skip_critic)
     telemetry_list = []
 
     def proposer(track):
-        proposal, telemetry = propose_with_telemetry(
-            track,
-            provider,
-            api_key,
-            resolved_model,
-            memory_offset_bars=offset,
-            loop_length_bars=loop_bars,
-            skip_critic=skip_critic,
-        )
+        try:
+            proposal, telemetry = propose_with_telemetry(
+                track,
+                provider,
+                api_key,
+                resolved_model,
+                memory_offset_bars=offset,
+                loop_length_bars=loop_bars,
+                skip_critic=skip_critic,
+            )
+        except Exception as e:
+            # Anything escaping propose_with_telemetry is, by its own
+            # design, an auth/permission failure (every other kind of
+            # per-call error is already caught and degraded to the
+            # heuristic there) -- so abort cleanly here instead of a raw
+            # traceback, for whichever command (propose/compare/review)
+            # is calling this closure.
+            click.echo(
+                f"\nError: --agentic run aborted -- {provider_name} rejected the "
+                f"request (likely an invalid/expired key or missing permissions): {e}",
+                err=True,
+            )
+            click.echo("Check your key with: djcues auth status", err=True)
+            raise SystemExit(1) from e
         telemetry_list.append(telemetry)
         return proposal
 
@@ -201,7 +216,7 @@ def _print_cost_summary(telemetry_list, model, track_count):
     total_calls = sum(t.calls_made for t in telemetry_list)
     total_input = sum(t.input_tokens for t in telemetry_list)
     total_output = sum(t.output_tokens for t in telemetry_list)
-    total_errors = sum(len(t.errors) for t in telemetry_list)
+    all_errors = [e for t in telemetry_list for e in t.errors]
 
     from djcues.providers import estimate_cost
 
@@ -211,11 +226,20 @@ def _print_cost_summary(telemetry_list, model, track_count):
         f"\nDone: {track_count} tracks analyzed. "
         f"Actual cost: {cost_str} ({total_calls} calls, {model})."
     )
-    if total_errors:
+    if all_errors:
+        # Real failures repeat identically across tracks (e.g. one bad
+        # key fails the same way on every call) -- show what actually
+        # went wrong, deduplicated, not just a count with no way to tell
+        # why from the output.
+        unique_errors = sorted(set(all_errors))
         click.echo(
-            f"  {total_errors} specialist/critic call(s) fell back to the heuristic "
-            f"value for their pad — see notes above for which."
+            f"  {len(all_errors)} specialist/critic call(s) fell back to the heuristic "
+            f"value for their pad ({len(unique_errors)} distinct error(s)):"
         )
+        for msg in unique_errors[:5]:
+            click.echo(f"    - {msg}")
+        if len(unique_errors) > 5:
+            click.echo(f"    ... and {len(unique_errors) - 5} more distinct error(s)")
 
 
 def _print_agentic_estimate(tracks, provider_name, model, skip_critic, offset, loop_bars):

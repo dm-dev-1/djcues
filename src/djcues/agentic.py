@@ -298,14 +298,18 @@ def _apply_placement(
     positions: dict[str, float],
     confidence: dict[str, float],
     notes: list[str],
-    errors: list[str],
     specialist_name: str,
 ) -> None:
     """Apply one specialist's placement for one pad, falling back to
     whatever the heuristic already put in positions/confidence (passed
     in pre-populated) if the specialist declined (-1) or errored."""
     if result is None:
-        errors.append(f"{specialist_name} specialist failed for pad {pad}; kept heuristic value")
+        # The real failure reason is already in telemetry.errors, added
+        # once by the caller when the specialist call itself failed --
+        # don't duplicate it here for every pad that specialist covers
+        # (structure alone covers 3), just note which pad kept the
+        # heuristic value.
+        notes.append(f"{pad} ({specialist_name}): kept heuristic (specialist call failed)")
         return
 
     placement = result.get(key)
@@ -391,23 +395,23 @@ def propose_with_telemetry(
 
     _apply_placement(
         results.get("structure"), "drop", "D", phrases, positions, confidence, notes,
-        telemetry.errors, "structure",
+        "structure",
     )
     _apply_placement(
         results.get("structure"), "breakdown", "E", phrases, positions, confidence, notes,
-        telemetry.errors, "structure",
+        "structure",
     )
     _apply_placement(
         results.get("structure"), "outro", "G", phrases, positions, confidence, notes,
-        telemetry.errors, "structure",
+        "structure",
     )
     _apply_placement(
         results.get("vocal"), "vocal_buildup", "C", phrases, positions, confidence, notes,
-        telemetry.errors, "vocal",
+        "vocal",
     )
     _apply_placement(
         results.get("energy"), "special", "F", phrases, positions, confidence, notes,
-        telemetry.errors, "energy",
+        "energy",
     )
 
     if not skip_critic:
@@ -472,9 +476,26 @@ def propose(
     return proposal
 
 
+_AUTH_ERROR_TYPE_NAMES = ("AuthenticationError", "PermissionDeniedError")
+_AUTH_ERROR_HTTP_CODES = (401, 403)
+
+
 def _looks_like_auth_error(exc: Exception) -> bool:
-    """True for an authentication failure that should abort the whole
-    run rather than degrade one pad to its heuristic value. Checks the
-    exception's type name rather than importing every provider SDK's
-    exception classes here (they're optional dependencies)."""
-    return type(exc).__name__ in ("AuthenticationError", "PermissionDeniedError")
+    """True for an authentication/permission failure that should abort
+    the whole run rather than degrade one pad to its heuristic value.
+
+    Checked two ways, neither importing any provider SDK (they're
+    optional dependencies): the exception's type name -- works for
+    Anthropic, whose SDK has distinctly-named AuthenticationError/
+    PermissionDeniedError classes -- and an HTTP status code exposed via
+    a `.code` or `.status_code` attribute, whichever the SDK sets. The
+    second check exists because Gemini's SDK does NOT have a distinctly
+    named class for this: confirmed against a real 403 response, its
+    google.genai.errors module raises the exact same ClientError for
+    every 4xx status (401, 403, 429, ...), so type-name alone silently
+    misses even a flatly rejected API key on that provider.
+    """
+    if type(exc).__name__ in _AUTH_ERROR_TYPE_NAMES:
+        return True
+    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    return code in _AUTH_ERROR_HTTP_CODES

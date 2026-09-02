@@ -347,6 +347,69 @@ def test_auth_error_from_critic_propagates(sample_track: Track):
         agentic.propose_with_telemetry(sample_track, provider, api_key="bad", model="claude-haiku-4-5")
 
 
+class GeminiStyleClientError(Exception):
+    """Mirrors the real google.genai.errors.ClientError shape (confirmed
+    by reading the SDK source against a real 403 response): every 4xx
+    status -- 401, 403, 429, ... -- raises this exact same class, with
+    no distinctly-named subclass to tell an auth failure apart from any
+    other client error. Only a `.code` attribute carries the HTTP status."""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+def test_looks_like_auth_error_detects_gemini_style_permission_denied():
+    """Direct regression test for the real bug: a genuine 403 from
+    Gemini never matches by class name (Gemini has no
+    AuthenticationError/PermissionDeniedError class at all), so
+    detection has to fall back to the HTTP code."""
+    exc = GeminiStyleClientError(403, "PERMISSION_DENIED")
+    assert agentic._looks_like_auth_error(exc) is True
+
+
+def test_looks_like_auth_error_detects_gemini_style_401():
+    exc = GeminiStyleClientError(401, "UNAUTHENTICATED")
+    assert agentic._looks_like_auth_error(exc) is True
+
+
+def test_looks_like_auth_error_false_for_unrelated_client_error():
+    exc = GeminiStyleClientError(429, "RESOURCE_EXHAUSTED")  # rate limit, not auth
+    assert agentic._looks_like_auth_error(exc) is False
+
+
+def test_looks_like_auth_error_false_for_plain_exception():
+    assert agentic._looks_like_auth_error(RuntimeError("boom")) is False
+
+
+def test_gemini_style_403_from_specialist_propagates(sample_track: Track):
+    """End-to-end version of the class-name-blind detection above --
+    this is the exact shape of exception the real Gemini SDK raised
+    when it hit a real, live 403 during verification."""
+    routes = _all_success_routes()
+    routes["structure"] = GeminiStyleClientError(403, "PERMISSION_DENIED")
+    provider = _FakeProvider(routes)
+
+    with pytest.raises(GeminiStyleClientError):
+        agentic.propose_with_telemetry(sample_track, provider, api_key="bad", model="gemini-2.5-flash-lite")
+
+
+def test_specialist_failure_logs_error_once_not_once_per_pad(sample_track: Track):
+    """Regression test for the inflated-count bug: the structure
+    specialist covers 3 pads (D, E, G), so a naive per-pad error log
+    triples the count for one real failure. Must log exactly once."""
+    routes = _all_success_routes()
+    routes["structure"] = RuntimeError("structure boom")
+    provider = _FakeProvider(routes)
+
+    _proposal, telemetry = agentic.propose_with_telemetry(
+        sample_track, provider, api_key="k", model="claude-haiku-4-5"
+    )
+
+    structure_errors = [e for e in telemetry.errors if "structure" in e]
+    assert len(structure_errors) == 1
+
+
 def test_critic_cannot_move_a_cue_position(sample_track: Track):
     """The critic schema has no position field; even if a hallucinating
     provider stuffed one into the response, the code must never read it."""
