@@ -77,7 +77,19 @@ class GeminiProvider:
             output_tokens=getattr(usage, "candidates_token_count", 0) or 0,
         )
 
-    def count_tokens(self, api_key: str, model: str, content: str) -> int:
+    def count_tokens(self, api_key: str, model: str, content: str, system: str | None = None) -> int:
         client = self._client(api_key)
-        result = client.models.count_tokens(model=model, contents=content)
+        # Gemini's count_tokens backend rejects a system_instruction passed
+        # via CountTokensConfig -- confirmed against a real, still-open SDK
+        # issue (googleapis/python-genai#432): the API returns 400
+        # INVALID_ARGUMENT, so there is no supported way to have the real
+        # API count system-prompt tokens separately from content tokens.
+        # Concatenating it into the counted text instead is a close
+        # approximation -- BPE tokenization doesn't change based on which
+        # role a string is tagged with, so this differs from a true
+        # system+user count by at most a handful of turn-boundary tokens,
+        # while still using the real tokenizer via a real API call rather
+        # than a guessed chars-per-token ratio.
+        counted_text = f"{system}\n\n{content}" if system else content
+        result = client.models.count_tokens(model=model, contents=counted_text)
         return getattr(result, "total_tokens", 0)

@@ -63,10 +63,13 @@ class AnthropicProvider:
             output_tokens=response.usage.output_tokens,
         )
 
-    def count_tokens(self, api_key: str, model: str, content: str) -> int:
+    def count_tokens(self, api_key: str, model: str, content: str, system: str | None = None) -> int:
         client = self._client(api_key)
-        result = client.messages.count_tokens(
-            model=model,
-            messages=[{"role": "user", "content": content}],
-        )
+        kwargs: dict[str, Any] = {"model": model, "messages": [{"role": "user", "content": content}]}
+        if system:
+            # The count_tokens endpoint accepts the same shape as
+            # messages.create (system, tools, thinking, ...), confirmed
+            # against Anthropic's docs -- and it's free to call regardless.
+            kwargs["system"] = system
+        result = client.messages.count_tokens(**kwargs)
         return result.input_tokens

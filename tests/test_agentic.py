@@ -74,9 +74,11 @@ class _FakeProvider:
 
     name = "fake"
 
-    def __init__(self, routes: dict[str, object]):
+    def __init__(self, routes: dict[str, object], token_counts: dict[str, int] | None = None):
         self._routes = routes
+        self._token_counts = token_counts or {}
         self.calls: list[str] = []
+        self.count_token_calls: list[tuple[str, str]] = []
 
     def _key(self, system: str) -> str:
         if system == agentic._STRUCTURE_SYSTEM:
@@ -100,8 +102,10 @@ class _FakeProvider:
     def list_models(self, api_key):
         raise NotImplementedError
 
-    def count_tokens(self, api_key, model, content):
-        raise NotImplementedError
+    def count_tokens(self, api_key, model, content, system=None):
+        key = self._key(system)
+        self.count_token_calls.append((key, content))
+        return self._token_counts.get(key, 100)
 
 
 def _all_success_routes() -> dict[str, object]:
@@ -176,25 +180,67 @@ def test_build_track_payload_empty_vocal_track_gives_no_regions(beat_grid, phras
     assert payload["phrase_energy"] == []
 
 
-# --- estimate_cost -------------------------------------------------------
+# --- estimate_track_cost --------------------------------------------------
+# Real per-track estimate: input tokens come from live count_tokens() calls
+# against the actual constructed payload (via the fake provider here),
+# not a flat guess -- output tokens still an approximation, since no
+# provider can count hypothetical output before generation.
+
+_TOKEN_COUNTS = {"structure": 200, "vocal": 150, "energy": 180, "critic": 220}
 
 
-def test_estimate_cost_with_critic_is_4_calls():
-    input_tokens, output_tokens, cost = agentic.estimate_cost("claude-haiku-4-5", skip_critic=False)
-    assert input_tokens == 600 * 4
+def test_estimate_track_cost_with_critic_sums_4_real_input_counts(sample_track: Track):
+    provider = _FakeProvider(_all_success_routes(), token_counts=_TOKEN_COUNTS)
+    input_tokens, output_tokens, cost = agentic.estimate_track_cost(
+        sample_track, provider, api_key="k", model="claude-haiku-4-5"
+    )
+    assert input_tokens == 200 + 150 + 180 + 220
     assert output_tokens == 150 * 4
     assert cost == pytest.approx(price_estimate("claude-haiku-4-5", input_tokens, output_tokens))
+    assert {key for key, _content in provider.count_token_calls} == {
+        "structure", "vocal", "energy", "critic"
+    }
 
 
-def test_estimate_cost_skip_critic_is_3_calls():
-    input_tokens, output_tokens, cost = agentic.estimate_cost("claude-haiku-4-5", skip_critic=True)
-    assert input_tokens == 600 * 3
+def test_estimate_track_cost_skip_critic_never_counts_critic(sample_track: Track):
+    provider = _FakeProvider(_all_success_routes(), token_counts=_TOKEN_COUNTS)
+    input_tokens, output_tokens, cost = agentic.estimate_track_cost(
+        sample_track, provider, api_key="k", model="claude-haiku-4-5", skip_critic=True
+    )
+    assert input_tokens == 200 + 150 + 180  # critic never counted, never charged
     assert output_tokens == 150 * 3
+    assert "critic" not in {key for key, _content in provider.count_token_calls}
 
 
-def test_estimate_cost_unpriced_model_is_none():
-    _, _, cost = agentic.estimate_cost("some-unpriced-model")
+def test_estimate_track_cost_unpriced_model_is_none(sample_track: Track):
+    provider = _FakeProvider(_all_success_routes(), token_counts=_TOKEN_COUNTS)
+    _, _, cost = agentic.estimate_track_cost(
+        sample_track, provider, api_key="k", model="some-unpriced-model"
+    )
     assert cost is None
+
+
+def test_estimate_track_cost_counts_the_real_payload_not_a_placeholder(sample_track: Track):
+    """The whole point of replacing the old flat per-call guess: what
+    gets counted must be this track's actual payload, not a static
+    string -- so a bigger/smaller track produces a different count."""
+    provider = _FakeProvider(_all_success_routes(), token_counts=_TOKEN_COUNTS)
+    agentic.estimate_track_cost(sample_track, provider, api_key="k", model="claude-haiku-4-5")
+
+    heuristic = CueStrategy().propose(sample_track)
+    expected_payload = agentic.build_track_payload(sample_track, heuristic)
+
+    structure_content = next(
+        content for key, content in provider.count_token_calls if key == "structure"
+    )
+    assert json.loads(structure_content) == expected_payload
+
+    critic_content = next(
+        content for key, content in provider.count_token_calls if key == "critic"
+    )
+    critic_payload = json.loads(critic_content)
+    assert critic_payload["proposed_positions_ms"]  # critic payload has the extra fields
+    assert critic_payload["phrases"] == expected_payload["phrases"]
 
 
 # --- propose_with_telemetry: orchestration/fallback ----------------------

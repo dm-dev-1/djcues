@@ -95,8 +95,11 @@ class ModelProvider(Protocol):
         plus real input/output token usage from the provider's response."""
         ...
 
-    def count_tokens(self, api_key: str, model: str, content: str) -> int:
-        """Pre-flight token count for cost estimation."""
+    def count_tokens(self, api_key: str, model: str, content: str, system: str | None = None) -> int:
+        """Pre-flight token count for cost estimation. When *system* is
+        given, its tokens are included in the count -- exactly, on
+        providers whose API supports it; approximated on ones that don't
+        (see each adapter for specifics)."""
         ...
 
 

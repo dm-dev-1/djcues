@@ -33,11 +33,11 @@ from djcues.strategy import CueStrategy, build_cue_points, compute_phrase_energy
 
 _VOCAL_FRAME_MS = 1024 / 22050 * 1000  # ~46.4ms per PVDI frame, matches strategy.py
 
-# Rough per-track token estimate used for pre-flight cost estimates,
-# before any real call is made -- based on the typical payload size for
-# a ~20-30 phrase track. Real usage is measured and reported after the
-# fact; this is only for --estimate-only.
-_ESTIMATED_INPUT_TOKENS_PER_CALL = 600
+# No provider offers a way to count hypothetical *output* tokens before
+# generation -- only input. Output tokens for --estimate-only stay a
+# static per-call approximation; the structured-output schemas are small
+# and bounded (a phrase index, a confidence float, a short reasoning
+# string), so this is a reasonable one, unlike guessing input size too.
 _ESTIMATED_OUTPUT_TOKENS_PER_CALL = 150
 _CALLS_PER_TRACK_WITH_CRITIC = 4
 _CALLS_PER_TRACK_NO_CRITIC = 3
@@ -113,21 +113,6 @@ def build_track_payload(track: Track, heuristic_proposal: CueProposal) -> dict:
         "phrase_energy": energy_by_index,
         "heuristic_confidence": heuristic_by_pad,
     }
-
-
-def estimate_cost(model: str, skip_critic: bool = False) -> tuple[int, int, float | None]:
-    """Rough pre-flight per-track estimate: (input_tokens, output_tokens, usd_cost).
-
-    A static estimate, not a real count_tokens() call -- callers that
-    want a precise number should use the provider's count_tokens on the
-    actual constructed payload instead. usd_cost is None if the model
-    isn't in the local pricing table (unknown, not free).
-    """
-    calls = _CALLS_PER_TRACK_NO_CRITIC if skip_critic else _CALLS_PER_TRACK_WITH_CRITIC
-    input_tokens = _ESTIMATED_INPUT_TOKENS_PER_CALL * calls
-    output_tokens = _ESTIMATED_OUTPUT_TOKENS_PER_CALL * calls
-    cost = price_estimate(model, input_tokens, output_tokens)
-    return input_tokens, output_tokens, cost
 
 
 # --- Specialist schemas -----------------------------------------------
@@ -235,6 +220,60 @@ _CRITIC_SYSTEM = (
     "any cue's position. Only include a pad in `adjustments` if you're "
     "revising its confidence; omit pads you have nothing to add for."
 )
+
+
+def estimate_track_cost(
+    track: Track,
+    provider: ModelProvider,
+    api_key: str,
+    model: str,
+    skip_critic: bool = False,
+    memory_offset_bars: int = 16,
+    loop_length_bars: int = 4,
+) -> tuple[int, int, float | None]:
+    """Real pre-flight estimate for one track: (input_tokens, output_tokens, usd_cost).
+
+    Input tokens are genuine count_tokens() calls against this track's
+    actual constructed payload and each real system prompt -- one call per
+    specialist (plus the critic, unless skip_critic), so the number varies
+    by track (phrase count, vocal regions, ...) instead of being a flat
+    guess. Output tokens stay an approximation (see
+    _ESTIMATED_OUTPUT_TOKENS_PER_CALL) since no provider can count
+    hypothetical output before generation. This makes 3-4 real API calls,
+    so it needs a valid key -- "cheap and safe" (free on Anthropic; a
+    normal metered call on Gemini), not "fully offline."
+    """
+    import json
+
+    from djcues.constants import KIND_TO_PAD
+
+    heuristic = CueStrategy(memory_offset_bars, loop_length_bars).propose(track)
+    payload = build_track_payload(track, heuristic)
+    payload_json = json.dumps(payload)
+
+    input_tokens = sum(
+        provider.count_tokens(api_key, model, payload_json, system=system)
+        for system in (_STRUCTURE_SYSTEM, _VOCAL_SYSTEM, _ENERGY_SYSTEM)
+    )
+    calls = _CALLS_PER_TRACK_NO_CRITIC
+
+    if not skip_critic:
+        heuristic_positions = {
+            KIND_TO_PAD.get(c.kind): c.position_ms for c in heuristic.hot_cues
+        }
+        critic_payload = {
+            **payload,
+            "proposed_positions_ms": {pad: round(pos) for pad, pos in heuristic_positions.items()},
+            "proposed_confidence": {pad: round(c, 3) for pad, c in heuristic.confidence.items()},
+        }
+        input_tokens += provider.count_tokens(
+            api_key, model, json.dumps(critic_payload), system=_CRITIC_SYSTEM
+        )
+        calls = _CALLS_PER_TRACK_WITH_CRITIC
+
+    output_tokens = _ESTIMATED_OUTPUT_TOKENS_PER_CALL * calls
+    cost = price_estimate(model, input_tokens, output_tokens)
+    return input_tokens, output_tokens, cost
 
 
 def _call_specialist(

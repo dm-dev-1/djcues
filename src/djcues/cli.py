@@ -218,6 +218,46 @@ def _print_cost_summary(telemetry_list, model, track_count):
         )
 
 
+def _print_agentic_estimate(tracks, provider_name, model, skip_critic, offset, loop_bars):
+    """Print a real --estimate-only total for --agentic: a genuine
+    count_tokens() call per specialist/critic system prompt against each
+    track's actual payload, summed across the whole selection — not a
+    flat per-call guess, and not just a per-track number the user has to
+    multiply themselves."""
+    from djcues.agentic import estimate_track_cost
+    from djcues.providers import get_provider
+
+    resolved_provider, api_key, resolved_model = _resolve_agentic_provider(provider_name, model)
+    provider = get_provider(resolved_provider)
+
+    total_input = total_output = 0
+    total_cost = 0.0
+    any_unpriced = False
+    with_phrases = [t for t in tracks if t.phrases]
+
+    click.echo(f"Estimating cost for {len(with_phrases)} track(s) with {resolved_model}...")
+    for t in with_phrases:
+        in_tok, out_tok, cost = estimate_track_cost(
+            t, provider, api_key, resolved_model, skip_critic,
+            memory_offset_bars=offset, loop_length_bars=loop_bars,
+        )
+        total_input += in_tok
+        total_output += out_tok
+        if cost is None:
+            any_unpriced = True
+        else:
+            total_cost += cost
+
+    if any_unpriced:
+        cost_str = "unknown (model not in local price table)"
+    else:
+        cost_str = f"${total_cost:.4f}"
+    click.echo(
+        f"Estimated cost: {cost_str} for {len(with_phrases)} track(s) "
+        f"(~{total_input} input / ~{total_output} output tokens, {resolved_model})."
+    )
+
+
 @click.group()
 def cli():
     """djcues — automated rekordbox cue placement based on phrase analysis."""
@@ -246,18 +286,6 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         click.echo("Error: --estimate-only only applies with --agentic.", err=True)
         raise SystemExit(1)
 
-    if estimate_only:
-        from djcues.agentic import estimate_cost as estimate_agentic_cost
-
-        _provider_name, _api_key, resolved_model = _resolve_agentic_provider(provider, model)
-        in_tok, out_tok, cost = estimate_agentic_cost(resolved_model, skip_critic)
-        cost_str = f"${cost:.4f}" if cost is not None else "unknown (model not in local price table)"
-        click.echo(
-            f"Estimated cost per track: {cost_str} "
-            f"(~{in_tok} input / ~{out_tok} output tokens, {resolved_model})"
-        )
-        return
-
     playlist = find_playlist(playlist_name)
     if playlist is None:
         click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
@@ -267,10 +295,6 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     if not tracks:
         click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
         raise SystemExit(1)
-
-    proposer, telemetry_list, resolved_model = _get_proposer(
-        agentic, provider, model, offset, loop_bars, skip_critic
-    )
 
     if all_tracks:
         selected = tracks
@@ -282,6 +306,14 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     else:
         click.echo("Error: provide a track name or use --all.", err=True)
         raise SystemExit(1)
+
+    if estimate_only:
+        _print_agentic_estimate(selected, provider, model, skip_critic, offset, loop_bars)
+        return
+
+    proposer, telemetry_list, resolved_model = _get_proposer(
+        agentic, provider, model, offset, loop_bars, skip_critic
+    )
 
     for t in selected:
         proposal = proposer(t)
