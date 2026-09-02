@@ -49,8 +49,10 @@ def sample_track(beat_grid: BeatGrid, phrases: list[Phrase]) -> Track:
     """Track with populated waveform + vocal_track, so build_track_payload
     has real (non-empty) energy/vocal data to condense."""
     waveform = [WaveformPoint(height=0.5, red=4, green=4, blue=4) for _ in range(200)]
-    # Two strong-vocal-onset runs (value >= 3) inside otherwise-quiet frames.
-    vocal_track = [0] * 50 + [3, 4, 4, 3] + [0] * 80 + [3, 3, 3] + [0] * 100
+    # One genuine (>=2s) vocal-onset run, plus a short (~139ms) blip that
+    # should be filtered out as noise -- see test_build_track_payload_*
+    # below, which pins both halves of that behavior.
+    vocal_track = [0] * 50 + [3] * 50 + [0] * 80 + [3, 3, 3] + [0] * 100
     return Track(
         id=1, title="Test Track", artist="Test Artist", bpm=128.0,
         duration_ms=218000.0, analysis_path="", cues=[], phrases=phrases,
@@ -140,9 +142,40 @@ def test_build_track_payload_no_raw_arrays_leak(sample_track: Track):
         assert set(entry.keys()) == {"index", "mean_energy"}
     for region in payload["vocal_regions"]:
         assert set(region.keys()) == {"start_ms", "end_ms"}
-    # Condensed to a handful of onset regions, not the raw 234-frame array.
+    # Condensed to a handful of onset regions, not the raw 283-frame array.
     assert len(payload["vocal_regions"]) < len(sample_track.vocal_track)
-    assert len(payload["vocal_regions"]) == 2
+    # Only the >=2s run survives; the ~139ms blip is filtered as noise --
+    # see test_summarize_vocal_onsets_filters_short_blips for the isolated
+    # version of this assertion.
+    assert len(payload["vocal_regions"]) == 1
+
+
+def test_summarize_vocal_onsets_filters_short_blips(beat_grid, phrases):
+    """Direct regression test for the duration filter: the heuristic's own
+    C-slot logic (strategy.py) only counts a vocal region as real if it
+    sustains for >= 2000ms -- a specialist must never see a shorter blip
+    the heuristic itself would discard as noise."""
+    frame_ms = agentic._VOCAL_FRAME_MS
+    long_enough = int(2000 / frame_ms) + 5  # comfortably over the 2000ms line
+    too_short = int(2000 / frame_ms) - 5  # comfortably under it
+    vocal_track = (
+        [0] * 20
+        + [3] * long_enough
+        + [0] * 20
+        + [3] * too_short
+        + [0] * 20
+    )
+    track = Track(
+        id=4, title="Blip Test", artist="Test", bpm=128.0,
+        duration_ms=218000.0, analysis_path="", cues=[], phrases=phrases,
+        beat_grid=beat_grid, vocal_track=vocal_track,
+    )
+
+    regions = agentic._summarize_vocal_onsets(track)
+
+    assert len(regions) == 1
+    expected_start = round(20 * frame_ms)
+    assert regions[0]["start_ms"] == expected_start
 
 
 def test_build_track_payload_phrase_shape(sample_track: Track):

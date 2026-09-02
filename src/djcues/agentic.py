@@ -32,6 +32,7 @@ from djcues.providers import GenerationResult, ModelProvider, estimate_cost as p
 from djcues.strategy import CueStrategy, build_cue_points, compute_phrase_energy
 
 _VOCAL_FRAME_MS = 1024 / 22050 * 1000  # ~46.4ms per PVDI frame, matches strategy.py
+_MIN_VOCAL_REGION_MS = 2000  # matches strategy.py's C-slot min_frames threshold
 
 # No provider offers a way to count hypothetical *output* tokens before
 # generation -- only input. Output tokens for --estimate-only stay a
@@ -58,7 +59,10 @@ def _summarize_vocal_onsets(track: Track) -> list[dict]:
     """Condense the PVDI per-frame vocal-confidence array into a compact
     list of strong-vocal-onset regions, instead of shipping the raw
     per-frame array (which can be thousands of points). Mirrors the
-    onset-detection thresholds strategy.py's slot C already uses."""
+    onset-detection thresholds strategy.py's slot C already uses,
+    including its minimum-duration filter -- a region has to sustain for
+    at least _MIN_VOCAL_REGION_MS to count as real, so a specialist never
+    sees a short blip the heuristic itself would discard as noise."""
     if not track.vocal_track:
         return []
     vt = track.vocal_track
@@ -69,10 +73,12 @@ def _summarize_vocal_onsets(track: Track) -> list[dict]:
             start = i
             while i < len(vt) and vt[i] > 0:
                 i += 1
-            regions.append({
-                "start_ms": round(start * _VOCAL_FRAME_MS),
-                "end_ms": round(i * _VOCAL_FRAME_MS),
-            })
+            duration_ms = (i - start) * _VOCAL_FRAME_MS
+            if duration_ms >= _MIN_VOCAL_REGION_MS:
+                regions.append({
+                    "start_ms": round(start * _VOCAL_FRAME_MS),
+                    "end_ms": round(i * _VOCAL_FRAME_MS),
+                })
         else:
             i += 1
     return regions
@@ -221,12 +227,25 @@ _STRUCTURE_SYSTEM = (
 _VOCAL_SYSTEM = (
     "You place a single DJ cue point, Vocal/Buildup, marking where the "
     "pre-drop buildup or first strong vocal begins. You are given the "
-    "track's phrase structure, a list of detected strong-vocal time "
-    "regions (from vocal-detection analysis, not a transcript), and the "
-    "local heuristic's own choice (heuristic_phrase_index) for reference. "
-    "Pick a phrase_index from the provided list, preferring one that "
-    "aligns with the first substantial vocal region before the drop, if "
-    "any."
+    "track's phrase structure, a list of detected vocal regions (each "
+    "already filtered to genuine, sustained vocal presence -- at least 2 "
+    "seconds long, not brief noise), and the local heuristic's own choice "
+    "(heuristic_phrase_index) per pad for reference -- "
+    "heuristic_phrase_index.D is the Drop's phrase index.\n\n"
+    "Follow this procedure in order:\n"
+    "1. If heuristic_phrase_index.D is not null, discard any vocal_regions "
+    "entry whose start_ms is at or after the Drop phrase's position_ms -- "
+    "Vocal/Buildup must come before the Drop, never after or during it, "
+    "no matter how prominent a later vocal moment looks.\n"
+    "2. Of what remains, take the EARLIEST vocal_regions entry (by "
+    "start_ms) -- not the longest, not the one that best matches a phrase "
+    "label, the earliest. Pick the phrase whose position_ms is closest to "
+    "that region's start_ms.\n"
+    "3. Only if no vocal_regions entries remain after step 1 (or none "
+    "exist at all), fall back to the last Up- or Verse-labeled phrase "
+    "before the Drop.\n"
+    "4. If heuristic_phrase_index.D is null (no Drop identified), use "
+    "your own judgment for where a pre-buildup moment would be."
 )
 
 _ENERGY_SYSTEM = (
