@@ -151,3 +151,34 @@ class SelfConsistencyResult:
     cumulative_drift_at_end_ms: float
     entry_count: int
     notes: list[str]
+
+
+@dataclass
+class AudioBeatVerification:
+    """Result of comparing real, audio-detected beat times against a
+    track's stored BeatGrid -- tier 2 of beat-grid verification, the
+    real-model half. verdict is one of "consistent", "drift_detected",
+    or "no_beats_detected"."""
+
+    matched_beats: int
+    mean_abs_drift_ms: float
+    max_abs_drift_ms: float
+    pct_within_tolerance: float
+    tracker_name: str
+    verdict: str
+
+
+@dataclass
+class BeatGridReport:
+    """Top-level beat-grid verification result for one track --
+    combines the free self-consistency check with the real audio-based
+    one, if it ran. audio is None whenever tier 2 wasn't reached (the
+    free check passed and wasn't forced, or real audio wasn't
+    available). status is one of "ok", "flagged", "no_grid_data",
+    "audio_unavailable", "audio_extra_missing", or "decode_failed"."""
+
+    track_id: int
+    title: str
+    self_consistency: SelfConsistencyResult
+    audio: AudioBeatVerification | None
+    status: str

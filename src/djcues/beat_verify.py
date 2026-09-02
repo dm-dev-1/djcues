@@ -11,12 +11,28 @@ and djcues already had access to but discarded.
 
 Tier 2 (real audio, needs the optional `ml` extra): live beat-tracker
 inference via `beat_this` (github.com/CPJKU/beat_this), compared against
-the stored grid. Not yet implemented in this file.
+the stored grid via score_beat_alignment() -- pure comparison math,
+fully testable with a synthetic detected-beat-times list, no model
+involved. verify_beat_grid() orchestrates both tiers: always runs the
+free check first, only escalates to real audio (needing the `ml`
+extra) when the free check looks suspicious or force_deep is set --
+so a track whose grid is already self-consistent costs nothing beyond
+the free check.
 """
 
 from __future__ import annotations
 
-from djcues.models import RawBeatGridEntry, SelfConsistencyResult
+from typing import Any
+
+from djcues.audio import AudioExtraUnavailableError, load_audio, resolve_audio_path
+from djcues.models import (
+    AudioBeatVerification,
+    BeatGrid,
+    BeatGridReport,
+    RawBeatGridEntry,
+    SelfConsistencyResult,
+    Track,
+)
 
 # Neither tolerance has been tuned against real data yet -- these are
 # reasonable starting points, not measured thresholds. Expect to revisit
@@ -25,6 +41,12 @@ from djcues.models import RawBeatGridEntry, SelfConsistencyResult
 _DEFAULT_TEMPO_EPSILON_BPM = 0.5
 _DEFAULT_GAP_ERROR_TOLERANCE_MS = 5.0
 _DEFAULT_DRIFT_TOLERANCE_MS = 30.0
+_DEFAULT_AUDIO_TOLERANCE_MS = 30.0
+_TRACKER_NAME = "beat_this"
+
+# Cached across calls so processing a whole playlist doesn't reload
+# model weights per track -- mirrors db.py's get_db() pattern.
+_beat_tracker = None
 
 
 def check_grid_self_consistency(
@@ -108,4 +130,172 @@ def check_grid_self_consistency(
         cumulative_drift_at_end_ms=cumulative_drift,
         entry_count=len(entries),
         notes=notes,
+    )
+
+
+def _get_beat_tracker() -> Any:
+    """Lazily construct and cache the real beat_this model. Live-only,
+    not unit-tested -- loads real model weights on first call."""
+    global _beat_tracker
+    if _beat_tracker is None:
+        from beat_this.inference import Audio2Beats
+
+        _beat_tracker = Audio2Beats(checkpoint_path="final0", device="cpu", dbn=False)
+    return _beat_tracker
+
+
+def _run_beat_tracker(samples: Any, sr: int) -> list[float]:
+    """Real beat_this inference against real audio samples. Live-only,
+    not unit-tested -- calls a real model (verified working this
+    session via direct testing, not assumed). Returns detected beat
+    times in milliseconds (beat_this's own native unit is seconds)."""
+    tracker = _get_beat_tracker()
+    beats, _downbeats = tracker(samples, sr)
+    return [float(b) * 1000.0 for b in beats]
+
+
+def score_beat_alignment(
+    detected_beat_times_ms: list[float],
+    beat_grid: BeatGrid,
+    tolerance_ms: float = _DEFAULT_AUDIO_TOLERANCE_MS,
+) -> AudioBeatVerification:
+    """Compare real, audio-detected beat times against the stored
+    BeatGrid. Pure comparison math -- fully testable with a synthetic
+    detected_beat_times_ms list, no model involved.
+
+    Uses BeatGrid's own ms_to_beat()/beat_to_ms() to find each detected
+    beat's nearest grid beat rather than reinventing that lookup, so
+    this stays consistent with how the rest of djcues already reasons
+    about beat positions.
+    """
+    if not detected_beat_times_ms:
+        return AudioBeatVerification(
+            matched_beats=0,
+            mean_abs_drift_ms=0.0,
+            max_abs_drift_ms=0.0,
+            pct_within_tolerance=0.0,
+            tracker_name=_TRACKER_NAME,
+            verdict="no_beats_detected",
+        )
+
+    abs_drifts = []
+    for t in detected_beat_times_ms:
+        nearest_beat_num = beat_grid.ms_to_beat(t)
+        expected_ms = beat_grid.beat_to_ms(nearest_beat_num)
+        abs_drifts.append(abs(t - expected_ms))
+
+    mean_abs_drift = sum(abs_drifts) / len(abs_drifts)
+    max_abs_drift = max(abs_drifts)
+    within_tolerance = sum(1 for d in abs_drifts if d <= tolerance_ms)
+    pct_within = within_tolerance / len(abs_drifts) * 100.0
+    verdict = "consistent" if pct_within >= 90.0 else "drift_detected"
+
+    return AudioBeatVerification(
+        matched_beats=len(detected_beat_times_ms),
+        mean_abs_drift_ms=mean_abs_drift,
+        max_abs_drift_ms=max_abs_drift,
+        pct_within_tolerance=pct_within,
+        tracker_name=_TRACKER_NAME,
+        verdict=verdict,
+    )
+
+
+def verify_beat_grid_against_audio(
+    track: Track,
+    samples: Any,
+    sr: int,
+    tolerance_ms: float = _DEFAULT_AUDIO_TOLERANCE_MS,
+) -> AudioBeatVerification:
+    """Real beat_this inference against real audio, compared to the
+    track's stored BeatGrid. Live-only -- not unit-tested, calls a real
+    model; see score_beat_alignment() for the testable comparison math
+    this wraps.
+    """
+    detected_ms = _run_beat_tracker(samples, sr)
+    return score_beat_alignment(detected_ms, track.beat_grid, tolerance_ms)
+
+
+def verify_beat_grid(
+    track: Track,
+    raw_entries: list[RawBeatGridEntry] | None,
+    force_deep: bool = False,
+    tempo_epsilon_bpm: float = _DEFAULT_TEMPO_EPSILON_BPM,
+    gap_error_tolerance_ms: float = _DEFAULT_GAP_ERROR_TOLERANCE_MS,
+    drift_tolerance_ms: float = _DEFAULT_DRIFT_TOLERANCE_MS,
+    audio_tolerance_ms: float = _DEFAULT_AUDIO_TOLERANCE_MS,
+) -> BeatGridReport:
+    """Top-level orchestration: always run the free self-consistency
+    check first; only escalate to real audio analysis (needing the
+    `ml` extra) when the free check looks suspicious or force_deep is
+    set. A track whose grid is already self-consistent costs nothing
+    beyond the free check -- no audio file is even resolved for it.
+    """
+    if raw_entries is None:
+        return BeatGridReport(
+            track_id=track.id,
+            title=track.title,
+            self_consistency=SelfConsistencyResult(
+                is_consistent=True,
+                tempo_varies=False,
+                max_pairwise_gap_error_ms=0.0,
+                cumulative_drift_at_end_ms=0.0,
+                entry_count=0,
+                notes=["no beat-grid data available"],
+            ),
+            audio=None,
+            status="no_grid_data",
+        )
+
+    self_consistency = check_grid_self_consistency(
+        raw_entries, tempo_epsilon_bpm, gap_error_tolerance_ms, drift_tolerance_ms
+    )
+
+    if not force_deep and self_consistency.is_consistent:
+        return BeatGridReport(
+            track_id=track.id,
+            title=track.title,
+            self_consistency=self_consistency,
+            audio=None,
+            status="ok",
+        )
+
+    audio_path = resolve_audio_path(track)
+    if audio_path is None:
+        return BeatGridReport(
+            track_id=track.id,
+            title=track.title,
+            self_consistency=self_consistency,
+            audio=None,
+            status="audio_unavailable",
+        )
+
+    try:
+        loaded = load_audio(audio_path)
+    except AudioExtraUnavailableError:
+        return BeatGridReport(
+            track_id=track.id,
+            title=track.title,
+            self_consistency=self_consistency,
+            audio=None,
+            status="audio_extra_missing",
+        )
+    except Exception:
+        return BeatGridReport(
+            track_id=track.id,
+            title=track.title,
+            self_consistency=self_consistency,
+            audio=None,
+            status="decode_failed",
+        )
+
+    audio_result = verify_beat_grid_against_audio(
+        track, loaded.samples, loaded.sr, audio_tolerance_ms
+    )
+    status = "ok" if audio_result.verdict == "consistent" else "flagged"
+    return BeatGridReport(
+        track_id=track.id,
+        title=track.title,
+        self_consistency=self_consistency,
+        audio=audio_result,
+        status=status,
     )
