@@ -47,12 +47,22 @@ class GenerationResult:
 # provider's model-metadata endpoint returns pricing, so this table is
 # what powers cost estimates -- verify it against each provider's current
 # pricing page before relying on it for real cost decisions, both
-# landscapes change frequently and this is not fetched live.
+# landscapes change frequently and this is not fetched live. Verified
+# against https://ai.google.dev/gemini-api/docs/pricing (2026-09-02).
+#
+# Deliberately excludes "-latest" alias ids (e.g. gemini-flash-lite-latest,
+# gemini-flash-latest) even when a user picks one in `auth set`/`auth web`:
+# Google repoints those aliases to a different underlying model over time,
+# so any price recorded here for one would silently go stale the next time
+# that happens, with no djcues code change to notice it. estimate_cost()
+# correctly returns None for them (unknown, not free) until they're
+# resolved to a concrete versioned id.
 PRICING: dict[str, PriceInfo] = {
     "claude-haiku-4-5": PriceInfo(1.00, 5.00),
     "claude-sonnet-5": PriceInfo(2.00, 10.00),
     "gemini-2.5-flash-lite": PriceInfo(0.10, 0.40),
     "gemini-3.1-flash-lite": PriceInfo(0.25, 1.50),
+    "gemini-3.5-flash-lite": PriceInfo(0.30, 2.50),
     "gemini-3.7-flash": PriceInfo(0.75, 3.75),
 }
 
