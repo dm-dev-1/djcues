@@ -158,7 +158,22 @@ class AudioBeatVerification:
     """Result of comparing real, audio-detected beat times against a
     track's stored BeatGrid -- tier 2 of beat-grid verification, the
     real-model half. verdict is one of "consistent", "drift_detected",
-    or "no_beats_detected"."""
+    "octave_error", or "no_beats_detected".
+
+    octave_error is None, "double", or "half" -- independent of
+    verdict, purely informational about the detected/grid tempo
+    ratio. Beat trackers are known to sometimes lock onto double or
+    half the true tempo (a well-known MIR failure mode): "double"
+    means the detected beats are roughly twice as dense as the grid
+    expects (every other one likely a phantom beat, not a real
+    downbeat); "half" means roughly half as dense (the tracker only
+    caught every other real beat). Only "double" escalates verdict to
+    "octave_error" instead of "drift_detected" -- it's the case that
+    would otherwise misleadingly report a huge drift number that isn't
+    really drift, just octave confusion. "half" doesn't distort the
+    drift metrics (each detected beat still lines up with a real grid
+    beat), so it's surfaced as information without overriding a
+    verdict that's already correctly "consistent"."""
 
     matched_beats: int
     mean_abs_drift_ms: float
@@ -166,6 +181,7 @@ class AudioBeatVerification:
     pct_within_tolerance: float
     tracker_name: str
     verdict: str
+    octave_error: str | None = None
 
 
 @dataclass

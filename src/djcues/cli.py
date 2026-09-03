@@ -777,13 +777,29 @@ def _print_beatgrid_report(report) -> None:
     consistency_label = "self-consistent" if sc.is_consistent else "INCONSISTENT"
 
     audio_label = ""
+    octave_note = None
     if report.audio is not None:
         a = report.audio
-        verdict_label = "consistent" if a.verdict == "consistent" else a.verdict.upper()
+        if a.verdict == "octave_error":
+            verdict_label = "POSSIBLE OCTAVE ERROR"
+        elif a.verdict == "consistent":
+            verdict_label = "consistent"
+        else:
+            verdict_label = a.verdict.upper()
         audio_label = (
             f"  audio={verdict_label} ({a.pct_within_tolerance:.1f}% within tolerance, "
             f"mean drift {a.mean_abs_drift_ms:.1f}ms)"
         )
+        if a.octave_error == "double":
+            octave_note = (
+                "detected beats are ~2x as dense as the grid expects -- likely a "
+                "beat-tracker octave error (phantom beats), not real grid drift"
+            )
+        elif a.octave_error == "half":
+            octave_note = (
+                "detected beats are ~half as dense as the grid expects -- the "
+                "tracker likely only caught every other real beat"
+            )
     elif report.status == "audio_unavailable":
         audio_label = "  (audio unavailable -- file missing or moved)"
     elif report.status == "audio_extra_missing":
@@ -796,6 +812,8 @@ def _print_beatgrid_report(report) -> None:
     click.echo(f"  {report.title[:45]:45s} {consistency_label:16s}{audio_label}")
     for note in sc.notes:
         click.echo(f"      {note}")
+    if octave_note:
+        click.echo(f"      {octave_note}")
 
 
 def _print_beatgrid_summary(reports) -> None:

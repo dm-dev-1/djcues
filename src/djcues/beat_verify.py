@@ -22,6 +22,7 @@ the free check.
 
 from __future__ import annotations
 
+import statistics
 from typing import Any
 
 from djcues.audio import AudioExtraUnavailableError, load_audio, resolve_audio_path
@@ -43,6 +44,15 @@ _DEFAULT_GAP_ERROR_TOLERANCE_MS = 5.0
 _DEFAULT_DRIFT_TOLERANCE_MS = 30.0
 _DEFAULT_AUDIO_TOLERANCE_MS = 30.0
 _TRACKER_NAME = "beat_this"
+
+# How close a detected/grid tempo ratio needs to be to exactly 2.0 or
+# 0.5 to count as an octave error rather than coincidence -- e.g. 0.15
+# accepts a ratio of 1.7-2.3 as "double". Untuned against real data,
+# same caveat as every other threshold in this file.
+_OCTAVE_RATIO_TOLERANCE = 0.15
+# Fewer detected beats than this and the median inter-beat interval is
+# too noisy to trust for octave-ratio comparison.
+_MIN_BEATS_FOR_OCTAVE_CHECK = 8
 
 # Cached across calls so processing a whole playlist doesn't reload
 # model weights per track -- mirrors db.py's get_db() pattern.
@@ -154,6 +164,38 @@ def _run_beat_tracker(samples: Any, sr: int) -> list[float]:
     return [float(b) * 1000.0 for b in beats]
 
 
+def _detect_octave_error(detected_beat_times_ms: list[float], ms_per_beat: float) -> str | None:
+    """Check whether the detected beats' own median spacing is roughly
+    double or half the grid's expected ms_per_beat -- the signature of
+    a beat tracker locking onto the wrong tempo octave, a well-known
+    MIR failure mode, distinct from genuine drift (which doesn't
+    change the *spacing* between detected beats, just their alignment
+    to the grid). Uses the median (not mean) interval so a handful of
+    missed detections in a quiet section don't skew the estimate.
+
+    Returns None (not enough beats, or no clean 2x/0.5x ratio), "half"
+    (detected beats roughly twice as far apart as expected -- the
+    tracker likely only caught every other real beat), or "double"
+    (detected beats roughly half as far apart -- likely inserting a
+    phantom beat between each real pair).
+    """
+    if len(detected_beat_times_ms) < _MIN_BEATS_FOR_OCTAVE_CHECK or ms_per_beat <= 0:
+        return None
+
+    sorted_times = sorted(detected_beat_times_ms)
+    intervals = [b - a for a, b in zip(sorted_times, sorted_times[1:])]
+    if not intervals:
+        return None
+
+    ratio = statistics.median(intervals) / ms_per_beat
+
+    if abs(ratio - 2.0) <= 2.0 * _OCTAVE_RATIO_TOLERANCE:
+        return "half"
+    if abs(ratio - 0.5) <= 0.5 * _OCTAVE_RATIO_TOLERANCE:
+        return "double"
+    return None
+
+
 def score_beat_alignment(
     detected_beat_times_ms: list[float],
     beat_grid: BeatGrid,
@@ -167,6 +209,11 @@ def score_beat_alignment(
     beat's nearest grid beat rather than reinventing that lookup, so
     this stays consistent with how the rest of djcues already reasons
     about beat positions.
+
+    Also checks for an octave error (see _detect_octave_error()) --
+    when detected, a "double" error reports verdict="octave_error"
+    instead of the misleadingly-large "drift_detected" that raw
+    nearest-beat distance would otherwise produce.
     """
     if not detected_beat_times_ms:
         return AudioBeatVerification(
@@ -188,7 +235,21 @@ def score_beat_alignment(
     max_abs_drift = max(abs_drifts)
     within_tolerance = sum(1 for d in abs_drifts if d <= tolerance_ms)
     pct_within = within_tolerance / len(abs_drifts) * 100.0
-    verdict = "consistent" if pct_within >= 90.0 else "drift_detected"
+
+    octave_error = _detect_octave_error(detected_beat_times_ms, beat_grid.ms_per_beat)
+    if octave_error == "double":
+        # A "double" error is what would otherwise misleadingly report
+        # as a huge, scattered-looking drift -- the tracker's phantom
+        # extra beats land almost exactly halfway between real grid
+        # beats, which reads as "half the beats are wrong" rather than
+        # what it actually is. "half" doesn't have this problem (every
+        # detected beat still lines up fine), so it doesn't override
+        # a verdict that's already correctly "consistent" below.
+        verdict = "octave_error"
+    elif pct_within >= 90.0:
+        verdict = "consistent"
+    else:
+        verdict = "drift_detected"
 
     return AudioBeatVerification(
         matched_beats=len(detected_beat_times_ms),
@@ -197,6 +258,7 @@ def score_beat_alignment(
         pct_within_tolerance=pct_within,
         tracker_name=_TRACKER_NAME,
         verdict=verdict,
+        octave_error=octave_error,
     )
 
 

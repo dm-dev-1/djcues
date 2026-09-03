@@ -197,6 +197,67 @@ def test_custom_tolerance_changes_verdict(grid: BeatGrid):
     assert score_beat_alignment(detected, grid, tolerance_ms=10.0).verdict == "drift_detected"
 
 
+# --- octave-error detection (a beat tracker locking onto 2x/0.5x tempo) ---
+
+
+def test_double_tempo_octave_error_overrides_drift_detected(grid: BeatGrid):
+    # A phantom extra beat inserted exactly halfway between each real
+    # pair of grid beats. Raw drift alone would report this as ~50%
+    # within tolerance -- a misleadingly large "drift" that isn't
+    # really drift, it's octave confusion.
+    real_beats = [grid.beat_to_ms(b) for b in range(1, 41)]
+    detected = [real_beats[0]]
+    for a, b in zip(real_beats, real_beats[1:]):
+        detected.append((a + b) / 2.0)
+        detected.append(b)
+    result = score_beat_alignment(detected, grid)
+
+    assert result.verdict == "octave_error"
+    assert result.octave_error == "double"
+
+
+def test_half_tempo_octave_error_is_informational_only(grid: BeatGrid):
+    # The tracker only caught every other real grid beat. Every
+    # detected beat still lines up with a real grid beat, so this
+    # stays "consistent" -- the flag is informational (fewer beats
+    # than expected), not a drift problem.
+    detected = [grid.beat_to_ms(1 + 2 * i) for i in range(20)]
+    result = score_beat_alignment(detected, grid)
+
+    assert result.verdict == "consistent"
+    assert result.octave_error == "half"
+    assert result.pct_within_tolerance == pytest.approx(100.0)
+
+
+def test_genuine_drift_is_not_misclassified_as_octave_error(grid: BeatGrid):
+    # A consistent, non-octave offset (spacing between detected beats
+    # matches the grid exactly, just shifted) must stay drift_detected
+    # -- confirms the ratio check keys off inter-beat spacing, not
+    # absolute offset from the grid.
+    detected = [grid.beat_to_ms(b) + 100.0 for b in range(1, 21)]
+    result = score_beat_alignment(detected, grid)
+
+    assert result.verdict == "drift_detected"
+    assert result.octave_error is None
+
+
+def test_octave_check_suppressed_with_too_few_beats(grid: BeatGrid):
+    # Spacing is a clean 2x ratio, but too few beats to trust a median
+    # interval estimate from.
+    detected = [grid.beat_to_ms(1 + 2 * i) for i in range(4)]
+    result = score_beat_alignment(detected, grid)
+
+    assert result.octave_error is None
+
+
+def test_normal_alignment_has_no_octave_error(grid: BeatGrid):
+    detected = [grid.beat_to_ms(b) for b in range(1, 21)]
+    result = score_beat_alignment(detected, grid)
+
+    assert result.octave_error is None
+    assert result.verdict == "consistent"
+
+
 # --- verify_beat_grid orchestration ---------------------------------------
 
 
