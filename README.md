@@ -111,6 +111,8 @@ djcues propose "Playlist Name" "Track Name" --refine-drops --deep
 
 `beatgrid` always runs a free, audio-independent self-consistency check first (no extra install needed) using rekordbox's own full per-beat grid data, and only escalates to real audio when that check looks suspicious or `--deep` forces it. `--refine-drops` never does an independent redetection — it only looks for a dominant energy transition (a rise for Drop/Special, a dip for Breakdown) in a bounded window around the position the heuristic (or `--agentic`) already proposed, and only moves the cue when the audio evidence is clearly dominant; otherwise it leaves the existing position untouched and says so in the notes. Neither feature ever writes to rekordbox — same read-only guarantee as every other command until `apply`.
 
+Every cue `--refine-drops` actually moves gets an extra diagnostic hint in the output — `energy pattern: oscillating` (the energy swings back within a beat or two, more likely a false positive) or `stable` (the new position holds steady, more likely a genuine improvement). This is an unverified heuristic, not a verdict — checked against real tracks but not proven reliable — meant to help you prioritize which moved cues are most worth a quick listen, not to replace listening.
+
 Install with `pip install djcues[audio]` for `--refine-drops` (needs `librosa`/`soundfile`), or `djcues[ml]` for `--deep` and `beatgrid --deep` (adds `beat-this` and `demucs`, which pull in `torch` — a large, platform-specific download, hundreds of MB+).
 
 ## How It Works

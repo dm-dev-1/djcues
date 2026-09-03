@@ -264,10 +264,24 @@ def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars):
     return wrapped, refinement_log
 
 
+_SUSTAIN_SIGNATURE_HINTS = {
+    "oscillating": "energy pattern: oscillating -- treat with extra suspicion",
+    "stable_match": "energy pattern: stable -- more likely a genuine improvement",
+}
+
+
 def _print_refinement_summary(refinement_log):
     """Post-run summary for --refine-drops, in the same voice as
     _print_cost_summary -- aggregate counts plus a compact listing of
-    every cue that actually moved."""
+    every cue that actually moved.
+
+    Each "refined" line's optional hint (oscillating/stable_match) is an
+    unverified diagnostic, not a verdict -- checked against exactly one
+    real by-ear listen plus a 282-case aggregate pattern (see the plan's
+    Local audio-ML analysis section), meant to help prioritize which
+    refinements are most worth double-checking by ear, never to replace
+    that check.
+    """
     from collections import Counter
 
     all_refinements = [r for _t, rs in refinement_log for r in rs]
@@ -287,9 +301,11 @@ def _print_refinement_summary(refinement_log):
     for track, refinements in refinement_log:
         for r in refinements:
             if r.outcome == "refined":
+                hint = _SUSTAIN_SIGNATURE_HINTS.get(r.sustain_signature, "")
+                hint_str = f"  [{hint}]" if hint else ""
                 click.echo(
                     f"  {track.title} [{r.pad}]: {r.original_ms / 1000:.1f}s -> "
-                    f"{r.refined_ms / 1000:.1f}s ({r.offset_ms:+.0f}ms, {r.source})"
+                    f"{r.refined_ms / 1000:.1f}s ({r.offset_ms:+.0f}ms, {r.source}){hint_str}"
                 )
 
 

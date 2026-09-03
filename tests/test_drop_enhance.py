@@ -7,6 +7,7 @@ from djcues import drop_enhance
 from djcues.audio import AudioExtraUnavailableError
 from djcues.drop_enhance import (
     DropRefinement,
+    _sustain_signature,
     enhance_proposal_drops,
     refine_breakdown_position,
     refine_drop_position,
@@ -212,6 +213,108 @@ def test_refine_breakdown_position_defaults_pad_to_e():
     result = refine_breakdown_position(y, _SR, candidate_ms=5000.0)
 
     assert result.pad == "E"
+
+
+# --- _sustain_signature: unverified diagnostic hint on "refined" outcomes ---
+
+
+def _flat_tone(duration_s: float, amp: float = 0.3, sr: int = _SR) -> np.ndarray:
+    """Constant-amplitude tone -- a stand-in for a genuinely settled,
+    sustained energy state (what a real drop/breakdown should look like
+    after it lands)."""
+    n = int(duration_s * sr)
+    t = np.arange(n)
+    return (amp * np.sin(2 * np.pi * 100 * t / sr)).astype(np.float32)
+
+
+def _pulsing_region(
+    duration_s: float, sr: int = _SR, period_s: float = 0.4,
+    loud_amp: float = 0.3, quiet_amp: float = 0.02,
+) -> np.ndarray:
+    """Alternating loud/quiet blocks -- a stand-in for normal per-beat
+    rhythmic pulsing that swings back within a beat or two, the shape
+    that fooled the fast-path dip-detector on a real confirmed case."""
+    n = int(duration_s * sr)
+    y = np.zeros(n, dtype=np.float32)
+    period = int(period_s * sr)
+    half = period // 2
+    for start in range(0, n, period):
+        y[start:start + half] = loud_amp
+    t = np.arange(n)
+    return (y * np.sin(2 * np.pi * 100 * t / sr)).astype(np.float32) + (
+        quiet_amp * np.sin(2 * np.pi * 100 * t / sr)
+    ).astype(np.float32)
+
+
+@requires_audio
+def test_sustain_signature_oscillating_when_refined_is_choppier():
+    # original: settles into a flat, stable state (a real transition's shape).
+    # refined: keeps pulsing (a normal rhythmic dip/rise's shape).
+    y = np.concatenate([_flat_tone(2.0), _pulsing_region(2.0)])
+    result = _sustain_signature(y, _SR, original_ms=0.0, refined_ms=2000.0)
+
+    assert result == "oscillating"
+
+
+@requires_audio
+def test_sustain_signature_stable_match_when_refined_is_steadier():
+    # Mirror of the above -- original pulses, refined settles.
+    y = np.concatenate([_pulsing_region(2.0), _flat_tone(2.0)])
+    result = _sustain_signature(y, _SR, original_ms=0.0, refined_ms=2000.0)
+
+    assert result == "stable_match"
+
+
+@requires_audio
+def test_sustain_signature_ambiguous_when_both_similar():
+    y = np.concatenate([_flat_tone(2.0), _flat_tone(2.0)])
+    result = _sustain_signature(y, _SR, original_ms=0.0, refined_ms=2000.0)
+
+    assert result == "ambiguous"
+
+
+@requires_audio
+def test_sustain_signature_none_near_track_end():
+    # _window_range degrades gracefully down to a 0.3s floor, so refined_ms
+    # needs to leave LESS than that -- not just less than the full 1.5s --
+    # to actually hit the "not enough audio" None path.
+    y = _flat_tone(2.0)
+    result = _sustain_signature(y, _SR, original_ms=0.0, refined_ms=1900.0)
+
+    assert result is None
+
+
+def _hum_with_burst(
+    duration_s: float, burst_at_s: float, burst_len_s: float = 0.3,
+    hum_amp: float = 0.05, burst_amp: float = 0.8, sr: int = _SR,
+) -> np.ndarray:
+    """A quiet-but-nonzero sustained baseline (so _sustain_signature has a
+    genuine energy level to compare, unlike near-total silence) plus a
+    real transient burst for the rise-detector itself to find."""
+    n = int(duration_s * sr)
+    t = np.arange(n)
+    y = (hum_amp * np.sin(2 * np.pi * 100 * t / sr)).astype(np.float32)
+    b0 = int(burst_at_s * sr)
+    b1 = min(n, b0 + int(burst_len_s * sr))
+    tb = np.arange(b1 - b0)
+    env = np.exp(-tb / (0.05 * sr))
+    y[b0:b1] += burst_amp * env * np.sin(2 * np.pi * 60 * tb / sr)
+    return y
+
+
+@requires_audio
+def test_refine_drop_position_populates_sustain_signature_only_when_refined():
+    confirmed = refine_drop_position(
+        _hum_with_burst(duration_s=10.0, burst_at_s=5.0), _SR, candidate_ms=5000.0, pad="D"
+    )
+    assert confirmed.outcome == "confirmed"
+    assert confirmed.sustain_signature is None
+
+    refined = refine_drop_position(
+        _hum_with_burst(duration_s=10.0, burst_at_s=6.5), _SR, candidate_ms=5000.0, pad="D"
+    )
+    assert refined.outcome == "refined"
+    assert refined.sustain_signature in ("oscillating", "stable_match", "ambiguous")
 
 
 # --- separate_stems: real Demucs inference, requires_ml smoke test only ---

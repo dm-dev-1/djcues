@@ -53,6 +53,17 @@ _MIN_REFINE_RATIO = 1.5  # the alternative must be at least this many times stro
 _MIN_RISE_STRENGTH = 0.01  # floor below which "the strongest rise in the window" still isn't a real transient
 _MIN_WINDOW_FRAMES = 4  # fewer than this and there's not enough resolution to say anything
 
+# How far past a "refined" position to check whether the implied energy
+# state actually holds, vs. swinging back within a beat or two -- an
+# unverified diagnostic, not a threshold that changes outcome/refined_ms.
+# Checked against one real by-ear listen (correctly flagged "oscillating")
+# plus a 282-case real-library aggregate (37% oscillating, 18%
+# stable_match, 45% ambiguous) -- real signal, not validated as reliable
+# enough to decide anything on its own. See the plan's Local audio-ML
+# analysis section.
+_SUSTAIN_CHECK_WINDOW_MS = 1500.0
+_SUSTAIN_RATIO_THRESHOLD = 1.2  # >20% difference either way before calling it either way
+
 _RISE_PADS = ("D", "F")
 _DIP_PADS = ("E",)
 # Iteration order here becomes the order refinement notes are appended
@@ -173,6 +184,7 @@ def _score_transition(
         return DropRefinement(
             pad=pad, outcome="refined", original_ms=candidate_ms, refined_ms=best_ms,
             offset_ms=best_ms - candidate_ms, strength=ratio, source=source,
+            sustain_signature=_sustain_signature(samples, sr, candidate_ms, best_ms),
             note=(
                 f"stronger energy {word} found {best_ms - candidate_ms:+.0f}ms away "
                 f"({ratio:.1f}x the {word} at the original position)"
@@ -184,6 +196,45 @@ def _score_transition(
         offset_ms=0.0, strength=ratio, source=source,
         note="audio analysis agrees with the existing position",
     )
+
+
+def _sustain_signature(
+    samples: np.ndarray, sr: int, original_ms: float, refined_ms: float
+) -> str | None:
+    """Informational-only diagnostic for a "refined" outcome: compares
+    how much the energy level fluctuates in the _SUSTAIN_CHECK_WINDOW_MS
+    after the original position vs. after the refined one. A real
+    transition (a drop or a breakdown) should settle into a new,
+    comparatively stable energy state; a normal per-beat rhythmic pulse
+    swings back within a beat or two -- this is exactly the shape a
+    confirmed real false positive showed (see the plan). Never affects
+    outcome/refined_ms -- purely a hint for a human doing the by-ear
+    check this whole feature still depends on.
+    """
+    import librosa
+
+    def _window_range(pos_ms: float) -> float | None:
+        start = int(pos_ms / 1000.0 * sr)
+        end = start + int(_SUSTAIN_CHECK_WINDOW_MS / 1000.0 * sr)
+        segment = samples[start:end]
+        if len(segment) < sr * 0.3:
+            return None
+        hop = max(1, int(sr * 0.05))
+        frame = max(hop * 2, int(sr * 0.2))
+        rms = librosa.feature.rms(y=segment, frame_length=frame, hop_length=hop)[0]
+        return float(rms.max() - rms.min())
+
+    original_range = _window_range(original_ms)
+    refined_range = _window_range(refined_ms)
+    if original_range is None or refined_range is None or original_range <= 0:
+        return None
+
+    ratio = refined_range / original_range
+    if ratio > _SUSTAIN_RATIO_THRESHOLD:
+        return "oscillating"
+    if ratio < 1.0 / _SUSTAIN_RATIO_THRESHOLD:
+        return "stable_match"
+    return "ambiguous"
 
 
 def refine_drop_position(

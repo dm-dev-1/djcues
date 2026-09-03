@@ -221,7 +221,22 @@ class DropRefinement:
     rise measured right at original_ms (informational, not itself a
     threshold consumers should re-check). source is "full_mix" or
     "stems" (bass+drums from Demucs, --deep only) depending on which
-    signal was analyzed."""
+    signal was analyzed.
+
+    sustain_signature is only ever populated for outcome="refined"
+    (there's nothing to compare for "confirmed"/"inconclusive", since
+    original_ms == refined_ms there) -- one of "oscillating" (the
+    refined position's energy swings noticeably more than the original
+    did over the following ~1.5s, the same shape a real, confirmed
+    false positive showed), "stable_match" (swings noticeably less,
+    the shape a genuine improvement should have), "ambiguous" (neither,
+    the common case), or None (couldn't be computed). Purely an
+    unverified diagnostic hint for a human doing the by-ear check this
+    whole feature still depends on -- never affects refined_ms/outcome,
+    and has been checked against exactly one real by-ear listen so far
+    plus a 282-case aggregate pattern, not validated as reliable enough
+    to decide anything on its own. See the plan's Local audio-ML
+    analysis section."""
 
     pad: str
     outcome: str
@@ -231,3 +246,4 @@ class DropRefinement:
     strength: float
     source: str
     note: str
+    sustain_signature: str | None = None
