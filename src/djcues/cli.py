@@ -210,6 +210,89 @@ def _get_proposer(agentic, provider_name, model, offset, loop_bars, skip_critic)
     return proposer, telemetry_list, resolved_model
 
 
+def _check_refine_drops_available(deep: bool) -> None:
+    """Upfront fail-fast for --refine-drops[/--deep], matching
+    _resolve_agentic_provider's existing pattern: fail with a clear
+    install message before processing any track, not partway through a
+    playlist."""
+    try:
+        import librosa  # noqa: F401
+    except ImportError:
+        click.echo(
+            "Error: --refine-drops needs the 'librosa'/'soundfile' packages. "
+            "Install them with: pip install djcues[audio]",
+            err=True,
+        )
+        raise SystemExit(1)
+    if deep:
+        try:
+            import demucs  # noqa: F401
+            import torch  # noqa: F401
+        except ImportError:
+            click.echo(
+                "Error: --refine-drops --deep needs the 'demucs'/'torch' packages. "
+                "Install them with: pip install djcues[ml]",
+                err=True,
+            )
+            raise SystemExit(1)
+
+
+def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars):
+    """Wrap a proposer(track) -> CueProposal callable so it also
+    refines D/E/F against real audio afterward, when --refine-drops is
+    set -- composes with either the heuristic or --agentic proposer
+    transparently, the same way _get_proposer already composes agentic
+    vs. heuristic behind one callable. Returns (proposer, refinement_log)
+    where refinement_log is None when --refine-drops wasn't requested,
+    else a list of (track, list[DropRefinement]) accumulated per call.
+    """
+    if not refine_drops:
+        return proposer, None
+
+    from djcues.drop_enhance import enhance_proposal_drops
+
+    refinement_log = []
+
+    def wrapped(track):
+        proposal = proposer(track)
+        refined, refinements = enhance_proposal_drops(
+            proposal, track, offset, loop_bars, deep=deep
+        )
+        refinement_log.append((track, refinements))
+        return refined
+
+    return wrapped, refinement_log
+
+
+def _print_refinement_summary(refinement_log):
+    """Post-run summary for --refine-drops, in the same voice as
+    _print_cost_summary -- aggregate counts plus a compact listing of
+    every cue that actually moved."""
+    from collections import Counter
+
+    all_refinements = [r for _t, rs in refinement_log for r in rs]
+    if not all_refinements:
+        click.echo(
+            "\n--refine-drops: no D/E/F cues were checked (no audio file "
+            "resolved for any selected track)."
+        )
+        return
+
+    counts = Counter(r.outcome for r in all_refinements)
+    click.echo(
+        f"\n--refine-drops: {len(all_refinements)} cue(s) checked against real audio -- "
+        f"{counts.get('confirmed', 0)} confirmed, {counts.get('refined', 0)} refined, "
+        f"{counts.get('inconclusive', 0)} inconclusive."
+    )
+    for track, refinements in refinement_log:
+        for r in refinements:
+            if r.outcome == "refined":
+                click.echo(
+                    f"  {track.title} [{r.pad}]: {r.original_ms / 1000:.1f}s -> "
+                    f"{r.refined_ms / 1000:.1f}s ({r.offset_ms:+.0f}ms, {r.source})"
+                )
+
+
 def _print_cost_summary(telemetry_list, model, track_count):
     """Print the post-run cost summary for an --agentic run, in the
     same voice as apply's 'Done: N tracks, M cues written.' line."""
@@ -311,11 +394,18 @@ def cli():
 @click.option("--model", default=None, help="Model for --agentic. Defaults to your configured model.")
 @click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
 @click.option("--estimate-only", is_flag=True, help="Print an estimated --agentic cost and exit without calling the model.")
-def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, estimate_only):
+@click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
+@click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
+def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, estimate_only, refine_drops, deep):
     """Propose cue placements for tracks in a playlist."""
     if estimate_only and not agentic:
         click.echo("Error: --estimate-only only applies with --agentic.", err=True)
         raise SystemExit(1)
+    if deep and not refine_drops:
+        click.echo("Error: --deep only applies with --refine-drops.", err=True)
+        raise SystemExit(1)
+    if refine_drops:
+        _check_refine_drops_available(deep)
 
     playlist = find_playlist(playlist_name)
     if playlist is None:
@@ -345,6 +435,7 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     proposer, telemetry_list, resolved_model = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
+    proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
 
     for t in selected:
         proposal = proposer(t)
@@ -352,6 +443,8 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
 
     if telemetry_list is not None:
         _print_cost_summary(telemetry_list, resolved_model, len(selected))
+    if refinement_log is not None:
+        _print_refinement_summary(refinement_log)
 
 
 @cli.command()
@@ -364,8 +457,16 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
 @click.option("--provider", default=None, help="Provider for --agentic: 'anthropic' or 'gemini'. Defaults to your configured provider.")
 @click.option("--model", default=None, help="Model for --agentic. Defaults to your configured model.")
 @click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
-def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic):
+@click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
+@click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
+def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, refine_drops, deep):
     """Compare existing cues with proposed placements."""
+    if deep and not refine_drops:
+        click.echo("Error: --deep only applies with --refine-drops.", err=True)
+        raise SystemExit(1)
+    if refine_drops:
+        _check_refine_drops_available(deep)
+
     playlist = find_playlist(playlist_name)
     if playlist is None:
         click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
@@ -379,6 +480,7 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     proposer, telemetry_list, resolved_model = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
+    proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
 
     if all_tracks:
         per_track_stats = []
@@ -388,6 +490,8 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
 
         if telemetry_list is not None:
             _print_cost_summary(telemetry_list, resolved_model, len(tracks))
+        if refinement_log is not None:
+            _print_refinement_summary(refinement_log)
 
         merged = merge_pad_stats(per_track_stats)
         total = overall_stats(merged)
@@ -421,6 +525,8 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
             _print_comparison(proposal, t)
         if telemetry_list is not None:
             _print_cost_summary(telemetry_list, resolved_model, len(matched))
+        if refinement_log is not None:
+            _print_refinement_summary(refinement_log)
     else:
         click.echo("Error: provide a track name or use --all.", err=True)
         raise SystemExit(1)
@@ -501,13 +607,21 @@ def viz(playlist, track_name, all_tracks, compare_mode, offset, loop_bars, outpu
 @click.option("--provider", default=None, help="Provider for --agentic: 'anthropic' or 'gemini'. Defaults to your configured provider.")
 @click.option("--model", default=None, help="Model for --agentic. Defaults to your configured model.")
 @click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
-def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic, provider, model, skip_critic):
+@click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
+@click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
+def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic, provider, model, skip_critic, refine_drops, deep):
     """Launch interactive review session in browser."""
     import pathlib
     import time
     import webbrowser
     from djcues.review import create_session, render_review_html
     from djcues.server import start_server
+
+    if deep and not refine_drops:
+        click.echo("Error: --deep only applies with --refine-drops.", err=True)
+        raise SystemExit(1)
+    if refine_drops:
+        _check_refine_drops_available(deep)
 
     pl = find_playlist(playlist)
     if pl is None:
@@ -522,6 +636,7 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
     proposer, telemetry_list, resolved_model = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
+    proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
 
     if all_tracks:
         selected = tracks
@@ -543,6 +658,8 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
 
     if telemetry_list is not None:
         _print_cost_summary(telemetry_list, resolved_model, len(pairs))
+    if refinement_log is not None:
+        _print_refinement_summary(refinement_log)
 
     if not pairs:
         click.echo("No tracks with phrase data to review.", err=True)

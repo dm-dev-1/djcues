@@ -87,6 +87,32 @@ In the review UI:
 djcues compare "Processed" --all
 ```
 
+### Audio-ML analysis (optional, local-only)
+
+Two opt-in features analyze the real audio file instead of only rekordbox's pre-computed analysis. Both run entirely locally — no audio ever leaves your machine.
+
+```bash
+# Verify rekordbox's stored beat grid is still trustworthy
+djcues beatgrid "Playlist Name" --all
+
+# Force real audio-based verification even when the free check looks fine
+djcues beatgrid "Playlist Name" "Track Name" --deep
+
+# Refine Drop/Breakdown/Special cue positions against the real audio (composes with propose/compare/review)
+djcues propose "Playlist Name" "Track Name" --refine-drops
+djcues compare "Playlist Name" --all --refine-drops
+djcues review "Playlist Name" --all --refine-drops
+
+# --deep additionally runs Demucs source separation for a cleaner bass/drums
+# signal before refining -- meaningfully slower (~7-12 minutes per track on
+# CPU), so use it sparingly, on 1-2 tracks at a time
+djcues propose "Playlist Name" "Track Name" --refine-drops --deep
+```
+
+`beatgrid` always runs a free, audio-independent self-consistency check first (no extra install needed) using rekordbox's own full per-beat grid data, and only escalates to real audio when that check looks suspicious or `--deep` forces it. `--refine-drops` never does an independent redetection — it only looks for a dominant energy transition (a rise for Drop/Special, a dip for Breakdown) in a bounded window around the position the heuristic (or `--agentic`) already proposed, and only moves the cue when the audio evidence is clearly dominant; otherwise it leaves the existing position untouched and says so in the notes. Neither feature ever writes to rekordbox — same read-only guarantee as every other command until `apply`.
+
+Install with `pip install djcues[audio]` for `--refine-drops` (needs `librosa`/`soundfile`), or `djcues[ml]` for `--deep` and `beatgrid --deep` (adds `beat-this` and `demucs`, which pull in `torch` — a large, platform-specific download, hundreds of MB+).
+
 ## How It Works
 
 1. **Phrase analysis (PSSI)**: rekordbox analyzes tracks into phrases (Intro, Up, Down, Chorus, Outro). djcues maps these to cue slots using heuristics — e.g., Drop aligns with the first Chorus after 20% of the track.
@@ -122,11 +148,19 @@ src/djcues/
     constants.py    # PSSI mood tables, cue system definition, color maps
     db.py           # Rekordbox database reader
     strategy.py     # Cue placement heuristics
+    agentic.py      # LLM-based multi-agent analysis (--agentic, BYOK)
+    providers/      # Anthropic/Gemini provider adapters for --agentic
+    auth.py         # BYOK API key storage (OS keyring)
+    audio.py        # Real audio file loading (djcues[audio])
+    beat_verify.py  # Beat-grid self-consistency + real audio verification
+    drop_enhance.py # Drop/Breakdown/Special cue refinement against real audio (--refine-drops)
+    history.py      # Correction-history logging
+    metrics.py      # Precision/recall/F1 for compare
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
     server.py       # Local HTTP server for review sessions
     writer.py       # DB backup and cue writes
-    cli.py          # Click CLI (propose, compare, viz, review, apply)
+    cli.py          # Click CLI (propose, compare, viz, review, apply, beatgrid, auth, history)
 ```
 
 ## License

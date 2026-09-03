@@ -182,3 +182,36 @@ class BeatGridReport:
     self_consistency: SelfConsistencyResult
     audio: AudioBeatVerification | None
     status: str
+
+
+@dataclass
+class DropRefinement:
+    """Result of checking one already-placed cue (D, E, or F) against
+    real audio for a dominant nearby energy transition -- a rise for
+    D/F, a dip for E -- drop_enhance.py's core output. Deliberately
+    never an independent redetection: refined_ms can only ever be a
+    position found strictly inside the bounded search window around
+    original_ms.
+
+    outcome is one of:
+    - "confirmed": audio agrees with the existing position, unchanged.
+    - "refined": a clearly dominant transient was found elsewhere in
+      the window, refined_ms replaces original_ms.
+    - "inconclusive": nothing clear enough to act on either way, the
+      original position is left untouched (same as "confirmed" in
+      effect, but says so honestly rather than implying agreement).
+
+    strength is the ratio of the winning frame's energy-rise to the
+    rise measured right at original_ms (informational, not itself a
+    threshold consumers should re-check). source is "full_mix" or
+    "stems" (bass+drums from Demucs, --deep only) depending on which
+    signal was analyzed."""
+
+    pad: str
+    outcome: str
+    original_ms: float
+    refined_ms: float
+    offset_ms: float
+    strength: float
+    source: str
+    note: str
