@@ -33,11 +33,12 @@ def _importable(*module_names: str) -> bool:
     return True
 
 
-# For tests that need the `audio` extra (librosa/soundfile -- real audio
-# decode) or the `ml` extra (beat_this/demucs/torch -- real model
+# For tests that need the `audio` extra (librosa/soundfile/av -- real
+# audio decode, including the PyAV fallback for containers soundfile
+# can't open) or the `ml` extra (beat_this/demucs/torch -- real model
 # inference). Neither is required for djcues's core install.
 requires_audio = pytest.mark.skipif(
-    not _importable("librosa", "soundfile"), reason="djcues[audio] not installed"
+    not _importable("librosa", "soundfile", "av"), reason="djcues[audio] not installed"
 )
 requires_ml = pytest.mark.skipif(
     not _importable("beat_this", "demucs", "torch"), reason="djcues[ml] not installed"

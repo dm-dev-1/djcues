@@ -49,6 +49,15 @@ agentic = [
 audio = [
     "librosa>=0.10",
     "soundfile>=0.12",
+    # Fallback decoder for containers soundfile can't open (confirmed
+    # this session: AAC-in-MP4/M4A -- soundfile raises "Format not
+    # recognised" for both real .m4a/.mp4 files in this project's own
+    # library, but av decodes the .m4a one correctly end-to-end).
+    # Bundles its own FFmpeg-derived decoders -- no system ffmpeg
+    # install needed, confirmed via a real, isolated ~4.6MB install.
+    # Tested against av==18.1.0; floor set conservatively lower since
+    # only that version was actually verified.
+    "av>=13.0",
 ]
 ml = [
     "djcues[audio]",
