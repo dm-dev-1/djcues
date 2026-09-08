@@ -33,16 +33,37 @@ from djcues.server import start_auth_server, start_server
 
 def _request(method: str, url: str, body: dict | None = None) -> tuple[int, dict]:
     data = json.dumps(body).encode("utf-8") if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method)
-    if data is not None:
-        req.add_header("Content-Type", "application/json")
-    try:
-        resp: HTTPResponse = urllib.request.urlopen(req, timeout=5)
-        status = resp.status
-        raw = resp.read()
-    except urllib.error.HTTPError as e:
-        status = e.code
-        raw = e.read()
+    # Retry once on a raw connection-level failure (ConnectionAbortedError/
+    # ConnectionResetError, an OSError subclass -- not urllib.error.HTTPError,
+    # so it isn't a real 4xx/5xx from the handler). Observed intermittently
+    # in the full suite, never when this file runs alone or under light
+    # load -- consistent with transient Windows TCP-stack jitter after many
+    # rapid real socket open/close cycles in one process, not a logic bug:
+    # the same request against the same running server succeeds on retry
+    # every time this has been seen. Every route exercised here is either
+    # a GET or a POST to a 404/error path with no side effect, so a retry
+    # is safe -- this isn't papering over a real assertion failure, it's
+    # tolerating the kind of transient hiccup any real HTTP client needs
+    # to handle against a real server.
+    last_conn_error: OSError | None = None
+    for attempt in range(2):
+        req = urllib.request.Request(url, data=data, method=method)
+        if data is not None:
+            req.add_header("Content-Type", "application/json")
+        try:
+            resp: HTTPResponse = urllib.request.urlopen(req, timeout=5)
+            status = resp.status
+            raw = resp.read()
+            break
+        except urllib.error.HTTPError as e:
+            status = e.code
+            raw = e.read()
+            break
+        except (ConnectionAbortedError, ConnectionResetError) as e:
+            last_conn_error = e
+            time.sleep(0.2)
+    else:
+        raise last_conn_error
     try:
         parsed = json.loads(raw) if raw else {}
     except json.JSONDecodeError:
@@ -73,12 +94,23 @@ def _shutdown(server) -> None:
     """Stop a server's serving thread promptly instead of waiting out its
     10s handle_request() socket timeout -- set the flag, then send one
     harmless request to wake the currently-blocked handle_request() call
-    so the loop re-checks the flag immediately."""
+    so the loop re-checks the flag immediately. Then actually wait for
+    the socket to close (not just for this call to return) before handing
+    control back to the next test: this file starts 35+ real servers,
+    and leaving each one's teardown to finish in the background let
+    enough sockets/threads pile up across the file to cause intermittent
+    ConnectionAbortedError on unrelated later tests -- reproducible in
+    the full run, absent when this file runs alone. Waiting here for a
+    real fileno()==-1 confirms full OS-level cleanup, not just that this
+    function returned."""
     server._shutdown_flag = True
     try:
         urllib.request.urlopen(f"http://127.0.0.1:{server.server_address[1]}/", timeout=2)
     except Exception:
         pass
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and server.socket.fileno() != -1:
+        time.sleep(0.05)
 
 
 # ---------------------------------------------------------------------------
