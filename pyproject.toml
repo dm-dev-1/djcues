@@ -75,6 +75,8 @@ dev = [
     "anthropic>=0.40",
     "google-genai>=1.0",
     "keyring>=25.0",
+    "pytest-cov>=7.0",
+    "mypy>=2.0",
 ]
 
 [project.scripts]

@@ -6,6 +6,11 @@ dist/
 wheels/
 *.egg-info
 *.DS_Store
+
+# Coverage reports (pytest-cov)
+.coverage
+.coverage.*
+htmlcov/
 # Virtual environments
 .venv
 
