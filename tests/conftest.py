@@ -1,12 +1,22 @@
 import os
 import pathlib
 import pytest
+from pyrekordbox import get_config
 
 from djcues.models import BeatGrid, Phrase
 
-REKORDBOX_DB_EXISTS = pathlib.Path.home().joinpath(
-    "Library/Pioneer/rekordbox/master.db"
-).exists()
+
+def _rekordbox_db_exists() -> bool:
+    """Mirror Rekordbox6Database's own default db_path resolution
+    (pyrekordbox.config, win32/darwin-aware) instead of guessing a path,
+    so this matches whatever djcues.db.get_db() will actually open.
+    """
+    rb_config = get_config("rekordbox7") or get_config("rekordbox6")
+    db_path = rb_config.get("db_path", "") if rb_config else ""
+    return bool(db_path) and pathlib.Path(db_path).exists()
+
+
+REKORDBOX_DB_EXISTS = _rekordbox_db_exists()
 
 requires_rekordbox = pytest.mark.skipif(
     not REKORDBOX_DB_EXISTS, reason="Rekordbox database not found"
