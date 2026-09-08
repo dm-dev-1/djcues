@@ -461,10 +461,11 @@ def propose_with_telemetry(
     # fails or declines, and get overwritten below on success.
     from djcues.constants import KIND_TO_PAD
 
-    heuristic_positions = {
-        KIND_TO_PAD.get(c.kind): c.position_ms for c in heuristic.hot_cues
+    positions: dict[str, float] = {
+        pad: c.position_ms
+        for c in heuristic.hot_cues
+        if (pad := KIND_TO_PAD.get(c.kind)) is not None
     }
-    positions: dict[str, float] = dict(heuristic_positions)
     confidence: dict[str, float] = dict(heuristic.confidence)
     notes: list[str] = list(heuristic.notes)
 

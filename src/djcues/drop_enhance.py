@@ -374,7 +374,11 @@ def enhance_proposal_drops(
             analysis_samples = loaded.samples
             source = "full_mix"
 
-    positions = {KIND_TO_PAD.get(c.kind): c.position_ms for c in proposal.hot_cues}
+    positions = {
+        pad: c.position_ms
+        for c in proposal.hot_cues
+        if (pad := KIND_TO_PAD.get(c.kind)) is not None
+    }
     confidence = dict(proposal.confidence)
     notes = list(proposal.notes)
     refinements: list[DropRefinement] = []
