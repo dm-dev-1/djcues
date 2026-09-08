@@ -5,15 +5,15 @@ from tests.conftest import requires_rekordbox
 @requires_rekordbox
 def test_find_playlist():
     from djcues.db import find_playlist
-    pl = find_playlist("Processed")
+    pl = find_playlist("Tech House")
     assert pl is not None
-    assert pl.Name == "Processed"
+    assert pl.Name == "Tech House"
 
 
 @requires_rekordbox
 def test_load_playlist_tracks():
     from djcues.db import find_playlist, load_playlist_tracks
-    pl = find_playlist("Processed")
+    pl = find_playlist("Tech House")
     tracks = load_playlist_tracks(pl.ID)
     assert len(tracks) > 0
     first = tracks[0]
@@ -24,7 +24,7 @@ def test_load_playlist_tracks():
 @requires_rekordbox
 def test_track_has_phrases():
     from djcues.db import find_playlist, load_playlist_tracks
-    pl = find_playlist("Processed")
+    pl = find_playlist("Tech House")
     tracks = load_playlist_tracks(pl.ID)
     # At least some tracks should have phrases
     tracks_with_phrases = [t for t in tracks if len(t.phrases) > 0]
@@ -34,9 +34,9 @@ def test_track_has_phrases():
 @requires_rekordbox
 def test_track_has_cues():
     from djcues.db import find_playlist, load_playlist_tracks
-    pl = find_playlist("Processed")
+    pl = find_playlist("Tech House")
     tracks = load_playlist_tracks(pl.ID)
-    # Processed tracks should all have cues
+    # Tech House tracks should all have cues
     for t in tracks:
         assert len(t.cues) > 0, f"{t.title} has no cues"
 
@@ -44,7 +44,7 @@ def test_track_has_cues():
 @requires_rekordbox
 def test_track_beat_grid():
     from djcues.db import find_playlist, load_playlist_tracks
-    pl = find_playlist("Processed")
+    pl = find_playlist("Tech House")
     tracks = load_playlist_tracks(pl.ID)
     first = tracks[0]
     assert first.beat_grid.bpm > 0
