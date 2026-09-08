@@ -87,6 +87,54 @@ In the review UI:
 djcues compare "Processed" --all
 ```
 
+### LLM-based analysis (optional, BYOK)
+
+`--agentic` replaces the local heuristic with a multi-agent LLM analysis on `propose`, `compare`, and `review`: three specialists (Structure, Vocal, Energy) propose positions in parallel from the same phrase/vocal/energy data the heuristic uses, then a critic pass reviews their confidence and notes. No raw audio ever leaves your machine — only that same compact summary. Needs an API key first: run `djcues auth set` (see below).
+
+```bash
+# See the cost before spending anything
+djcues propose "Playlist Name" "Track Name" --agentic --estimate-only
+
+# Run it for real, using your configured provider/model
+djcues propose "Playlist Name" "Track Name" --agentic
+djcues compare "Playlist Name" --all --agentic
+djcues review "Playlist Name" --all --agentic
+
+# Override the configured provider/model, or skip the critic pass (3 calls/track instead of 4)
+djcues propose "Playlist Name" "Track Name" --agentic --provider gemini --model gemini-3.7-flash
+djcues propose "Playlist Name" "Track Name" --agentic --skip-critic
+```
+
+Every `--agentic` run prints its real cost when it finishes — actual tokens used, priced from djcues' local pricing table — not just an upfront guess. `--estimate-only` (propose only) does a genuine pre-flight token count against the selected tracks and exits without calling the model.
+
+Install with `pip install djcues[agentic]` (adds the `anthropic` and `google-genai` SDKs and `keyring`).
+
+### Configure an API key for --agentic
+
+```bash
+# Prompts for provider, API key, and a live-fetched model list
+djcues auth set
+
+# Show the configured provider/model and where the key came from (never the key itself)
+djcues auth status
+
+# Remove a stored key
+djcues auth clear
+
+# Same flow as `auth set`, in a local browser page instead of the terminal
+djcues auth web
+```
+
+Keys are stored in your OS credential store (Windows Credential Manager, macOS Keychain, or the Linux Secret Service) via `keyring` — never in a plaintext file. If you'd rather not run `auth set`, `--agentic` also falls back to the `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` environment variables when no key is in the keyring. Requires `pip install djcues[agentic]`.
+
+### View correction history
+
+```bash
+djcues history
+```
+
+Read-only. `djcues apply` automatically logs every accepted/adjusted/skipped hot cue to a local SQLite database at `~/.djcues/history.db` (independent of rekordbox's own database) as it writes; `history` just prints the per-pad totals and correction counts accumulated there so far. Nothing to configure — it fills in as you use `apply` normally.
+
 ### Audio-ML analysis (optional, local-only)
 
 Two opt-in features analyze the real audio file instead of only rekordbox's pre-computed analysis. Both run entirely locally — no audio ever leaves your machine.
@@ -130,7 +178,7 @@ Install with `pip install djcues[audio]` for `--refine-drops` (needs `librosa`/`
 - **Auto-backup**: `djcues apply` automatically backs up `master.db` before writing
 - **Overwrite protection**: Tracks with existing cues require explicit confirmation
 - **Rekordbox must be closed**: The apply command will not write while rekordbox is running
-- **Read-only by default**: `propose`, `compare`, `viz`, and `review` never modify the database
+- **Read-only by default**: `propose`, `compare`, `viz`, `review`, and `beatgrid` never modify the database
 - **DB-only writes**: Cues are written to `master.db` only (not ANLZ files). rekordbox handles ANLZ sync on USB export.
 
 ## Configuration
