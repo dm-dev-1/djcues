@@ -200,6 +200,21 @@ class TestPropose:
         assert "Test Track" in result.output
         assert "Second Track" in result.output
 
+    def test_all_flag_skips_tracks_with_no_phrase_data_instead_of_crashing(
+        self, runner: CliRunner, track: Track, track_no_phrases: Track
+    ):
+        # Regression test: a track with no phrase data also typically has
+        # bpm=0 in practice (Rekordbox never finished analyzing it), and
+        # CueStrategy.propose() divides by bpm -- this used to crash
+        # --all outright instead of skipping the one bad track, found via
+        # a real ZeroDivisionError against a real Rekordbox library.
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track, track_no_phrases]):
+            result = runner.invoke(cli, ["propose", "Test Playlist", "--all"])
+        assert result.exit_code == 0
+        assert "Test Track" in result.output
+        assert "Skipping No Phrases Track (no phrase data)" in result.output
+
     def test_refine_drops_composes_and_prints_summary(self, runner: CliRunner, track: Track):
         from djcues.models import DropRefinement
 
@@ -311,6 +326,17 @@ class TestCompare:
              patch("djcues.cli.load_playlist_tracks", return_value=[track]):
             result = runner.invoke(cli, ["compare", "Test Playlist", "--all"])
         assert result.exit_code == 0
+        assert "Overall" in result.output
+
+    def test_all_flag_skips_tracks_with_no_phrase_data_instead_of_crashing(
+        self, runner: CliRunner, track: Track, track_no_phrases: Track
+    ):
+        # Same real-library regression as propose's version of this test.
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track, track_no_phrases]):
+            result = runner.invoke(cli, ["compare", "Test Playlist", "--all"])
+        assert result.exit_code == 0
+        assert "Skipping No Phrases Track (no phrase data)" in result.output
         assert "Overall" in result.output
 
 

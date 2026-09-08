@@ -453,12 +453,17 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     )
     proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
 
+    analyzed = 0
     for t in selected:
+        if not t.phrases:
+            click.echo(f"  Skipping {t.title} (no phrase data)", err=True)
+            continue
         proposal = proposer(t)
         _print_proposal(proposal, t)
+        analyzed += 1
 
     if telemetry_list is not None:
-        _print_cost_summary(telemetry_list, resolved_model, len(selected))
+        _print_cost_summary(telemetry_list, resolved_model, analyzed)
     if refinement_log is not None:
         _print_refinement_summary(refinement_log)
 
@@ -500,12 +505,17 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
 
     if all_tracks:
         per_track_stats = []
+        analyzed = 0
         for t in tracks:
+            if not t.phrases:
+                click.echo(f"  Skipping {t.title} (no phrase data)", err=True)
+                continue
             proposal = proposer(t)
             per_track_stats.append(_print_comparison(proposal, t))
+            analyzed += 1
 
         if telemetry_list is not None:
-            _print_cost_summary(telemetry_list, resolved_model, len(tracks))
+            _print_cost_summary(telemetry_list, resolved_model, analyzed)
         if refinement_log is not None:
             _print_refinement_summary(refinement_log)
 
@@ -536,11 +546,16 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         if not matched:
             click.echo(f"Error: no track matching '{track_name}' in playlist.", err=True)
             raise SystemExit(1)
+        analyzed = 0
         for t in matched:
+            if not t.phrases:
+                click.echo(f"  Skipping {t.title} (no phrase data)", err=True)
+                continue
             proposal = proposer(t)
             _print_comparison(proposal, t)
+            analyzed += 1
         if telemetry_list is not None:
-            _print_cost_summary(telemetry_list, resolved_model, len(matched))
+            _print_cost_summary(telemetry_list, resolved_model, analyzed)
         if refinement_log is not None:
             _print_refinement_summary(refinement_log)
     else:
