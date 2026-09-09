@@ -254,7 +254,7 @@ def render_review_html(
   </div>
   <p class="cue-editor-hint">Bar jumps to that bar's exact downbeat. Time is exact, to the tenth of a second. Press Enter to apply.</p>
   <div class="cue-editor-row">
-    <button class="btn btn-preview" id="editor-preview-btn" onclick="previewSelectedCue()">&#9654; Preview</button>
+    <button class="btn btn-preview" id="editor-preview-btn" onclick="toggleSelectedCuePreview()">&#9654; Preview</button>
     <label class="checkbox-label cue-editor-loop-toggle">
       <input type="checkbox" id="editor-loop-toggle"> Loop
     </label>
@@ -993,6 +993,7 @@ function showEditorFor(marker, card) {{
   popover.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
 
   updatePreviewButtonState(card);
+  syncPreviewButtonLabel();
   document.getElementById('editor-loop-toggle').checked = previewSettings.preview_loop_enabled;
   document.getElementById('editor-loop-bars').value = previewSettings.preview_loop_bars;
 }}
@@ -1066,6 +1067,37 @@ function updatePreviewButtonState(card) {{
   }}
 }}
 
+// Reflects whether *this* cue is the thing actually playing right now --
+// not just whether *something* is playing -- so switching the selection
+// to a different cue while one previews doesn't leave a stale "Stop"
+// label on a button that would actually start a new preview if pressed.
+function syncPreviewButtonLabel() {{
+  const btn = document.getElementById('editor-preview-btn');
+  const info = getSelectedCueInfo();
+  if (!info) return;
+  const isPlayingThis = currentPreviewTrackId === info.trackId && !previewAudio.paused;
+  btn.innerHTML = isPlayingThis ? '&#9632; Stop' : '&#9654; Preview';
+}}
+
+// The popover's Preview button is a start/stop toggle, not just a start
+// button -- previously there was no way to stop a preview from inside
+// the popover at all (real feedback: "there is no way to stop it
+// there"). Stopping always fully stops (via stopPreview(), same as
+// natural end-of-track) rather than pausing in place, so pressing
+// Preview again starts fresh from the cue-relative position instead of
+// resuming from an arbitrary paused point -- matching what "Preview"
+// means here (audition this cue), not a generic transport control.
+function toggleSelectedCuePreview() {{
+  const info = getSelectedCueInfo();
+  if (!info) return;
+  if (currentPreviewTrackId === info.trackId && !previewAudio.paused) {{
+    stopPreview();
+  }} else {{
+    previewSelectedCue();
+  }}
+  syncPreviewButtonLabel();
+}}
+
 function stopPreview() {{
   previewAudio.pause();
   currentPreviewTrackId = null;
@@ -1073,6 +1105,7 @@ function stopPreview() {{
   const nowPlaying = document.getElementById('now-playing');
   nowPlaying.classList.add('hidden');
   nowPlaying.textContent = '';
+  syncPreviewButtonLabel();
 }}
 
 function startPreview(trackId, startMs, opts) {{
@@ -1203,6 +1236,12 @@ function startPlayheadLoop(card, durationMs) {{
   function tick() {{
     const pct = Math.max(0, Math.min(100, (previewAudio.currentTime * 1000 / durationMs) * 100));
     card.querySelectorAll('.playhead').forEach(p => {{ p.style.left = pct.toFixed(3) + '%'; }});
+    // Catches pause/resume triggered from elsewhere (spacebar, the
+    // global transport button) that don't go through stopPreview() --
+    // this runs every frame while playing, including the last one
+    // right after an external pause, so the popover's own button label
+    // never drifts from what's actually happening.
+    syncPreviewButtonLabel();
     if (!previewAudio.paused) {{
       playheadRAF = requestAnimationFrame(tick);
     }}
