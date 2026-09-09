@@ -157,8 +157,16 @@ def _extract_cues(track_content: Any) -> list[CuePoint]:
     return cues
 
 
-def _extract_waveform(track_content: Any, max_points: int = 800) -> list[WaveformPoint] | None:
-    """Extract color waveform from PWV5 tag, downsampled for display."""
+def _extract_waveform(track_content: Any, max_points: int = 1200) -> list[WaveformPoint] | None:
+    """Extract color waveform from PWV5 tag, downsampled for display.
+
+    max_points was 800 -- raised modestly (not aggressively) after a
+    real review-UI readability pass: the raw PWV5 source is far denser
+    than 800 points for any real track, so this surfaces more real
+    signal rather than fabricating detail, but a real generated review
+    HTML for a 115-track playlist already runs ~6.9MB at 800 points, so
+    the increase is kept conservative rather than maximized.
+    """
     db = get_db()
     try:
         anlz_files = db.read_anlz_files(track_content)

@@ -220,6 +220,18 @@ class TestRenderReviewHtml:
         assert "<script>alert(1)</script>" not in result
         assert "&lt;script&gt;" in result
 
+    def test_transport_controls_render_inside_sticky_header(self, track: Track, proposal: CueProposal):
+        # "persist at the top as you scroll" -- must actually live inside
+        # .sticky-header (already position:sticky) rather than floating
+        # separately, or scrolling would leave it behind.
+        result = render_review_html("P", [(track, proposal)], "sess.json", "http://127.0.0.1:8080")
+        header_start = result.index('class="sticky-header"')
+        header_end = result.index("</div>\n</div>\n<div class=\"review-body\"")
+        header_html = result[header_start:header_end]
+        assert 'id="transport-play-pause"' in header_html
+        assert 'id="transport-skip-back"' in header_html
+        assert 'id="transport-skip-forward"' in header_html
+
     def test_session_path_is_html_escaped(self, track: Track, proposal: CueProposal):
         result = render_review_html(
             "P", [(track, proposal)], '"><img src=x>', "http://127.0.0.1:8080"
@@ -297,3 +309,103 @@ class TestRenderReviewJs:
     def test_backslash_in_url_is_escaped(self):
         js = _render_review_js("http://127.0.0.1:8080\\evil")
         assert "http://127.0.0.1:8080\\\\evil" in js
+
+
+# ---------------------------------------------------------------------------
+# _resolve_local_audio_path -- the numpy-free duplicate of audio.py's
+# resolve_audio_path(), needed because review.py/cli.py must stay
+# importable with only djcues's core dependencies (djcues.audio imports
+# numpy at module level, confirmed live). Mirrors audio.py's own
+# resolve_audio_path tests exactly (tests/test_audio.py) since it's the
+# same logic, just duplicated to avoid the numpy import.
+# ---------------------------------------------------------------------------
+
+
+def _track_with_audio_path(audio_path: str | None, beat_grid: BeatGrid) -> Track:
+    return Track(
+        id=1, title="Test", artist="Test", bpm=128.0, duration_ms=1000.0,
+        analysis_path="", cues=[], phrases=[], beat_grid=beat_grid,
+        audio_path=audio_path,
+    )
+
+
+class TestResolveLocalAudioPath:
+    def test_none_when_track_has_no_path(self, beat_grid: BeatGrid):
+        from djcues.review import _resolve_local_audio_path
+        assert _resolve_local_audio_path(_track_with_audio_path(None, beat_grid)) is None
+
+    def test_none_when_file_does_not_exist(self, beat_grid: BeatGrid, tmp_path):
+        from djcues.review import _resolve_local_audio_path
+        missing = tmp_path / "does-not-exist.wav"
+        assert _resolve_local_audio_path(_track_with_audio_path(str(missing), beat_grid)) is None
+
+    def test_returns_path_when_file_exists(self, beat_grid: BeatGrid, tmp_path):
+        from djcues.review import _resolve_local_audio_path
+        real_file = tmp_path / "track.wav"
+        real_file.write_bytes(b"not really a wav, just needs to exist")
+        result = _resolve_local_audio_path(_track_with_audio_path(str(real_file), beat_grid))
+        assert result == real_file
+
+    def test_none_when_path_is_a_directory(self, beat_grid: BeatGrid, tmp_path):
+        from djcues.review import _resolve_local_audio_path
+        assert _resolve_local_audio_path(_track_with_audio_path(str(tmp_path), beat_grid)) is None
+
+    def test_none_for_spotify_uri(self, beat_grid: BeatGrid):
+        # Rekordbox stores a spotify:track:... URI in the same FolderPath
+        # field for Spotify-streaming-linked tracks -- confirmed live
+        # against this project's own real library (~51% of all content
+        # rows). Must resolve to "no audio," not crash or return garbage.
+        from djcues.review import _resolve_local_audio_path
+        track = _track_with_audio_path("spotify:track:4uLU6hMCjMI75M1A2tKUQC", beat_grid)
+        assert _resolve_local_audio_path(track) is None
+
+
+# ---------------------------------------------------------------------------
+# render_review_html -- new data attributes (audio availability, format,
+# per-cue confidence) added for the audio-preview feature.
+# ---------------------------------------------------------------------------
+
+
+class TestRenderReviewHtmlAudioData:
+    def test_no_audio_path_yields_has_audio_false(self, track: Track, proposal: CueProposal):
+        result = render_review_html("P", [(track, proposal)], "sess.json", "http://127.0.0.1:8080")
+        assert 'data-has-audio="false"' in result
+        assert 'data-audio-format=""' in result
+
+    def test_real_audio_file_yields_has_audio_true_with_format(
+        self, beat_grid: BeatGrid, phrases: list[Phrase], tmp_path
+    ):
+        audio_file = tmp_path / "song.mp3"
+        audio_file.write_bytes(b"fake mp3 content")
+        track = Track(
+            id=5, title="Has Audio", artist="A", bpm=128.0, duration_ms=1000.0,
+            analysis_path="", cues=[], phrases=phrases, beat_grid=beat_grid,
+            audio_path=str(audio_file),
+        )
+        proposal = CueStrategy().propose(track)
+        result = render_review_html("P", [(track, proposal)], "sess.json", "http://127.0.0.1:8080")
+        assert 'data-has-audio="true"' in result
+        assert 'data-audio-format="mp3"' in result
+
+    def test_missing_audio_file_yields_has_audio_false(
+        self, beat_grid: BeatGrid, phrases: list[Phrase], tmp_path
+    ):
+        track = Track(
+            id=6, title="Missing Audio", artist="A", bpm=128.0, duration_ms=1000.0,
+            analysis_path="", cues=[], phrases=phrases, beat_grid=beat_grid,
+            audio_path=str(tmp_path / "gone.mp3"),
+        )
+        proposal = CueStrategy().propose(track)
+        result = render_review_html("P", [(track, proposal)], "sess.json", "http://127.0.0.1:8080")
+        assert 'data-has-audio="false"' in result
+
+    def test_data_cues_includes_confidence(self, track: Track, proposal: CueProposal):
+        import html as html_mod
+
+        result = render_review_html("P", [(track, proposal)], "sess.json", "http://127.0.0.1:8080")
+        start = result.index("data-cues='") + len("data-cues='")
+        end = result.index("'", start)
+        cues_data = json.loads(html_mod.unescape(result[start:end]))
+        for hc in proposal.hot_cues:
+            pad = KIND_TO_PAD[hc.kind]
+            assert cues_data[pad]["confidence"] == proposal.confidence.get(pad, 0.0)

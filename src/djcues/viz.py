@@ -238,13 +238,15 @@ def _render_timeline_section(
     return f"""
     <div class="timeline-section">
       <h3>{html.escape(title)}</h3>
-      <div class="timeline-container">
-        {cue_markers}
-        <div class="waveform-container">
-          {waveform_html}
-        </div>
-        <div class="phrase-bar">
-          {phrase_bar}
+      <div class="timeline-scroll-wrapper">
+        <div class="timeline-container">
+          {cue_markers}
+          <div class="waveform-container">
+            {waveform_html}
+          </div>
+          <div class="phrase-bar">
+            {phrase_bar}
+          </div>
         </div>
       </div>
     </div>
@@ -285,10 +287,15 @@ _PAGE_CSS = """
 
   /* Timeline */
   .timeline-section { margin-bottom: 32px; }
+  .timeline-scroll-wrapper {
+    overflow-x: auto;
+    overflow-y: hidden;
+    margin: 0 10px;
+  }
   .timeline-container {
     position: relative;
-    height: 200px;
-    margin: 0 10px;
+    height: 240px;
+    min-width: 100%;
   }
 
   /* Waveform */
@@ -296,7 +303,7 @@ _PAGE_CSS = """
     position: absolute;
     top: 40px;
     left: 0; right: 0;
-    height: 80px;
+    height: 120px;
     background: #111122;
     border-radius: 4px 4px 0 0;
     overflow: hidden;
@@ -310,7 +317,7 @@ _PAGE_CSS = """
   /* Phrase bar */
   .phrase-bar {
     position: absolute;
-    top: 120px;
+    top: 160px;
     left: 0; right: 0;
     height: 40px;
     background: #2a2a3e;
@@ -336,12 +343,16 @@ _PAGE_CSS = """
     padding: 0 3px;
   }
 
-  /* Hot cue markers (above waveform) */
+  /* Hot cue markers (above waveform) -- extended the full stack height
+     (not just a 40px label band) so the line actually crosses the
+     waveform/phrase-bar, showing exactly which peak/phrase a cue lands
+     on rather than leaving the DJ to eyeball-align a floating flag
+     against the waveform beneath a gap. */
   .hot-cue-marker {
     position: absolute;
     top: 0;
     width: 0;
-    height: 40px;
+    height: 240px;
     border-left: 2px solid;
     z-index: 10;
   }
@@ -354,12 +365,12 @@ _PAGE_CSS = """
     white-space: nowrap;
   }
 
-  /* Memory cue markers (below phrase bar) */
+  /* Memory cue markers -- same full-height treatment as hot cue markers. */
   .mem-cue-marker {
     position: absolute;
-    top: 160px;
+    top: 0;
     width: 0;
-    height: 40px;
+    height: 240px;
     border-left: 2px dashed;
     z-index: 10;
   }
@@ -381,7 +392,7 @@ _PAGE_CSS = """
     z-index: 5;
   }
   .hot-loop { top: 36px; }
-  .mem-loop { top: 160px; }
+  .mem-loop { top: 200px; }
 
   /* Confidence bars */
   .confidence-section { margin-bottom: 24px; }

@@ -289,6 +289,21 @@ class TestRenderTimelineSection:
         assert "phrase-segment" in result
         assert "hot-cue-marker" in result
 
+    def test_timeline_container_wrapped_in_scroll_wrapper(self, phrases):
+        # Readability pass: .timeline-container's real width now grows
+        # for zoom (JS-driven), so it needs a scrollable ancestor rather
+        # than clipping/overflowing the page -- confirm the structural
+        # nesting is actually there, not just present anywhere in the
+        # string.
+        result = _render_timeline_section(
+            "Proposed Cues", [], [], phrases,
+            total_ms=phrases[-1].position_ms + phrases[-1].duration_ms,
+        )
+        wrapper_idx = result.index('class="timeline-scroll-wrapper"')
+        container_idx = result.index('class="timeline-container"')
+        assert wrapper_idx < container_idx
+        assert result.count("timeline-scroll-wrapper") == 1
+
 
 # ---------------------------------------------------------------------------
 # _render_track_body

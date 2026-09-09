@@ -14,6 +14,70 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+# Hardcoded rather than stdlib `mimetypes` -- that reads the OS registry
+# (inconsistent especially on Windows) -- covers exactly the extensions
+# that appear in real Rekordbox libraries this project has been tested
+# against.
+_AUDIO_CONTENT_TYPES: dict[str, str] = {
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".aiff": "audio/aiff",
+    ".aif": "audio/aiff",
+    ".m4a": "audio/mp4",
+    ".mp4": "audio/mp4",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+}
+
+
+def _parse_range_header(header: str, file_size: int) -> tuple[int, int] | None:
+    """Parse a single-range HTTP Range header (RFC 7233 §2.1 forms:
+    ``bytes=N-M``, ``bytes=N-``, ``bytes=-N``) against a known file size.
+
+    Returns an inclusive ``(start, end)`` byte range, or ``None`` if the
+    header is malformed, uses an unsupported unit, or the range is
+    unsatisfiable for this file size (the caller should respond 416).
+    Multi-range requests (comma-separated) are treated as unsupported --
+    real browsers requesting a single seekable `<audio>` stream only ever
+    send one range at a time.
+    """
+    if not header.startswith("bytes=") or "," in header:
+        return None
+    spec = header[len("bytes="):].strip()
+    if "-" not in spec:
+        return None
+    start_str, _, end_str = spec.partition("-")
+
+    if start_str == "":
+        # Suffix form: "bytes=-N" -- the last N bytes of the file.
+        if end_str == "":
+            return None
+        try:
+            suffix_len = int(end_str)
+        except ValueError:
+            return None
+        if suffix_len <= 0:
+            return None
+        start = max(0, file_size - suffix_len)
+        end = file_size - 1
+    else:
+        try:
+            start = int(start_str)
+        except ValueError:
+            return None
+        if end_str == "":
+            end = file_size - 1
+        else:
+            try:
+                end = int(end_str)
+            except ValueError:
+                return None
+
+    if start < 0 or end < start or start >= file_size:
+        return None
+    end = min(end, file_size - 1)
+    return start, end
+
 
 class ReviewServer(socketserver.ThreadingMixIn, HTTPServer):
     """Threaded HTTPServer with a larger listen backlog.
@@ -37,12 +101,17 @@ class ReviewHandler(BaseHTTPRequestHandler):
     Class-level attributes ``html_path`` and ``session_path`` must be set
     before the handler is used (set by ``start_server`` via dynamic subclass).
     Session file reads/writes are serialized via ``_session_lock`` since the
-    server now handles requests concurrently across threads.
+    server now handles requests concurrently across threads. ``audio_paths``
+    (track ID string -> local file path string) is likewise set by
+    ``start_server``; a missing/empty dict just means no track has a
+    resolvable local audio file, not an error.
     """
 
     html_path: Path
     session_path: Path
+    audio_paths: dict[str, str] = {}
     _session_lock = threading.Lock()
+    _settings_lock = threading.Lock()
 
     # --- helpers --------------------------------------------------------
 
@@ -106,6 +175,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
         elif path == "/session":
             session = self._read_session()
             self._send_json(session)
+        elif path == "/settings":
+            self._handle_settings_get()
+        elif path.startswith("/audio/"):
+            self._handle_audio_get(path[len("/audio/"):])
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -118,6 +191,71 @@ class ReviewHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _handle_settings_get(self) -> None:
+        """Return the current playback-preview settings (persisted
+        cross-session -- see settings.py)."""
+        from djcues.settings import load_playback_settings
+
+        with self._settings_lock:
+            settings = load_playback_settings()
+        self._send_json(settings)
+
+    def _handle_audio_get(self, track_id: str) -> None:
+        """Stream a track's real local audio file, with HTTP Range
+        support so a browser <audio> element can seek without
+        re-downloading from byte 0 every time. Not a nice-to-have --
+        previewing a cue near the end of a long file would otherwise
+        stall on downloading everything before it first."""
+        path_str = self.audio_paths.get(track_id)
+        if not path_str:
+            self._send_json({"error": "no audio available for this track"}, status=404)
+            return
+
+        path = Path(path_str)
+        if not path.is_file():
+            self._send_json({"error": "audio file not found"}, status=404)
+            return
+
+        content_type = _AUDIO_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+        file_size = path.stat().st_size
+        range_header = self.headers.get("Range")
+
+        if range_header:
+            parsed = _parse_range_header(range_header, file_size)
+            if parsed is None:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{file_size}")
+                self.end_headers()
+                return
+            start, end = parsed
+            length = end - start + 1
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
+        else:
+            start, end = 0, file_size - 1
+            length = file_size
+            self.send_response(200)
+
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(length))
+        self.send_header("Accept-Ranges", "bytes")
+        self.end_headers()
+
+        try:
+            with open(path, "rb") as f:
+                f.seek(start)
+                remaining = length
+                while remaining > 0:
+                    chunk = f.read(min(65536, remaining))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    remaining -= len(chunk)
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError):
+            # A scrub to a new position cancels the in-flight request for
+            # the old one -- routine and expected here, not a real error.
+            return
+
     # --- POST -----------------------------------------------------------
 
     def do_POST(self) -> None:  # noqa: N802
@@ -129,8 +267,37 @@ class ReviewHandler(BaseHTTPRequestHandler):
             self._handle_accept_all()
         elif path.startswith("/session/track/"):
             self._route_track_post(path)
+        elif path == "/settings":
+            self._handle_settings_post()
         else:
             self._send_json({"error": "not found"}, status=404)
+
+    def _handle_settings_post(self) -> None:
+        """Update playback-preview settings. Body may contain any subset
+        of the known keys; unknown keys are silently ignored (matching
+        auth.py's config save, which is similarly trusting), but a known
+        key with the wrong type/an out-of-range value is a 400 -- unlike
+        auth.py's config, these values feed directly into playback-timing
+        math client-side, so a bad value here would misbehave silently
+        rather than just being cosmetically wrong."""
+        from djcues.settings import DEFAULT_PLAYBACK_SETTINGS, save_playback_settings
+
+        body = self._read_body()
+        for key, value in body.items():
+            if key not in DEFAULT_PLAYBACK_SETTINGS:
+                continue
+            if key == "preview_loop_enabled":
+                if not isinstance(value, bool):
+                    self._send_json({"error": f"{key} must be a boolean"}, status=400)
+                    return
+            else:
+                if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+                    self._send_json({"error": f"{key} must be a positive number"}, status=400)
+                    return
+
+        with self._settings_lock:
+            merged = save_playback_settings(body)
+        self._send_json(merged)
 
     def _handle_accept_all(self) -> None:
         """Set all pending tracks and their cues to accepted."""
@@ -275,18 +442,27 @@ def start_server(
     session_path: Path,
     port: int = 0,
     timeout_minutes: int = 30,
+    audio_paths: dict[str, str] | None = None,
 ) -> tuple[HTTPServer, int]:
     """Start the review server in a daemon thread.
 
     Returns ``(server, actual_port)`` where *actual_port* is the
-    OS-assigned port when *port* is 0.
+    OS-assigned port when *port* is 0. *audio_paths* (track ID string ->
+    local file path string) enables the /audio/<id> preview endpoint for
+    whichever tracks have a resolvable local file; omit it (or pass an
+    empty dict) to serve a review page with no audio preview available --
+    backward compatible with every existing caller.
     """
     # Dynamically create a handler subclass with paths baked in as class
     # attributes, so each request handler instance can access them via self.
     handler = type(
         "BoundReviewHandler",
         (ReviewHandler,),
-        {"html_path": html_path, "session_path": session_path},
+        {
+            "html_path": html_path,
+            "session_path": session_path,
+            "audio_paths": audio_paths or {},
+        },
     )
 
     server = ReviewServer(("127.0.0.1", port), handler)

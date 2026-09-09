@@ -645,7 +645,7 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
     import pathlib
     import time
     import webbrowser
-    from djcues.review import create_session, render_review_html
+    from djcues.review import _resolve_local_audio_path, create_session, render_review_html
     from djcues.server import start_server
 
     if deep and not refine_drops:
@@ -722,11 +722,23 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
         encoding="utf-8",
     )
 
+    # Resolve each track's real local audio file (if any) for the
+    # /audio/<id> preview endpoint -- silently omits tracks with no
+    # resolvable file (missing/moved, or a Spotify-streaming URI in
+    # place of a real path), same as the review page's own per-track
+    # data-has-audio gating.
+    audio_paths = {}
+    for t, _proposal in pairs:
+        resolved = _resolve_local_audio_path(t)
+        if resolved is not None:
+            audio_paths[str(t.id)] = str(resolved)
+
     # Start local server
     html_path = out_dir / f"{safe_name}-review.html"
     server, port = start_server(
         html_path=html_path,
         session_path=session_path,
+        audio_paths=audio_paths,
     )
     server_url = f"http://127.0.0.1:{port}"
 

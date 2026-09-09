@@ -636,3 +636,254 @@ class TestServerLifecycle:
             assert closed, "server did not close itself after its idle timeout elapsed"
         finally:
             server._shutdown_flag = True  # already closed; just don't leave the flag unset
+
+    def test_audio_paths_param_is_optional_and_backward_compatible(self, tmp_path):
+        html_path = tmp_path / "r.html"
+        html_path.write_text("<html></html>", encoding="utf-8")
+        session_path = tmp_path / "s.json"
+        session_path.write_text("{}", encoding="utf-8")
+        # No audio_paths passed at all -- every caller before this feature
+        # existed still works exactly as before.
+        server, port = start_server(html_path=html_path, session_path=session_path)
+        try:
+            status, body = _get(f"http://127.0.0.1:{port}/audio/1")
+            assert status == 404
+            assert "no audio available" in body["error"]
+        finally:
+            _shutdown(server)
+
+
+# ---------------------------------------------------------------------------
+# _parse_range_header -- pure unit tests, no server needed at all
+# ---------------------------------------------------------------------------
+
+
+class TestParseRangeHeader:
+    def test_open_ended_range(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=10-", 100) == (10, 99)
+
+    def test_bounded_range(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=10-19", 100) == (10, 19)
+
+    def test_suffix_range(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=-10", 100) == (90, 99)
+
+    def test_suffix_range_larger_than_file_clamps_to_start(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=-500", 100) == (0, 99)
+
+    def test_end_beyond_file_size_clamps_to_last_byte(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=50-999", 100) == (50, 99)
+
+    def test_start_beyond_file_size_is_unsatisfiable(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=100-200", 100) is None
+
+    def test_missing_bytes_unit_is_rejected(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("items=0-10", 100) is None
+
+    def test_multi_range_is_rejected(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=0-10,20-30", 100) is None
+
+    def test_no_dash_is_malformed(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=10", 100) is None
+
+    def test_non_numeric_is_malformed(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=abc-def", 100) is None
+
+    def test_empty_suffix_length_is_malformed(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=-", 100) is None
+
+    def test_zero_suffix_length_is_malformed(self):
+        from djcues.server import _parse_range_header
+        assert _parse_range_header("bytes=-0", 100) is None
+
+
+# ---------------------------------------------------------------------------
+# /settings and /audio/<id> -- real servers, real requests, same
+# established pattern as the rest of this file.
+# ---------------------------------------------------------------------------
+
+
+def _get_raw(url: str, headers: dict | None = None) -> tuple[int, dict, bytes]:
+    """Like _get, but returns raw response bytes and headers instead of
+    JSON-parsing the body -- needed for the binary audio endpoint."""
+    req = urllib.request.Request(url, headers=headers or {})
+    try:
+        resp = urllib.request.urlopen(req, timeout=5)
+        return resp.status, dict(resp.headers.items()), resp.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers.items()), e.read()
+
+
+class TestSettingsEndpoint:
+    def test_get_returns_defaults_when_no_file_exists(self, review_server, tmp_path, monkeypatch):
+        from djcues import settings as settings_module
+
+        monkeypatch.setattr(settings_module, "default_settings_path", lambda: tmp_path / "nonexistent" / "playback_settings.json")
+        base_url, _session_path, _pads = review_server
+        status, body = _get(f"{base_url}/settings")
+        assert status == 200
+        assert body == settings_module.DEFAULT_PLAYBACK_SETTINGS
+
+    def test_post_partial_update_merges_and_persists(self, review_server, tmp_path, monkeypatch):
+        from djcues import settings as settings_module
+
+        settings_path = tmp_path / "playback_settings.json"
+        monkeypatch.setattr(settings_module, "default_settings_path", lambda: settings_path)
+        base_url, _session_path, _pads = review_server
+
+        status, body = _post(f"{base_url}/settings", {"preview_pre_roll_bars": 8})
+        assert status == 200
+        assert body["preview_pre_roll_bars"] == 8
+        assert body["preview_loop_bars"] == settings_module.DEFAULT_PLAYBACK_SETTINGS["preview_loop_bars"]
+
+        # A second GET reflects the persisted value, not just the POST response.
+        status, body2 = _get(f"{base_url}/settings")
+        assert status == 200
+        assert body2 == body
+
+    def test_post_negative_number_is_400(self, review_server, tmp_path, monkeypatch):
+        from djcues import settings as settings_module
+
+        monkeypatch.setattr(settings_module, "default_settings_path", lambda: tmp_path / "playback_settings.json")
+        base_url, _session_path, _pads = review_server
+        status, body = _post(f"{base_url}/settings", {"preview_loop_bars": -1})
+        assert status == 400
+        assert "positive number" in body["error"]
+
+    def test_post_wrong_type_for_boolean_is_400(self, review_server, tmp_path, monkeypatch):
+        from djcues import settings as settings_module
+
+        monkeypatch.setattr(settings_module, "default_settings_path", lambda: tmp_path / "playback_settings.json")
+        base_url, _session_path, _pads = review_server
+        status, body = _post(f"{base_url}/settings", {"preview_loop_enabled": "yes"})
+        assert status == 400
+        assert "boolean" in body["error"]
+
+    def test_post_bool_for_numeric_field_is_400(self, review_server, tmp_path, monkeypatch):
+        # bool is a subclass of int in Python -- confirm True/False are
+        # explicitly rejected for a numeric field, not silently accepted as 1/0.
+        from djcues import settings as settings_module
+
+        monkeypatch.setattr(settings_module, "default_settings_path", lambda: tmp_path / "playback_settings.json")
+        base_url, _session_path, _pads = review_server
+        status, body = _post(f"{base_url}/settings", {"preview_pre_roll_bars": True})
+        assert status == 400
+
+    def test_post_unknown_key_is_ignored_not_an_error(self, review_server, tmp_path, monkeypatch):
+        from djcues import settings as settings_module
+
+        monkeypatch.setattr(settings_module, "default_settings_path", lambda: tmp_path / "playback_settings.json")
+        base_url, _session_path, _pads = review_server
+        status, body = _post(f"{base_url}/settings", {"bogus_setting": 123})
+        assert status == 200
+        assert "bogus_setting" not in body
+
+
+class TestAudioEndpoint:
+    def _start_with_audio(self, tmp_path, content: bytes = b"0123456789" * 10, filename: str = "test.mp3"):
+        html_path = tmp_path / "r.html"
+        html_path.write_text("<html></html>", encoding="utf-8")
+        session_path = tmp_path / "s.json"
+        session_path.write_text("{}", encoding="utf-8")
+        audio_file = tmp_path / filename
+        audio_file.write_bytes(content)
+        server, port = start_server(
+            html_path=html_path, session_path=session_path, audio_paths={"1": str(audio_file)}
+        )
+        return server, f"http://127.0.0.1:{port}", audio_file
+
+    def test_whole_file_get(self, tmp_path):
+        server, base_url, audio_file = self._start_with_audio(tmp_path)
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1")
+            assert status == 200
+            assert body == audio_file.read_bytes()
+            assert headers["Content-Type"] == "audio/mpeg"
+            assert headers["Accept-Ranges"] == "bytes"
+            assert headers["Content-Length"] == str(len(body))
+        finally:
+            _shutdown(server)
+
+    def test_range_request_returns_206_with_correct_slice(self, tmp_path):
+        server, base_url, audio_file = self._start_with_audio(tmp_path)
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1", headers={"Range": "bytes=10-19"})
+            assert status == 206
+            assert body == audio_file.read_bytes()[10:20]
+            assert headers["Content-Range"] == f"bytes 10-19/{len(audio_file.read_bytes())}"
+            assert headers["Content-Length"] == "10"
+        finally:
+            _shutdown(server)
+
+    def test_suffix_range_form(self, tmp_path):
+        server, base_url, audio_file = self._start_with_audio(tmp_path)
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1", headers={"Range": "bytes=-5"})
+            assert status == 206
+            assert body == audio_file.read_bytes()[-5:]
+        finally:
+            _shutdown(server)
+
+    def test_out_of_bounds_range_is_416(self, tmp_path):
+        server, base_url, audio_file = self._start_with_audio(tmp_path)
+        try:
+            file_size = len(audio_file.read_bytes())
+            status, headers, body = _get_raw(
+                f"{base_url}/audio/1", headers={"Range": f"bytes={file_size + 10}-{file_size + 20}"}
+            )
+            assert status == 416
+            assert headers["Content-Range"] == f"bytes */{file_size}"
+        finally:
+            _shutdown(server)
+
+    def test_unknown_track_id_is_404(self, tmp_path):
+        server, base_url, _audio_file = self._start_with_audio(tmp_path)
+        try:
+            status, body = _get(f"{base_url}/audio/999")
+            assert status == 404
+        finally:
+            _shutdown(server)
+
+    def test_file_moved_since_server_start_is_404(self, tmp_path):
+        server, base_url, audio_file = self._start_with_audio(tmp_path)
+        try:
+            audio_file.unlink()
+            status, body = _get(f"{base_url}/audio/1")
+            assert status == 404
+            assert "not found" in body["error"]
+        finally:
+            _shutdown(server)
+
+    @pytest.mark.parametrize(
+        "filename,expected_content_type",
+        [
+            ("t.mp3", "audio/mpeg"),
+            ("t.flac", "audio/flac"),
+            ("t.aiff", "audio/aiff"),
+            ("t.aif", "audio/aiff"),
+            ("t.m4a", "audio/mp4"),
+            ("t.mp4", "audio/mp4"),
+            ("t.wav", "audio/wav"),
+            ("t.ogg", "audio/ogg"),
+            ("t.unknownext", "application/octet-stream"),
+        ],
+    )
+    def test_content_type_per_extension(self, tmp_path, filename, expected_content_type):
+        server, base_url, _audio_file = self._start_with_audio(tmp_path, filename=filename)
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1")
+            assert status == 200
+            assert headers["Content-Type"] == expected_content_type
+        finally:
+            _shutdown(server)
