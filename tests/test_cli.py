@@ -77,6 +77,24 @@ def proposal(track: Track) -> CueProposal:
     return CueStrategy().propose(track)
 
 
+@pytest.fixture(autouse=True)
+def no_analysis_cache():
+    """Every existing test in this file predates the analysis cache and
+    isn't testing it -- without this, a CliRunner invocation of propose/
+    compare/review/beatgrid would hit the REAL ~/.djcues/analysis_cache.db
+    (by design, analysis_cache has no test-injectable db_path threaded
+    through cli.py -- it's meant to be one real, single, user-global
+    cache). Neutralizing it here matches test_writer.py's own precedent:
+    get_cached/store_result are mocked at the source, the same way that
+    file mocks djcues.history.log_session_corrections rather than letting
+    apply_session touch real state. Tests that actually exercise caching
+    behavior (TestAnalysisCacheIntegration) override this locally with
+    their own patch()."""
+    with patch("djcues.analysis_cache.get_cached", return_value=None), \
+         patch("djcues.analysis_cache.store_result"):
+        yield
+
+
 def _mock_playlist(playlist_id: int = 1, name: str = "Test Playlist") -> MagicMock:
     pl = MagicMock()
     pl.ID = playlist_id
@@ -564,6 +582,304 @@ class TestBeatgrid:
             result = runner.invoke(cli, ["beatgrid", "Test Playlist", "--all"])
         assert result.exit_code == 0
         assert "2 tracks checked, 2 OK" in result.output
+
+
+# ---------------------------------------------------------------------------
+# analysis cache (propose/compare/review/beatgrid wiring, cache group)
+# ---------------------------------------------------------------------------
+
+
+class TestAnalysisCacheIntegration:
+    """propose/compare/review/beatgrid's own analysis_cache wiring.
+    djcues.analysis_cache.get_cached/store_result are mocked at the
+    source in each test here (matching test_writer.py's precedent for
+    cross-module persistence calls -- that file mocks
+    djcues.history.log_session_corrections rather than re-testing it),
+    overriding the file's own no_analysis_cache autouse fixture locally
+    wherever a specific hit/miss/failure scenario needs asserting on.
+    """
+
+    def test_propose_cache_miss_calls_proposer_and_stores_result(
+        self, runner: CliRunner, track: Track
+    ):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.analysis_cache.get_cached", return_value=None) as mock_get, \
+             patch("djcues.analysis_cache.store_result") as mock_store:
+            result = runner.invoke(cli, ["propose", "Test Playlist", "Test Track"])
+
+        assert result.exit_code == 0
+        mock_get.assert_called_once()
+        mock_store.assert_called_once()
+        _, kwargs = mock_store.call_args
+        assert kwargs["track_title"] == "Test Track"
+        assert "Using cached analysis" not in result.output
+
+    def test_propose_cache_hit_skips_proposer_and_prints_indicator(
+        self, runner: CliRunner, track: Track
+    ):
+        from djcues.analysis_cache import CachedResult
+
+        cached = CachedResult(
+            result={"positions": {"A": 77.0}, "confidence": {"A": 1.0}, "notes": ["cached"]},
+            cost_usd=None, compute_seconds=190.4, source="cli",
+            created_at="2026-09-09T12:00:00", updated_at="2026-09-09T12:00:00",
+        )
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.analysis_cache.get_cached", return_value=cached), \
+             patch("djcues.analysis_cache.store_result") as mock_store, \
+             patch("djcues.strategy.CueStrategy.propose") as mock_propose:
+            result = runner.invoke(cli, ["propose", "Test Playlist", "Test Track"])
+
+        assert result.exit_code == 0
+        mock_propose.assert_not_called()
+        mock_store.assert_not_called()
+        assert "Using cached analysis for Test Track (analyzed 2026-09-09T12:00:00)" in result.output
+        assert "Cache: 1/1 track(s) reused" in result.output
+
+    def test_propose_no_cache_flag_skips_read_but_still_stores(
+        self, runner: CliRunner, track: Track
+    ):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.analysis_cache.get_cached") as mock_get, \
+             patch("djcues.analysis_cache.store_result") as mock_store:
+            result = runner.invoke(cli, ["propose", "Test Playlist", "Test Track", "--no-cache"])
+
+        assert result.exit_code == 0
+        mock_get.assert_not_called()
+        mock_store.assert_called_once()
+
+    def test_compare_all_and_single_track_both_use_cache(
+        self, runner: CliRunner, track: Track
+    ):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.analysis_cache.get_cached", return_value=None) as mock_get, \
+             patch("djcues.analysis_cache.store_result") as mock_store:
+            result_all = runner.invoke(cli, ["compare", "Test Playlist", "--all"])
+        assert result_all.exit_code == 0
+        assert mock_get.call_count == 1
+        assert mock_store.call_count == 1
+
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.analysis_cache.get_cached", return_value=None) as mock_get2, \
+             patch("djcues.analysis_cache.store_result") as mock_store2:
+            result_single = runner.invoke(cli, ["compare", "Test Playlist", "Test Track"])
+        assert result_single.exit_code == 0
+        assert mock_get2.call_count == 1
+        assert mock_store2.call_count == 1
+
+    def test_review_session_uses_cached_proposal_transparently(
+        self, runner: CliRunner, track: Track, tmp_path, monkeypatch
+    ):
+        from djcues.analysis_cache import CachedResult
+
+        monkeypatch.chdir(tmp_path)
+        cached = CachedResult(
+            result={"positions": {"A": 77.0}, "confidence": {"A": 1.0}, "notes": []},
+            cost_usd=None, compute_seconds=1.0, source="cli",
+            created_at="2026-09-09T12:00:00", updated_at="2026-09-09T12:00:00",
+        )
+        fake_server = MagicMock()
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.analysis_cache.get_cached", return_value=cached), \
+             patch("djcues.analysis_cache.store_result") as mock_store, \
+             patch("djcues.strategy.CueStrategy.propose") as mock_propose, \
+             patch("djcues.server.start_server", return_value=(fake_server, 54123)), \
+             patch("webbrowser.open"), \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+            result = runner.invoke(cli, ["review", "Test Playlist", "--all"])
+
+        assert result.exit_code == 0
+        mock_propose.assert_not_called()
+        mock_store.assert_not_called()
+        assert "Using cached analysis" in result.output
+
+    def test_beatgrid_second_invocation_pattern_uses_cache(
+        self, runner: CliRunner, track: Track
+    ):
+        from djcues.analysis_cache import CachedResult
+
+        cached = CachedResult(
+            result={
+                "status": "ok",
+                "self_consistency": {
+                    "is_consistent": True, "tempo_varies": False,
+                    "max_pairwise_gap_error_ms": 0.0, "cumulative_drift_at_end_ms": 0.0,
+                    "entry_count": 10, "notes": [],
+                },
+                "audio": None,
+            },
+            cost_usd=None, compute_seconds=0.1, source="cli",
+            created_at="2026-09-09T12:00:00", updated_at="2026-09-09T12:00:00",
+        )
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.db.get_db", return_value=MagicMock()), \
+             patch("djcues.db.extract_raw_beat_grid", return_value=[]), \
+             patch("djcues.analysis_cache.get_cached", return_value=cached), \
+             patch("djcues.analysis_cache.store_result") as mock_store, \
+             patch("djcues.beat_verify.verify_beat_grid") as mock_verify:
+            result = runner.invoke(cli, ["beatgrid", "Test Playlist", "Test Track"])
+
+        assert result.exit_code == 0
+        mock_verify.assert_not_called()
+        mock_store.assert_not_called()
+        assert "Using cached beat-grid check" in result.output
+        assert "self-consistent" in result.output
+
+    def test_cache_io_failure_degrades_to_recompute_not_crash(
+        self, runner: CliRunner, track: Track
+    ):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.analysis_cache.get_cached", side_effect=RuntimeError("disk full")), \
+             patch("djcues.analysis_cache.store_result", side_effect=RuntimeError("disk full")):
+            result = runner.invoke(cli, ["propose", "Test Playlist", "Test Track"])
+
+        assert result.exit_code == 0
+        assert "Warning: analysis cache unavailable" in result.output
+        # Real proposal output is still printed despite the cache being down.
+        assert "Test Track" in result.output
+
+    def test_beatgrid_cache_io_failure_degrades_to_recompute_not_crash(
+        self, runner: CliRunner, track: Track
+    ):
+        """beatgrid wires the cache inline (no _apply_cache composition,
+        unlike propose/compare/review -- see cli.py) so its own
+        get_cached/store_result failure-degradation branches need their
+        own, separate coverage from test_cache_io_failure_degrades_to_recompute_not_crash."""
+        from djcues.models import BeatGridReport, SelfConsistencyResult
+
+        report = BeatGridReport(
+            track_id=track.id, title=track.title,
+            self_consistency=SelfConsistencyResult(
+                is_consistent=True, tempo_varies=False,
+                max_pairwise_gap_error_ms=0.0, cumulative_drift_at_end_ms=0.0,
+                entry_count=10, notes=[],
+            ),
+            audio=None, status="ok",
+        )
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.db.get_db", return_value=MagicMock()), \
+             patch("djcues.db.extract_raw_beat_grid", return_value=[]), \
+             patch("djcues.beat_verify.verify_beat_grid", return_value=report), \
+             patch("djcues.analysis_cache.get_cached", side_effect=RuntimeError("disk full")), \
+             patch("djcues.analysis_cache.store_result", side_effect=RuntimeError("disk full")):
+            result = runner.invoke(cli, ["beatgrid", "Test Playlist", "Test Track"])
+
+        assert result.exit_code == 0
+        assert "Warning: analysis cache unavailable" in result.output
+        assert "self-consistent" in result.output
+
+    def test_beatgrid_store_failure_alone_still_warns(self, runner: CliRunner, track: Track):
+        """Same as above but with a clean cache read (a real miss, not a
+        failure) followed by a store failure in isolation -- the
+        previous test's simultaneous read+write failure only ever
+        exercises the *first* warn-once branch (the read one), since
+        cache_warned is already True by the time the write is attempted;
+        this is what actually reaches the write branch's own
+        `if not cache_warned` check with it still False."""
+        from djcues.models import BeatGridReport, SelfConsistencyResult
+
+        report = BeatGridReport(
+            track_id=track.id, title=track.title,
+            self_consistency=SelfConsistencyResult(
+                is_consistent=True, tempo_varies=False,
+                max_pairwise_gap_error_ms=0.0, cumulative_drift_at_end_ms=0.0,
+                entry_count=10, notes=[],
+            ),
+            audio=None, status="ok",
+        )
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.db.get_db", return_value=MagicMock()), \
+             patch("djcues.db.extract_raw_beat_grid", return_value=[]), \
+             patch("djcues.beat_verify.verify_beat_grid", return_value=report), \
+             patch("djcues.analysis_cache.get_cached", return_value=None), \
+             patch("djcues.analysis_cache.store_result", side_effect=RuntimeError("disk full")):
+            result = runner.invoke(cli, ["beatgrid", "Test Playlist", "Test Track"])
+
+        assert result.exit_code == 0
+        assert "Warning: analysis cache unavailable" in result.output
+        assert "self-consistent" in result.output
+
+    def test_get_proposer_returns_resolved_provider_heuristic_is_none(self):
+        from djcues.cli import _get_proposer
+
+        proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
+            agentic=False, provider_name=None, model=None, offset=16, loop_bars=4, skip_critic=False,
+        )
+        assert telemetry_list is None
+        assert resolved_model is None
+        assert resolved_provider is None
+
+    def test_get_proposer_agentic_returns_real_resolved_provider(self):
+        from djcues.cli import _get_proposer
+
+        with patch("djcues.auth.load_config", return_value={"provider": "gemini", "model": "gemini-x"}), \
+             patch("djcues.auth.resolve_api_key", return_value=("sk-key", "keyring")), \
+             patch("djcues.providers.get_provider", return_value=MagicMock()):
+            proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
+                agentic=True, provider_name=None, model=None, offset=16, loop_bars=4, skip_critic=False,
+            )
+        assert telemetry_list == []
+        assert resolved_model == "gemini-x"
+        assert resolved_provider == "gemini"
+
+
+class TestCacheCommand:
+    def test_status_empty_cache(self, runner: CliRunner, tmp_path):
+        db_path = tmp_path / "analysis_cache.db"
+        with patch("djcues.analysis_cache.summary", return_value=[]), \
+             patch("djcues.analysis_cache.default_db_path", return_value=db_path):
+            result = runner.invoke(cli, ["cache", "status"])
+        assert result.exit_code == 0
+        assert "No cached analysis yet" in result.output
+
+    def test_status_prints_rows(self, runner: CliRunner, tmp_path):
+        db_path = tmp_path / "analysis_cache.db"
+        rows = [
+            {"analysis_kind": "cue_proposal", "engine": "heuristic", "total": 5,
+             "total_cost_usd": 0.0, "first_seen": "2026-01-01", "last_seen": "2026-01-02"},
+        ]
+        with patch("djcues.analysis_cache.summary", return_value=rows), \
+             patch("djcues.analysis_cache.default_db_path", return_value=db_path):
+            result = runner.invoke(cli, ["cache", "status"])
+        assert result.exit_code == 0
+        assert "cue_proposal" in result.output
+        assert "heuristic" in result.output
+
+    def test_clear_already_empty(self, runner: CliRunner):
+        with patch("djcues.analysis_cache.summary", return_value=[]):
+            result = runner.invoke(cli, ["cache", "clear", "--force"])
+        assert result.exit_code == 0
+        assert "already empty" in result.output
+
+    def test_clear_with_force_skips_confirmation(self, runner: CliRunner):
+        rows = [{"analysis_kind": "cue_proposal", "engine": "heuristic", "total": 3,
+                 "total_cost_usd": 0.0, "first_seen": "x", "last_seen": "y"}]
+        with patch("djcues.analysis_cache.summary", return_value=rows), \
+             patch("djcues.analysis_cache.clear_all", return_value=3) as mock_clear:
+            result = runner.invoke(cli, ["cache", "clear", "--force"])
+        assert result.exit_code == 0
+        mock_clear.assert_called_once()
+        assert "Deleted 3 cached result(s)" in result.output
+
+    def test_clear_without_force_prompts_and_aborts_on_no(self, runner: CliRunner):
+        rows = [{"analysis_kind": "cue_proposal", "engine": "heuristic", "total": 3,
+                 "total_cost_usd": 0.0, "first_seen": "x", "last_seen": "y"}]
+        with patch("djcues.analysis_cache.summary", return_value=rows), \
+             patch("djcues.analysis_cache.clear_all") as mock_clear:
+            result = runner.invoke(cli, ["cache", "clear"], input="n\n")
+        assert result.exit_code == 0
+        assert "Aborted" in result.output
+        mock_clear.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

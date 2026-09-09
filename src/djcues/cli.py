@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import sys
+import time
 import warnings
 import click
 
@@ -13,10 +14,12 @@ for _name in ("pyrekordbox", "pyrekordbox.db6", "pyrekordbox.anlz"):
     logging.getLogger(_name).setLevel(logging.CRITICAL)
 warnings.filterwarnings("ignore", module="pyrekordbox")
 
+from djcues import analysis_cache
 from djcues.constants import CUE_SYSTEM_BY_PAD, KIND_TO_PAD
 from djcues.db import find_playlist, load_playlist_tracks
 from djcues.metrics import compare_cues, merge_pad_stats, overall_stats
-from djcues.strategy import CueStrategy
+from djcues.models import CueProposal
+from djcues.strategy import CueStrategy, build_cue_points
 
 
 def _format_time(ms: float) -> str:
@@ -163,14 +166,20 @@ def _resolve_agentic_provider(provider_name, model):
 
 
 def _get_proposer(agentic, provider_name, model, offset, loop_bars, skip_critic):
-    """Returns (proposer, telemetry_list, resolved_model). `proposer(track)`
-    returns a CueProposal, either from the local heuristic or agentic
-    analysis. telemetry_list/resolved_model are None for the heuristic
-    path; telemetry_list accumulates one AgenticTelemetry per call for
-    the agentic path's cost summary."""
+    """Returns (proposer, telemetry_list, resolved_model, resolved_provider).
+    `proposer(track)` returns a CueProposal, either from the local
+    heuristic or agentic analysis. telemetry_list/resolved_model/
+    resolved_provider are None for the heuristic path; telemetry_list
+    accumulates one AgenticTelemetry per call for the agentic path's
+    cost summary. resolved_provider/resolved_model are the *actual*
+    provider/model used (post config/env-var resolution, never the
+    raw, often-None --provider/--model args) -- callers building an
+    analysis_cache key need these, not the unresolved args, so that
+    two runs both omitting --provider don't wrongly collide or miss
+    if the saved default ever changes."""
     if not agentic:
         strategy = CueStrategy(memory_offset_bars=offset, loop_length_bars=loop_bars)
-        return strategy.propose, None, None
+        return strategy.propose, None, None, None
 
     from djcues.providers import get_provider
     from djcues.agentic import propose_with_telemetry
@@ -207,7 +216,7 @@ def _get_proposer(agentic, provider_name, model, offset, loop_bars, skip_critic)
         telemetry_list.append(telemetry)
         return proposal
 
-    return proposer, telemetry_list, resolved_model
+    return proposer, telemetry_list, resolved_model, provider_name
 
 
 def _check_refine_drops_available(deep: bool) -> None:
@@ -262,6 +271,169 @@ def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars):
         return refined
 
     return wrapped, refinement_log
+
+
+def _shape_proposal_for_cache(proposal, refinements=None):
+    """Reduce a CueProposal to the plain-dict payload analysis_cache
+    stores: positions (pad letter -> ms, derived from hot_cues via
+    KIND_TO_PAD) + confidence + notes is exactly what
+    strategy.build_cue_points() needs to reconstruct an equivalent
+    proposal later -- no need to store full CuePoint objects.
+    refinements (informational only, not used for rehydration -- see
+    _apply_cache) records what --refine-drops actually found, so a
+    future `cache status`-style inspection isn't blind to it."""
+    positions = {KIND_TO_PAD.get(c.kind, str(c.kind)): c.position_ms for c in proposal.hot_cues}
+    result = {"positions": positions, "confidence": proposal.confidence, "notes": proposal.notes}
+    if refinements:
+        result["refinements"] = [
+            {
+                "pad": r.pad, "outcome": r.outcome, "original_ms": r.original_ms,
+                "refined_ms": r.refined_ms, "offset_ms": r.offset_ms,
+                "source": r.source, "sustain_signature": r.sustain_signature,
+            }
+            for r in refinements
+        ]
+    return result
+
+
+def _rehydrate_proposal(result, track, offset, loop_bars):
+    """Inverse of _shape_proposal_for_cache -- rebuilds a real
+    CueProposal via strategy.build_cue_points(), the same helper
+    drop_enhance.py already relies on for identical reasons, so
+    memory-cue offset/loop math stays consistent instead of being
+    hand-rolled a second time."""
+    hot_cues, memory_cues = build_cue_points(
+        result["positions"], result["confidence"], track, offset, loop_bars
+    )
+    return CueProposal(
+        track=track, hot_cues=hot_cues, memory_cues=memory_cues,
+        confidence=result["confidence"], notes=result["notes"],
+    )
+
+
+def _apply_cache(proposer, cache_key, offset, loop_bars, no_cache,
+                  refinement_log=None, telemetry_list=None, resolved_model=None):
+    """Wraps proposer(track) -> CueProposal so a cache hit (matching
+    track_id + cache_key, with an unchanged input fingerprint) short-
+    circuits the real call and rehydrates an equivalent CueProposal
+    instead. Composes AFTER _apply_refine_drops in the chain, so a
+    cached payload always reflects the final (refined, if requested)
+    proposal.
+
+    A cache hit is deliberately NOT added to refinement_log/
+    telemetry_list -- those report what THIS run actually computed and
+    spent, and a hit did neither; see _print_cache_summary for the
+    hit/miss accounting instead. refinement_log/telemetry_list are
+    still read (never mutated) here, purely to shape what gets stored
+    on a miss -- a track's own refinements/telemetry are always the
+    most-recently-appended entry once proposer(track) returns, since
+    _apply_cache composes after both.
+
+    Never lets a cache I/O failure abort the run -- propose/compare/
+    review are read-only and the cache is a pure optimization here,
+    not their actual purpose (deliberately different from writer.py's
+    apply_session, which lets a history-logging failure propagate
+    because that logging *is* apply's purpose). Degrades to a real
+    recompute and warns once per run, not once per track.
+
+    Returns (wrapped, cache_stats) with cache_stats={"hits":0,"misses":0}.
+    """
+    cache_stats = {"hits": 0, "misses": 0}
+    warned = False
+
+    def _warn_once(exc):
+        nonlocal warned
+        if not warned:
+            click.echo(f"Warning: analysis cache unavailable ({exc}) -- continuing without it.", err=True)
+            warned = True
+
+    def wrapped(track):
+        fp = analysis_cache.fingerprint_track_analysis(track)
+
+        if not no_cache:
+            cached = None
+            try:
+                cached = analysis_cache.get_cached(track.id, cache_key, fp)
+            except Exception as e:
+                _warn_once(e)
+            if cached is not None:
+                cache_stats["hits"] += 1
+                click.echo(f"  Using cached analysis for {track.title} (analyzed {cached.updated_at})")
+                return _rehydrate_proposal(cached.result, track, offset, loop_bars)
+
+        cache_stats["misses"] += 1
+        started = time.monotonic()
+        proposal = proposer(track)
+        elapsed = time.monotonic() - started
+
+        refinements = refinement_log[-1][1] if refinement_log else None
+        cost = None
+        if telemetry_list:
+            last = telemetry_list[-1]
+            if last.input_tokens or last.output_tokens:
+                from djcues.providers import estimate_cost
+                cost = estimate_cost(resolved_model, last.input_tokens, last.output_tokens)
+
+        try:
+            analysis_cache.store_result(
+                track.id, cache_key, fp, _shape_proposal_for_cache(proposal, refinements),
+                track_title=track.title, track_artist=track.artist,
+                cost_usd=cost, compute_seconds=elapsed,
+            )
+        except Exception as e:
+            _warn_once(e)
+        return proposal
+
+    return wrapped, cache_stats
+
+
+def _print_cache_summary(cache_stats):
+    total = cache_stats["hits"] + cache_stats["misses"]
+    if total == 0 or cache_stats["hits"] == 0:
+        return
+    click.echo(
+        f"\nCache: {cache_stats['hits']}/{total} track(s) reused from a previous "
+        f"analysis (use --no-cache to force a fresh recompute)."
+    )
+
+
+def _shape_beatgrid_for_cache(report):
+    sc = report.self_consistency
+    payload = {
+        "status": report.status,
+        "self_consistency": {
+            "is_consistent": sc.is_consistent,
+            "tempo_varies": sc.tempo_varies,
+            "max_pairwise_gap_error_ms": sc.max_pairwise_gap_error_ms,
+            "cumulative_drift_at_end_ms": sc.cumulative_drift_at_end_ms,
+            "entry_count": sc.entry_count,
+            "notes": sc.notes,
+        },
+        "audio": None,
+    }
+    if report.audio is not None:
+        a = report.audio
+        payload["audio"] = {
+            "matched_beats": a.matched_beats,
+            "mean_abs_drift_ms": a.mean_abs_drift_ms,
+            "max_abs_drift_ms": a.max_abs_drift_ms,
+            "pct_within_tolerance": a.pct_within_tolerance,
+            "tracker_name": a.tracker_name,
+            "verdict": a.verdict,
+            "octave_error": a.octave_error,
+        }
+    return payload
+
+
+def _rehydrate_beatgrid(result, track):
+    from djcues.models import AudioBeatVerification, BeatGridReport, SelfConsistencyResult
+
+    sc = SelfConsistencyResult(**result["self_consistency"])
+    audio = AudioBeatVerification(**result["audio"]) if result["audio"] is not None else None
+    return BeatGridReport(
+        track_id=track.id, title=track.title, self_consistency=sc, audio=audio,
+        status=result["status"],
+    )
 
 
 _SUSTAIN_SIGNATURE_HINTS = {
@@ -412,7 +584,8 @@ def cli():
 @click.option("--estimate-only", is_flag=True, help="Print an estimated --agentic cost and exit without calling the model.")
 @click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
 @click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
-def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, estimate_only, refine_drops, deep):
+@click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
+def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, estimate_only, refine_drops, deep, no_cache):
     """Propose cue placements for tracks in a playlist."""
     if estimate_only and not agentic:
         click.echo("Error: --estimate-only only applies with --agentic.", err=True)
@@ -448,10 +621,19 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         _print_agentic_estimate(selected, provider, model, skip_critic, offset, loop_bars)
         return
 
-    proposer, telemetry_list, resolved_model = _get_proposer(
+    proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
     proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
+    cache_key = analysis_cache.cue_proposal_key(
+        agentic=agentic, provider=resolved_provider, model=resolved_model,
+        skip_critic=skip_critic, refine_drops=refine_drops, deep=deep,
+        offset_bars=offset, loop_bars=loop_bars,
+    )
+    proposer, cache_stats = _apply_cache(
+        proposer, cache_key, offset, loop_bars, no_cache,
+        refinement_log=refinement_log, telemetry_list=telemetry_list, resolved_model=resolved_model,
+    )
 
     analyzed = 0
     for t in selected:
@@ -466,6 +648,7 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         _print_cost_summary(telemetry_list, resolved_model, analyzed)
     if refinement_log is not None:
         _print_refinement_summary(refinement_log)
+    _print_cache_summary(cache_stats)
 
 
 @cli.command()
@@ -480,7 +663,8 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
 @click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
 @click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
 @click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
-def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, refine_drops, deep):
+@click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
+def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, refine_drops, deep, no_cache):
     """Compare existing cues with proposed placements."""
     if deep and not refine_drops:
         click.echo("Error: --deep only applies with --refine-drops.", err=True)
@@ -498,10 +682,19 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
         raise SystemExit(1)
 
-    proposer, telemetry_list, resolved_model = _get_proposer(
+    proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
     proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
+    cache_key = analysis_cache.cue_proposal_key(
+        agentic=agentic, provider=resolved_provider, model=resolved_model,
+        skip_critic=skip_critic, refine_drops=refine_drops, deep=deep,
+        offset_bars=offset, loop_bars=loop_bars,
+    )
+    proposer, cache_stats = _apply_cache(
+        proposer, cache_key, offset, loop_bars, no_cache,
+        refinement_log=refinement_log, telemetry_list=telemetry_list, resolved_model=resolved_model,
+    )
 
     if all_tracks:
         per_track_stats = []
@@ -541,6 +734,7 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
                     f"{s.precision:<11.0%} {s.recall:<8.0%}"
                 )
             click.echo(f"{'=' * 60}")
+        _print_cache_summary(cache_stats)
     elif track_name:
         matched = [t for t in tracks if track_name.lower() in t.title.lower()]
         if not matched:
@@ -558,6 +752,7 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
             _print_cost_summary(telemetry_list, resolved_model, analyzed)
         if refinement_log is not None:
             _print_refinement_summary(refinement_log)
+        _print_cache_summary(cache_stats)
     else:
         click.echo("Error: provide a track name or use --all.", err=True)
         raise SystemExit(1)
@@ -640,7 +835,8 @@ def viz(playlist, track_name, all_tracks, compare_mode, offset, loop_bars, outpu
 @click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
 @click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
 @click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
-def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic, provider, model, skip_critic, refine_drops, deep):
+@click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
+def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic, provider, model, skip_critic, refine_drops, deep, no_cache):
     """Launch interactive review session in browser."""
     import pathlib
     import time
@@ -664,10 +860,19 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
         click.echo(f"No tracks found in playlist '{playlist}'.", err=True)
         raise SystemExit(1)
 
-    proposer, telemetry_list, resolved_model = _get_proposer(
+    proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
     proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
+    cache_key = analysis_cache.cue_proposal_key(
+        agentic=agentic, provider=resolved_provider, model=resolved_model,
+        skip_critic=skip_critic, refine_drops=refine_drops, deep=deep,
+        offset_bars=offset, loop_bars=loop_bars,
+    )
+    proposer, cache_stats = _apply_cache(
+        proposer, cache_key, offset, loop_bars, no_cache,
+        refinement_log=refinement_log, telemetry_list=telemetry_list, resolved_model=resolved_model,
+    )
 
     if all_tracks:
         selected = tracks
@@ -691,6 +896,7 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
         _print_cost_summary(telemetry_list, resolved_model, len(pairs))
     if refinement_log is not None:
         _print_refinement_summary(refinement_log)
+    _print_cache_summary(cache_stats)
 
     if not pairs:
         click.echo("No tracks with phrase data to review.", err=True)
@@ -805,6 +1011,54 @@ def history():
         )
 
 
+@cli.group()
+def cache():
+    """Inspect or clear the persistent analysis-completion cache.
+
+    propose/compare/review/beatgrid all consult this automatically
+    (use --no-cache on any of them to force a fresh recompute) -- this
+    group is for inspecting or resetting it directly.
+    """
+
+
+@cache.command("status")
+def cache_status():
+    """Show cached analysis-run counts and spend, per kind/engine."""
+    rows = analysis_cache.summary()
+    db_path = analysis_cache.default_db_path()
+    if not rows:
+        click.echo(f"No cached analysis yet at {db_path}.")
+        click.echo("This fills in as you run propose/compare/review/beatgrid normally — nothing to show yet.")
+        return
+
+    click.echo(f"Analysis cache: {db_path}\n")
+    click.echo(f"  {'Kind':<14s} {'Engine':<10s} {'Total':<7s} {'Cost':<10s} {'First seen':<20s} {'Last seen':<20s}")
+    click.echo(f"  {'-' * 14} {'-' * 10} {'-' * 7} {'-' * 10} {'-' * 20} {'-' * 20}")
+    for row in rows:
+        click.echo(
+            f"  {row['analysis_kind']:<14s} {row['engine']:<10s} {row['total']:<7d} "
+            f"${row['total_cost_usd']:<9.4f} {row['first_seen']:<20s} {row['last_seen']:<20s}"
+        )
+
+
+@cache.command("clear")
+@click.option("--force", is_flag=True, help="Skip confirmation.")
+def cache_clear(force):
+    """Delete every cached analysis result."""
+    rows = analysis_cache.summary()
+    total = sum(r["total"] for r in rows)
+    if total == 0:
+        click.echo("Cache is already empty.")
+        return
+    if not force and not click.confirm(
+        f"Delete all {total} cached analysis result(s) at {analysis_cache.default_db_path()}?"
+    ):
+        click.echo("Aborted.")
+        return
+    removed = analysis_cache.clear_all()
+    click.echo(f"Deleted {removed} cached result(s).")
+
+
 _BEATGRID_STATUS_LABELS = {
     "flagged": "flagged by audio check",
     "no_grid_data": "no grid data",
@@ -885,7 +1139,8 @@ def _print_beatgrid_summary(reports) -> None:
 @click.option("--all", "all_tracks", is_flag=True, help="Check all tracks in the playlist.")
 @click.option("--deep", is_flag=True, help="Force real audio-based verification even when the free check already looks fine.")
 @click.option("--tolerance-ms", default=30.0, show_default=True, help="Audio-based drift tolerance in ms.")
-def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms):
+@click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
+def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms, no_cache):
     """Verify Rekordbox's stored beat grid is still trustworthy.
 
     Always runs a free, audio-independent self-consistency check first
@@ -919,17 +1174,51 @@ def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms):
         click.echo("Error: provide a track name or use --all.", err=True)
         raise SystemExit(1)
 
+    cache_key = analysis_cache.beatgrid_key(deep=deep, tolerance_ms=tolerance_ms)
+    cache_stats = {"hits": 0, "misses": 0}
+    cache_warned = False
+
     db = get_db()
     reports = []
     for t in selected:
         content = db.get_content(ID=t.id)
         entries = extract_raw_beat_grid(content)
-        report = verify_beat_grid(t, entries, force_deep=deep, audio_tolerance_ms=tolerance_ms)
+        fp = analysis_cache.fingerprint_beat_grid(entries)
+
+        report = None
+        if not no_cache:
+            cached = None
+            try:
+                cached = analysis_cache.get_cached(t.id, cache_key, fp)
+            except Exception as e:
+                if not cache_warned:
+                    click.echo(f"Warning: analysis cache unavailable ({e}) -- continuing without it.", err=True)
+                    cache_warned = True
+            if cached is not None:
+                cache_stats["hits"] += 1
+                click.echo(f"  Using cached beat-grid check for {t.title} (checked {cached.updated_at})")
+                report = _rehydrate_beatgrid(cached.result, t)
+
+        if report is None:
+            cache_stats["misses"] += 1
+            report = verify_beat_grid(t, entries, force_deep=deep, audio_tolerance_ms=tolerance_ms)
+            if not no_cache:
+                try:
+                    analysis_cache.store_result(
+                        t.id, cache_key, fp, _shape_beatgrid_for_cache(report),
+                        track_title=t.title, track_artist=t.artist,
+                    )
+                except Exception as e:
+                    if not cache_warned:
+                        click.echo(f"Warning: analysis cache unavailable ({e}) -- continuing without it.", err=True)
+                        cache_warned = True
+
         reports.append(report)
         _print_beatgrid_report(report)
 
     if len(selected) > 1:
         _print_beatgrid_summary(reports)
+    _print_cache_summary(cache_stats)
 
 
 @cli.group()

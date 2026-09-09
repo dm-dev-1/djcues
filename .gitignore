@@ -21,3 +21,6 @@ htmlcov/
 *-cues.html
 *-review.html
 *-session.json
+
+# Full-library batch-processing tracker/output (generated, not source)
+library_processing/

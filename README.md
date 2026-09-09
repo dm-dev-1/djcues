@@ -135,6 +135,21 @@ djcues history
 
 Read-only. `djcues apply` automatically logs every accepted/adjusted/skipped hot cue to a local SQLite database at `~/.djcues/history.db` (independent of rekordbox's own database) as it writes; `history` just prints the per-pad totals and correction counts accumulated there so far. Nothing to configure — it fills in as you use `apply` normally.
 
+### Analysis cache
+
+```bash
+# See what's cached
+djcues cache status
+
+# Force a fresh recompute for one run (still refreshes the cache)
+djcues propose "Playlist Name" "Track Name" --refine-drops --deep --no-cache
+
+# Wipe the cache entirely
+djcues cache clear
+```
+
+`propose`, `compare`, `review`, and `beatgrid` all cache their results locally at `~/.djcues/analysis_cache.db`, keyed on the track plus every option that can change the result (`--agentic`/provider/model, `--refine-drops`, `--deep`, `--offset`, `--loop-bars`, etc.) — so re-running the same analysis on a track you've already checked reuses the cached result instead of re-paying `--deep`'s multi-minute Demucs pass or `--agentic`'s real API cost. A cached result is only ever served while rekordbox's own phrase/vocal/waveform/beat-grid data for that track hasn't changed since — re-analyze the track in rekordbox and the next run computes fresh automatically. Pass `--no-cache` on any of the four commands to force a fresh run without disabling the cache going forward.
+
 ### Audio-ML analysis (optional, local-only)
 
 Two opt-in features analyze the real audio file instead of only rekordbox's pre-computed analysis. Both run entirely locally — no audio ever leaves your machine.
@@ -180,6 +195,7 @@ Install with `pip install djcues[audio]` for `--refine-drops` (needs `librosa`/`
 - **Rekordbox must be closed**: The apply command will not write while rekordbox is running
 - **Read-only by default**: `propose`, `compare`, `viz`, `review`, and `beatgrid` never modify the database
 - **DB-only writes**: Cues are written to `master.db` only (not ANLZ files). rekordbox handles ANLZ sync on USB export.
+- **Analysis cache**: `propose`/`compare`/`review`/`beatgrid` cache results locally at `~/.djcues/analysis_cache.db` to avoid redundant recomputation — never touches the rekordbox database; use `--no-cache` to force a fresh run.
 
 ## Configuration
 
@@ -205,6 +221,7 @@ src/djcues/
     beat_verify.py  # Beat-grid self-consistency + real audio verification
     drop_enhance.py # Drop/Breakdown/Special cue refinement against real audio (--refine-drops)
     history.py      # Correction-history logging
+    analysis_cache.py # Persistent cache of completed analysis runs (propose/compare/review/beatgrid)
     metrics.py      # Precision/recall/F1 for compare
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
