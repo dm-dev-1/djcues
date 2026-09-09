@@ -1212,7 +1212,13 @@ class TestDashboardHandlerLaunch:
         mock_popen.assert_called_once()
         argv = mock_popen.call_args.args[0]
         assert argv[0] == sys.executable
-        assert argv[1:4] == ["-m", "djcues.cli", "viz"]
+        assert argv[1] == "-c"
+        # Deliberately NOT "-m djcues.cli": cli.py has no
+        # `if __name__ == "__main__"` guard, so -m silently does nothing
+        # (confirmed live -- a real, shipped bug this test now guards
+        # against regressing back to).
+        assert "cli(sys.argv[1:])" in argv[2]
+        assert argv[3] == "viz"
         assert argv[4] == "Tech House"
         assert argv[5] == data["track_title"]
         mock_popen.return_value.wait.assert_not_called()

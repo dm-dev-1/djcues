@@ -1109,12 +1109,22 @@ class DashboardHandler(_LocalJsonHandler):
             self._send_json({"error": "playlist or track not found"}, status=404)
             return
 
-        # sys.executable -m djcues.cli, never `uv run`/a bare `djcues` PATH
-        # lookup -- this repo's own documented environment gotchas record
-        # `uv run` corrupting this exact venv's editable install before;
-        # sys.executable is the exact interpreter already running this
-        # server, sidestepping that entirely.
-        argv = [sys.executable, "-m", "djcues.cli", tool, playlist_name, track_title]
+        # sys.executable -c "...cli(sys.argv[1:])", never `uv run`/a bare
+        # `djcues` PATH lookup -- this repo's own documented environment
+        # gotchas record `uv run` corrupting this exact venv's editable
+        # install before; sys.executable is the exact interpreter already
+        # running this server, sidestepping that entirely. Also
+        # deliberately NOT `-m djcues.cli`: cli.py has no
+        # `if __name__ == "__main__": cli()` guard, so `-m` silently
+        # imports the module and exits 0 without ever invoking anything
+        # (confirmed live -- this was a real, shipped bug, not a
+        # hypothetical). `cli(sys.argv[1:])` is the exact programmatic-
+        # invocation pattern already verified working repeatedly this
+        # session for real CLI calls.
+        argv = [
+            sys.executable, "-c", "import sys; from djcues.cli import cli; cli(sys.argv[1:])",
+            tool, playlist_name, track_title,
+        ]
         if tool == "review":
             # Deliberately separate, default-off flags -- never inherited
             # from whatever the propose/compare panel currently has
