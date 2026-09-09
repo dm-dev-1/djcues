@@ -242,6 +242,7 @@ def render_review_html(
 {cards_html}
 </div>
 <div id="cue-editor-popover" class="cue-editor-popover hidden">
+  <div class="cue-editor-handle" id="cue-editor-handle">Edit Cue</div>
   <div class="cue-editor-row">
     <label>Bar
       <input type="number" id="editor-bar" min="1" step="1" inputmode="numeric">
@@ -256,6 +257,9 @@ def render_review_html(
     <button class="btn btn-preview" id="editor-preview-btn" onclick="previewSelectedCue()">&#9654; Preview</button>
     <label class="checkbox-label cue-editor-loop-toggle">
       <input type="checkbox" id="editor-loop-toggle"> Loop
+    </label>
+    <label class="cue-editor-loop-bars">
+      <input type="number" id="editor-loop-bars" min="1" step="1"> bars
     </label>
   </div>
 </div>
@@ -390,9 +394,45 @@ _REVIEW_CSS = """
   /* Review body (push below sticky header) */
   .review-body { padding-top: 8px; }
 
+  /* Proposed hot-cue markers are selectable/editable (existing ones are
+     read-only), so they get a much wider invisible click target than
+     their 2px visual line -- a real click reliably misses a 2px-wide
+     target and falls through to the timeline's click-to-scrub handler
+     instead of selecting the cue (reported live: "lost the ability to
+     select the cue"). The visual line is redrawn via ::before, centered
+     in the wider box; .existing markers are deliberately excluded so
+     the Existing Cues timeline (still fully click-to-scrub-able) doesn't
+     gain a larger dead zone for no benefit. */
+  .hot-cue-marker.proposed {
+    width: 14px;
+    margin-left: -7px;
+    border-left: none;
+    cursor: pointer;
+  }
+  .hot-cue-marker.proposed::before {
+    content: "";
+    position: absolute;
+    left: 6px;
+    top: 0;
+    height: 100%;
+    border-left: 2px solid currentColor;
+  }
+  /* The letter itself is a small clickable chip, not just floating text --
+     a clear "click here" affordance in addition to the wider invisible
+     hit-box above, and a bigger target in its own right. */
+  .hot-cue-marker.proposed .marker-label {
+    padding: 1px 5px;
+    border: 1.5px solid currentColor;
+    border-radius: 3px;
+    background: #111122;
+  }
+
   /* Selected cue marker */
+  .hot-cue-marker.selected::before {
+    border-left-width: 5px;
+    left: 4.5px;
+  }
   .hot-cue-marker.selected {
-    border-left-width: 5px !important;
     filter: brightness(1.4) drop-shadow(0 0 6px currentColor);
     z-index: 15;
   }
@@ -423,6 +463,8 @@ _REVIEW_CSS = """
      to cross-reference the separate confidence-bars section below. */
   .hot-cue-marker.low-confidence {
     opacity: 0.55;
+  }
+  .hot-cue-marker.low-confidence::before {
     border-left-style: dotted;
   }
 
@@ -510,6 +552,16 @@ _REVIEW_CSS = """
     display: flex;
     flex-direction: column;
     gap: 8px;
+  }
+  .cue-editor-handle {
+    cursor: move;
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: #888;
+    padding-bottom: 6px;
+    margin-bottom: 2px;
+    border-bottom: 1px solid #2a2a3e;
+    user-select: none;
   }
   .cue-editor-row {
     display: flex;
@@ -924,12 +976,25 @@ function showEditorFor(marker, card) {{
   popover.classList.remove('hidden');
   syncEditorFields(info.cueInfo, card);
 
+  // Anchor below the marker's full height (which spans the zoom controls
+  // down through the waveform and phrase bar), not beside its top -- the
+  // popover used to open right on top of the waveform/zoom-controls row,
+  // so it had to be dragged aside before you could see either one.
   const markerRect = marker.getBoundingClientRect();
   popover.style.left = (markerRect.left + window.scrollX + 8) + 'px';
-  popover.style.top = (markerRect.top + window.scrollY - 10) + 'px';
+  popover.style.top = (markerRect.bottom + window.scrollY + 8) + 'px';
+
+  // Positioning it below a marker that's near the bottom of the viewport
+  // can push the popover's own bottom -- where Preview/Loop live -- past
+  // the visible area, so those controls appear to just not respond
+  // (they're actually rendering off-screen). "nearest" only scrolls if
+  // something is actually cut off, so a fully-visible popover doesn't
+  // cause a jump.
+  popover.scrollIntoView({{ block: 'nearest', inline: 'nearest' }});
 
   updatePreviewButtonState(card);
   document.getElementById('editor-loop-toggle').checked = previewSettings.preview_loop_enabled;
+  document.getElementById('editor-loop-bars').value = previewSettings.preview_loop_bars;
 }}
 
 function hideEditor() {{
@@ -1018,7 +1083,8 @@ function startPreview(trackId, startMs, opts) {{
 
   const durationMs = parseFloat(card.getAttribute('data-duration-ms'));
   const bpm = parseFloat(card.getAttribute('data-bpm'));
-  const loopMs = (60000 / bpm) * 4 * previewSettings.preview_loop_bars;
+  const loopBars = opts.loopBars !== undefined ? opts.loopBars : previewSettings.preview_loop_bars;
+  const loopMs = (60000 / bpm) * 4 * loopBars;
   const loopStartMs = startMs;
   const loopEndMs = Math.min(durationMs, startMs + loopMs);
 
@@ -1059,10 +1125,25 @@ function togglePlayPauseOrStartSelected() {{
 function previewSelectedCue() {{
   const info = getSelectedCueInfo();
   if (!info) return;
-  const preRollMs = info.msPerBar * previewSettings.preview_pre_roll_bars;
-  const startMs = Math.max(0, info.cueInfo.position_ms - preRollMs);
   const loop = document.getElementById('editor-loop-toggle').checked;
-  startPreview(info.trackId, startMs, {{ loop: loop }});
+  const loopBarsInput = parseInt(document.getElementById('editor-loop-bars').value, 10);
+  const loopBars = (Number.isFinite(loopBarsInput) && loopBarsInput >= 1)
+    ? loopBarsInput : previewSettings.preview_loop_bars;
+
+  let startMs;
+  if (loop) {{
+    // Center the loop *on* the cue point rather than tying it to the
+    // separate pre-roll setting -- for a 2-bar loop that's 1 bar before
+    // the cue to 1 bar after it, so every pass actually crosses the
+    // exact point being verified instead of stopping short of it (or,
+    // if pre-roll happened to be shorter than the loop, overshooting
+    // past it with no way to hear the moment itself repeat).
+    startMs = Math.max(0, info.cueInfo.position_ms - (info.msPerBar * loopBars) / 2);
+  }} else {{
+    const preRollMs = info.msPerBar * previewSettings.preview_pre_roll_bars;
+    startMs = Math.max(0, info.cueInfo.position_ms - preRollMs);
+  }}
+  startPreview(info.trackId, startMs, {{ loop: loop, loopBars: loopBars }});
 }}
 
 // --- Global transport bar (play/pause, skip back/forward) --
@@ -1251,9 +1332,40 @@ function initZoomControls() {{
   }});
 }}
 
+// --- Cue editor popover: draggable by its handle ---
+// showEditorFor repositions the popover next to the newly-selected marker
+// on every selection; a drag only moves it for as long as the current
+// selection stays open, matching the handle's job of getting the popover
+// out of the way of whatever it's currently covering (a waveform detail,
+// a nearby marker) rather than remembering a custom position long-term.
+function initPopoverDrag() {{
+  const popover = document.getElementById('cue-editor-popover');
+  const handle = document.getElementById('cue-editor-handle');
+  let dragging = false;
+  let startX = 0, startY = 0, startLeft = 0, startTop = 0;
+
+  handle.addEventListener('mousedown', function(e) {{
+    dragging = true;
+    startX = e.clientX;
+    startY = e.clientY;
+    startLeft = parseFloat(popover.style.left) || 0;
+    startTop = parseFloat(popover.style.top) || 0;
+    e.preventDefault();
+  }});
+  document.addEventListener('mousemove', function(e) {{
+    if (!dragging) return;
+    popover.style.left = (startLeft + (e.clientX - startX)) + 'px';
+    popover.style.top = (startTop + (e.clientY - startY)) + 'px';
+  }});
+  document.addEventListener('mouseup', function() {{
+    dragging = false;
+  }});
+}}
+
 // Initialize on load
 updateSummaryCounts();
 fetchSettings();
 initZoomControls();
 applyConfidenceStyling();
+initPopoverDrag();
 """

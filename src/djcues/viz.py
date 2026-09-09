@@ -80,10 +80,15 @@ def _render_cue_markers(
         else:
             hot_nudge_count = 0
         prev_hot_pct = left_pct
-        label_offset = 4 + hot_nudge_count * NUDGE_PX
+        # Proposed markers get a wider invisible click target than their
+        # visual line (see the .hot-cue-marker.proposed CSS rule) -- the
+        # label's base offset shifts to match, so it still lands just to
+        # the line's right, matching its pre-widening position.
+        label_base = 11 if css_class_prefix == "proposed" else 4
+        label_offset = label_base + hot_nudge_count * NUDGE_PX
         markers.append(
             f'<div class="hot-cue-marker {css_class_prefix}" '
-            f'style="left:{left_pct:.4f}%;border-left-color:{color};" '
+            f'style="left:{left_pct:.4f}%;color:{color};" '
             f'title="{comment} @ {_format_time(cue.position_ms)}">'
             f'<span class="marker-label" style="color:{color};left:{label_offset}px;">{html.escape(pad)}</span>'
             f"</div>"
