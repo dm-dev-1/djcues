@@ -1,4 +1,5 @@
-"""Local HTTP server for djcues review sessions.
+"""Local HTTP server for djcues review sessions, the BYOK setup wizard,
+and the analysis dashboard.
 
 Bridges the browser review UI to the session JSON file, handling CORS,
 session reads/writes, and cue adjustment logic including memory cue
@@ -8,9 +9,14 @@ recalculation.
 from __future__ import annotations
 
 import json
+import queue
 import socketserver
+import subprocess
+import sys
 import threading
 import time
+import uuid
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -79,6 +85,48 @@ def _parse_range_header(header: str, file_size: int) -> tuple[int, int] | None:
     return start, end
 
 
+class _LocalJsonHandler(BaseHTTPRequestHandler):
+    """Shared boilerplate for djcues's local-only (127.0.0.1) HTTP
+    handlers -- request-logging suppression, JSON response/body helpers,
+    and idle-timeout activity tracking. Extracted once a third handler
+    (DashboardHandler) needed the exact same four methods ReviewHandler/
+    AuthSetupHandler had each already duplicated independently. Route
+    logic (do_GET/do_POST/_handle_*) stays on each subclass -- that part
+    is genuinely different per handler, not boilerplate.
+    """
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        """Suppress default stderr logging."""
+
+    def _touch_activity(self) -> None:
+        """Update the server's last-activity timestamp, for idle-timeout tracking."""
+        if hasattr(self.server, "_last_activity"):
+            self.server._last_activity = time.monotonic()
+
+    def _send_json(self, data: dict, status: int = 200, cors: bool = False) -> None:
+        """Send a JSON response. cors=True adds the Access-Control-Allow-*
+        headers a file://-opened page needs (review.py's page, opened
+        from a written .html file -- a different origin from this
+        server); same-origin server-served pages (auth-setup, dashboard)
+        don't need them and don't send them."""
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _read_body(self) -> dict:
+        """Read and parse the request body as JSON."""
+        length = int(self.headers.get("Content-Length", 0))
+        raw = self.rfile.read(length)
+        return json.loads(raw) if raw else {}
+
+
 class ReviewServer(socketserver.ThreadingMixIn, HTTPServer):
     """Threaded HTTPServer with a larger listen backlog.
 
@@ -95,7 +143,7 @@ class ReviewServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 
-class ReviewHandler(BaseHTTPRequestHandler):
+class ReviewHandler(_LocalJsonHandler):
     """Request handler for the review session server.
 
     Class-level attributes ``html_path`` and ``session_path`` must be set
@@ -115,9 +163,6 @@ class ReviewHandler(BaseHTTPRequestHandler):
 
     # --- helpers --------------------------------------------------------
 
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        """Suppress default stderr logging."""
-
     def _read_session(self) -> dict:
         """Read and parse the session JSON file."""
         return json.loads(self.session_path.read_text(encoding="utf-8"))
@@ -130,27 +175,10 @@ class ReviewHandler(BaseHTTPRequestHandler):
         )
 
     def _send_json(self, data: dict, status: int = 200) -> None:
-        """Send a JSON response with CORS headers."""
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_body(self) -> dict:
-        """Read and parse the request body as JSON."""
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
-        return json.loads(raw) if raw else {}
-
-    def _touch_activity(self) -> None:
-        """Update the server's last-activity timestamp."""
-        if hasattr(self.server, "_last_activity"):
-            self.server._last_activity = time.monotonic()
+        """Always CORS-enabled -- review.py's page is opened via a
+        written file:// URL, a different origin from this server, unlike
+        the same-origin auth-setup/dashboard pages."""
+        super()._send_json(data, status=status, cors=True)
 
     # --- CORS -----------------------------------------------------------
 
@@ -492,7 +520,7 @@ class AuthSetupServer(HTTPServer):
     (`djcues auth web`). Bound to 127.0.0.1 only, same as ReviewServer."""
 
 
-class AuthSetupHandler(BaseHTTPRequestHandler):
+class AuthSetupHandler(_LocalJsonHandler):
     """Serves the setup-wizard page and its two endpoints.
 
     ``html_body`` is baked in as a class attribute (via a dynamic subclass,
@@ -501,30 +529,11 @@ class AuthSetupHandler(BaseHTTPRequestHandler):
     server URL embedded in it. The API key travels in POST bodies only,
     is never written to a response, a log line, or any file — only
     ``djcues.auth.set_api_key()`` (the OS credential store) ever sees it.
+    No CORS needed (inherited default is cors=False) -- same-origin, like
+    the dashboard, unlike review.py's file://-opened page.
     """
 
     html_body: bytes
-
-    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-        """Suppress default stderr logging (no request here ever carries
-        the key in its path, but suppressed anyway for consistency)."""
-
-    def _touch_activity(self) -> None:
-        if hasattr(self.server, "_last_activity"):
-            self.server._last_activity = time.monotonic()
-
-    def _send_json(self, data: dict, status: int = 200) -> None:
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _read_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0))
-        raw = self.rfile.read(length)
-        return json.loads(raw) if raw else {}
 
     def do_GET(self) -> None:  # noqa: N802
         self._touch_activity()
@@ -655,6 +664,521 @@ def start_auth_server(
             elapsed = time.monotonic() - server._last_activity  # type: ignore[attr-defined]
             if elapsed > timeout_seconds:
                 server._timed_out = True  # type: ignore[attr-defined]
+                break
+        server.server_close()
+
+    thread = threading.Thread(target=_serve, daemon=True)
+    thread.start()
+
+    return server, actual_port
+
+
+class _DbWorker:
+    """Owns the ONE Rekordbox6Database connection the dashboard's
+    browsing routes are allowed to touch, on the ONE thread it's created
+    and used from exclusively.
+
+    Required, not optional -- confirmed by reading pyrekordbox's and
+    SQLAlchemy's own source, not assumed: ``Rekordbox6Database`` wraps a
+    single, unlocked SQLAlchemy ``Session`` (not safe to query from more
+    than one thread at once), and it connects through the
+    ``sqlite+pysqlcipher`` dialect, which hardcodes
+    ``pool.SingletonThreadPool`` -- whose own docstring warns it silently
+    ``.close()``s connections once more than ``pool_size`` (default 5)
+    distinct *thread identities* have ever touched it, a lifetime count
+    a per-request-thread server (``ReviewServer``'s ``ThreadingMixIn``)
+    blows past almost immediately just from ordinary browsing. Routing
+    every browsing query through one fixed thread sidesteps both hazards
+    by construction, not by reasoning about lock coverage.
+
+    Background analysis jobs deliberately do NOT use this worker -- they
+    open their own short-lived dedicated connection instead (see
+    ``_run_analysis_job``), so a multi-minute job never blocks browsing,
+    and browsing never waits behind a job either.
+    """
+
+    def __init__(self) -> None:
+        self._queue: "queue.Queue[tuple]" = queue.Queue()
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self) -> None:
+        from pyrekordbox import Rekordbox6Database
+
+        db = Rekordbox6Database()
+        while True:
+            fn, box, done = self._queue.get()
+            try:
+                box["value"] = fn(db)
+            except Exception as e:  # noqa: BLE001 -- re-raised on the caller's thread in run()
+                box["error"] = e
+            done.set()
+
+    def run(self, fn, timeout: float = 30.0):
+        """Run ``fn(db)`` on the worker thread; block the calling thread
+        (an HTTP handler thread) until it completes or *timeout* elapses.
+        Re-raises whatever exception ``fn`` raised, on the caller's own
+        thread, so a handler's normal try/except handles it naturally."""
+        box: dict = {}
+        done = threading.Event()
+        self._queue.put((fn, box, done))
+        if not done.wait(timeout):
+            raise TimeoutError("dashboard database worker did not respond in time")
+        if "error" in box:
+            raise box["error"]
+        return box.get("value")
+
+
+def _run_analysis_job(
+    job_id: str, track_id: str, params: dict, jobs: dict, jobs_lock: threading.Lock
+) -> None:
+    """Runs one propose/compare/beatgrid analysis on its own thread, with
+    its own short-lived, dedicated Rekordbox6Database connection --
+    deliberately never the shared djcues.db.get_db() singleton, and
+    deliberately never routed through _DbWorker either (see its
+    docstring for why sharing either across threads is unsafe). The
+    database is touched exactly once, right at the start (loading the
+    Track) -- the real work after that (the heuristic/agentic proposer,
+    --refine-drops's audio analysis including --deep's Demucs pass, the
+    analysis cache) runs entirely against the in-memory Track object,
+    so this thread never blocks browsing or another job for however
+    long it runs.
+
+    Reuses cli.py's exact tested composition chain
+    (_get_proposer -> _apply_refine_drops -> analysis cache -> proposer())
+    and its already-tested _print_* functions for output -- captured
+    verbatim via redirect_stdout/redirect_stderr (both, not just stdout:
+    an agentic auth failure's real explanation is click.echo'd with
+    err=True inside _get_proposer's own closure, and would otherwise be
+    lost) rather than building any new rendering logic. For propose/
+    compare specifically, also renders a real waveform/timeline via
+    viz._render_track_body -- the same function review.py already
+    reuses for its own cards -- for free.
+    """
+    import contextlib
+    import io
+    import time as time_module
+
+    from pyrekordbox import Rekordbox6Database
+
+    from djcues import analysis_cache
+    from djcues import db as db_module
+    from djcues.beat_verify import verify_beat_grid
+    from djcues.cli import (
+        _apply_cache,
+        _apply_refine_drops,
+        _get_proposer,
+        _print_beatgrid_report,
+        _print_cache_summary,
+        _print_comparison,
+        _print_cost_summary,
+        _print_proposal,
+        _print_refinement_summary,
+        _rehydrate_beatgrid,
+        _shape_beatgrid_for_cache,
+    )
+    from djcues.providers import estimate_cost
+    from djcues.viz import _render_track_body
+
+    started = time_module.monotonic()
+    dedicated_db = Rekordbox6Database()
+    output = io.StringIO()
+    html_fragment = None
+    cache_stats = {"hits": 0, "misses": 0}
+    cost_usd = None
+    result: dict
+
+    try:
+        content = dedicated_db.get_content(ID=track_id)
+        if content is None:
+            raise ValueError(f"track {track_id!r} not found")
+        track = db_module.load_track(content, db=dedicated_db)
+
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            if params["kind"] in ("propose", "compare"):
+                proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
+                    params["agentic"], params["provider"], params["model"],
+                    params["offset_bars"], params["loop_bars"], params["skip_critic"],
+                )
+                proposer, refinement_log = _apply_refine_drops(
+                    proposer, params["refine_drops"], params["deep"],
+                    params["offset_bars"], params["loop_bars"],
+                )
+                cache_key = analysis_cache.cue_proposal_key(
+                    agentic=params["agentic"], provider=resolved_provider, model=resolved_model,
+                    skip_critic=params["skip_critic"], refine_drops=params["refine_drops"],
+                    deep=params["deep"], offset_bars=params["offset_bars"],
+                    loop_bars=params["loop_bars"],
+                )
+                proposer, cache_stats = _apply_cache(
+                    proposer, cache_key, params["offset_bars"], params["loop_bars"],
+                    params["no_cache"], refinement_log=refinement_log,
+                    telemetry_list=telemetry_list, resolved_model=resolved_model,
+                )
+                proposal = proposer(track)
+
+                if params["kind"] == "propose":
+                    _print_proposal(proposal, track)
+                else:
+                    _print_comparison(proposal, track)
+                if telemetry_list is not None:
+                    _print_cost_summary(telemetry_list, resolved_model, 1)
+                    if telemetry_list and (telemetry_list[-1].input_tokens or telemetry_list[-1].output_tokens):
+                        cost_usd = estimate_cost(
+                            resolved_model, telemetry_list[-1].input_tokens,
+                            telemetry_list[-1].output_tokens,
+                        )
+                if refinement_log is not None:
+                    _print_refinement_summary(refinement_log)
+                _print_cache_summary(cache_stats)
+
+                html_fragment = _render_track_body(
+                    track, proposal, compare=(params["kind"] == "compare")
+                )
+
+            else:  # beatgrid
+                entries = db_module.extract_raw_beat_grid(content, db=dedicated_db)
+                fp = analysis_cache.fingerprint_beat_grid(entries)
+                cache_key = analysis_cache.beatgrid_key(
+                    deep=params["deep"], tolerance_ms=params["tolerance_ms"]
+                )
+
+                report = None
+                if not params["no_cache"]:
+                    cached = analysis_cache.get_cached(track.id, cache_key, fp)
+                    if cached is not None:
+                        cache_stats["hits"] += 1
+                        report = _rehydrate_beatgrid(cached.result, track)
+
+                if report is None:
+                    cache_stats["misses"] += 1
+                    report = verify_beat_grid(
+                        track, entries, force_deep=params["deep"],
+                        audio_tolerance_ms=params["tolerance_ms"],
+                    )
+                    if not params["no_cache"]:
+                        analysis_cache.store_result(
+                            track.id, cache_key, fp, _shape_beatgrid_for_cache(report),
+                            track_title=track.title, track_artist=track.artist,
+                        )
+
+                _print_beatgrid_report(report)
+                _print_cache_summary(cache_stats)
+
+        result = {
+            "status": "done", "output_text": output.getvalue(), "html_fragment": html_fragment,
+            "cache": cache_stats, "cost_usd": cost_usd, "error": None,
+        }
+    except SystemExit:
+        # _get_proposer's agentic closure raises this on an unrecoverable
+        # auth/permission failure -- the real explanation was already
+        # click.echo(err=True)'d inside it, captured above into `output`
+        # since both streams are redirected there.
+        result = {
+            "status": "error", "output_text": output.getvalue(), "html_fragment": None,
+            "cache": cache_stats, "cost_usd": cost_usd,
+            "error": "Request aborted -- see output for details (likely an auth/permission issue).",
+        }
+    except Exception as e:  # noqa: BLE001 -- surfaced to the dashboard UI, not swallowed
+        result = {
+            "status": "error", "output_text": output.getvalue(), "html_fragment": None,
+            "cache": cache_stats, "cost_usd": cost_usd, "error": str(e),
+        }
+    finally:
+        dedicated_db.close()
+
+    result["finished_at"] = datetime.now().replace(microsecond=0).isoformat()
+    result["elapsed_seconds"] = round(time_module.monotonic() - started, 1)
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(result)
+
+
+class DashboardHandler(_LocalJsonHandler):
+    """Serves the analysis dashboard: browse rekordbox playlists/tracks
+    and run propose/compare/beatgrid against a selected track, or launch
+    the existing viz/review commands for it.
+
+    ``html_body`` is baked in as a class attribute (dynamic subclass,
+    same pattern as AuthSetupHandler) -- same-origin page, no CORS needed
+    (inherited default cors=False). ``_db_worker`` (one ``_DbWorker``
+    per server instance) is likewise baked in by ``start_dashboard_server``
+    and is the ONLY thing browsing routes are allowed to use to touch
+    ``djcues.db`` -- see ``_DbWorker``'s docstring for why. Background
+    analysis jobs run on their own threads with their own dedicated DB
+    connection instead (``_run_analysis_job``), tracked in ``_jobs``
+    (guarded by ``_jobs_lock`` -- same lock-per-shared-mutable-dict idiom
+    ``ReviewHandler`` already uses for its own session lock).
+    """
+
+    html_body: bytes
+    _db_worker: "_DbWorker"
+    _jobs: dict = {}
+    _jobs_lock = threading.Lock()
+
+    # --- GET --------------------------------------------------------
+
+    def do_GET(self) -> None:  # noqa: N802
+        self._touch_activity()
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            self._serve_html()
+        elif path == "/api/playlists":
+            self._handle_playlists_get()
+        else:
+            parts = [p for p in path.split("/") if p]
+            if len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks":
+                self._handle_playlist_tracks_get(parts[2])
+            elif len(parts) == 3 and parts[0:2] == ["api", "tracks"]:
+                self._handle_track_detail_get(parts[2])
+            elif len(parts) == 3 and parts[0:2] == ["api", "jobs"]:
+                self._handle_job_get(parts[2])
+            else:
+                self._send_json({"error": "not found"}, status=404)
+
+    def _serve_html(self) -> None:
+        body = self.html_body
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _handle_playlists_get(self) -> None:
+        from djcues.db import build_playlist_tree
+
+        def _node_to_dict(node) -> dict:
+            return {
+                "id": node.id, "name": node.name, "kind": node.kind,
+                "track_count": node.track_count,
+                "children": [_node_to_dict(c) for c in node.children],
+            }
+
+        try:
+            tree = self._db_worker.run(lambda db: build_playlist_tree(db=db))
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+        self._send_json({"tree": [_node_to_dict(n) for n in tree]})
+
+    def _handle_playlist_tracks_get(self, playlist_id: str) -> None:
+        from djcues.db import list_playlist_tracks
+
+        try:
+            tracks = self._db_worker.run(lambda db: list_playlist_tracks(playlist_id, db=db))
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+        self._send_json({
+            "playlist_id": playlist_id,
+            "tracks": [
+                {
+                    "id": t.id, "track_no": t.track_no, "title": t.title,
+                    "artist": t.artist, "bpm": t.bpm, "duration_ms": t.duration_ms,
+                }
+                for t in tracks
+            ],
+        })
+
+    def _handle_track_detail_get(self, track_id: str) -> None:
+        from djcues import db as db_module
+        from djcues.review import _resolve_local_audio_path
+
+        def work(db):
+            content = db.get_content(ID=track_id)
+            if content is None:
+                return None
+            return db_module.load_track(content, db=db)
+
+        try:
+            track = self._db_worker.run(work)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+        if track is None:
+            self._send_json({"error": "track not found"}, status=404)
+            return
+
+        self._send_json({
+            "id": track.id, "title": track.title, "artist": track.artist,
+            "bpm": track.bpm, "duration_ms": track.duration_ms,
+            "phrase_count": len(track.phrases), "has_phrases": bool(track.phrases),
+            "existing_cue_count": len(track.cues),
+            "has_local_audio": _resolve_local_audio_path(track) is not None,
+        })
+
+    def _handle_job_get(self, job_id: str) -> None:
+        with self._jobs_lock:
+            job = self._jobs.get(job_id)
+            job_copy = dict(job) if job is not None else None
+        if job_copy is None:
+            self._send_json({"error": "job not found"}, status=404)
+            return
+        self._send_json(job_copy)
+
+    # --- POST -------------------------------------------------------
+
+    def do_POST(self) -> None:  # noqa: N802
+        self._touch_activity()
+        path = self.path.split("?")[0]
+        parts = [p for p in path.split("/") if p]
+        if len(parts) == 4 and parts[0:2] == ["api", "tracks"] and parts[3] == "jobs":
+            self._handle_job_post(parts[2])
+        elif len(parts) == 5 and parts[0:2] == ["api", "tracks"] and parts[3] == "launch":
+            self._handle_launch_post(parts[2], parts[4])
+        else:
+            self._send_json({"error": "not found"}, status=404)
+
+    def _handle_job_post(self, track_id: str) -> None:
+        from djcues.cli import _check_refine_drops_available
+
+        body = self._read_body()
+        kind = body.get("kind")
+        if kind not in ("propose", "compare", "beatgrid"):
+            self._send_json({"error": "kind must be propose, compare, or beatgrid"}, status=400)
+            return
+
+        deep = bool(body.get("deep", False))
+        refine_drops = bool(body.get("refine_drops", False))
+        if kind != "beatgrid":
+            if deep and not refine_drops:
+                self._send_json({"error": "deep only applies with refine_drops"}, status=400)
+                return
+            if refine_drops:
+                err = _check_refine_drops_available(deep)
+                if err:
+                    self._send_json({"error": err}, status=400)
+                    return
+
+        params = {
+            "kind": kind,
+            "agentic": bool(body.get("agentic", False)),
+            "provider": body.get("provider") or None,
+            "model": body.get("model") or None,
+            "skip_critic": bool(body.get("skip_critic", False)),
+            "refine_drops": refine_drops,
+            "deep": deep,
+            "offset_bars": int(body.get("offset_bars", 16)),
+            "loop_bars": int(body.get("loop_bars", 4)),
+            "no_cache": bool(body.get("no_cache", False)),
+            "tolerance_ms": float(body.get("tolerance_ms", 30.0)),
+        }
+
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id, "track_id": track_id, "kind": kind, "status": "running",
+            "started_at": datetime.now().replace(microsecond=0).isoformat(), "finished_at": None,
+            "elapsed_seconds": None, "output_text": "", "html_fragment": None,
+            "cache": {"hits": 0, "misses": 0}, "cost_usd": None, "error": None,
+        }
+        with self._jobs_lock:
+            self._jobs[job_id] = job
+
+        thread = threading.Thread(
+            target=_run_analysis_job,
+            args=(job_id, track_id, params, self._jobs, self._jobs_lock),
+            daemon=True,
+        )
+        thread.start()
+        self._send_json({"job_id": job_id, "status": "running"}, status=202)
+
+    def _handle_launch_post(self, track_id: str, tool: str) -> None:
+        if tool not in ("viz", "review"):
+            self._send_json({"error": "not found"}, status=404)
+            return
+
+        body = self._read_body()
+        playlist_id = body.get("playlist_id")
+        if not playlist_id:
+            self._send_json({"error": "playlist_id is required"}, status=400)
+            return
+
+        def work(db):
+            playlist = db.get_playlist(ID=playlist_id)
+            content = db.get_content(ID=track_id)
+            return (
+                playlist.Name if playlist is not None else None,
+                content.Title if content is not None else None,
+            )
+
+        try:
+            playlist_name, track_title = self._db_worker.run(work)
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+        if playlist_name is None or track_title is None:
+            self._send_json({"error": "playlist or track not found"}, status=404)
+            return
+
+        # sys.executable -m djcues.cli, never `uv run`/a bare `djcues` PATH
+        # lookup -- this repo's own documented environment gotchas record
+        # `uv run` corrupting this exact venv's editable install before;
+        # sys.executable is the exact interpreter already running this
+        # server, sidestepping that entirely.
+        argv = [sys.executable, "-m", "djcues.cli", tool, playlist_name, track_title]
+        if tool == "review":
+            # Deliberately separate, default-off flags -- never inherited
+            # from whatever the propose/compare panel currently has
+            # toggled, so opening Review can't silently piggyback an
+            # unwanted --agentic/--deep charge.
+            if body.get("agentic"):
+                argv.append("--agentic")
+            if body.get("refine_drops"):
+                argv.append("--refine-drops")
+            if body.get("deep"):
+                argv.append("--deep")
+
+        popen_kwargs: dict = {}
+        if sys.platform == "win32":
+            popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        subprocess.Popen(argv, **popen_kwargs)  # fire-and-forget, never .wait()ed on
+
+        self._send_json({"ok": True, "playlist_name": playlist_name, "track_title": track_title})
+
+
+def start_dashboard_server(
+    html_body: bytes,
+    port: int = 0,
+    timeout_minutes: int = 30,
+) -> tuple[HTTPServer, int]:
+    """Start the analysis dashboard server in a daemon thread.
+
+    Returns ``(server, actual_port)``. Reuses ``ReviewServer`` as-is for
+    its ``ThreadingMixIn``/larger backlog (nothing in that class is
+    review-specific despite the name) -- browsing requests benefit from
+    concurrent handling too (e.g. a track-detail lookup shouldn't block
+    behind an in-flight playlist-tree request), and every request
+    handler thread only ever touches ``djcues.db`` via the one shared
+    ``_DbWorker``, per its own docstring, never the request thread
+    itself. A long-running analysis job naturally keeps this server
+    alive past its idle timeout too, since the dashboard page polls
+    ``GET /api/jobs/<id>`` every ~2s while one is in flight, and every
+    request (including polls) touches activity via ``_touch_activity``.
+    """
+    db_worker = _DbWorker()
+    handler = type(
+        "BoundDashboardHandler",
+        (DashboardHandler,),
+        {
+            "html_body": html_body,
+            "_db_worker": db_worker,
+            "_jobs": {},
+            "_jobs_lock": threading.Lock(),
+        },
+    )
+
+    server = ReviewServer(("127.0.0.1", port), handler)
+    actual_port = server.server_address[1]
+    server._last_activity = time.monotonic()  # type: ignore[attr-defined]
+    server._shutdown_flag = False  # type: ignore[attr-defined]
+
+    timeout_seconds = timeout_minutes * 60
+
+    def _serve() -> None:
+        server.timeout = 10
+        while not server._shutdown_flag:  # type: ignore[attr-defined]
+            server.handle_request()
+            elapsed = time.monotonic() - server._last_activity  # type: ignore[attr-defined]
+            if elapsed > timeout_seconds:
                 break
         server.server_close()
 

@@ -450,6 +450,82 @@ class TestReview:
 
 
 # ---------------------------------------------------------------------------
+# dashboard
+# ---------------------------------------------------------------------------
+
+
+class TestDashboard:
+    """Mirrors TestReview's/TestAuthWeb's own established pattern for a
+    server-backed command: mock start_dashboard_server/webbrowser.open,
+    break the blocking wait loop via time.sleep's side_effect."""
+
+    def test_happy_path_starts_server_and_opens_browser(self, runner: CliRunner):
+        fake_server = MagicMock()
+        with patch("djcues.server.start_dashboard_server", return_value=(fake_server, 54123)) as mock_start, \
+             patch("webbrowser.open") as mock_open, \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+            result = runner.invoke(cli, ["dashboard"])
+
+        assert result.exit_code == 0
+        assert "Dashboard: http://127.0.0.1:54123" in result.output
+        assert "Server stopped." in result.output
+        mock_start.assert_called_once()
+        mock_open.assert_called_once_with("http://127.0.0.1:54123")
+
+    def test_no_playlist_arg_means_no_initial_playlist(self, runner: CliRunner):
+        fake_server = MagicMock()
+        with patch("djcues.server.start_dashboard_server", return_value=(fake_server, 54123)), \
+             patch("djcues.dashboard.render_dashboard_html", return_value="<html></html>") as mock_render, \
+             patch("webbrowser.open"), \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+            runner.invoke(cli, ["dashboard"])
+
+        _, kwargs = mock_render.call_args
+        assert kwargs["initial_playlist"] is None
+
+    def test_playlist_arg_resolves_to_initial_playlist(self, runner: CliRunner):
+        fake_server = MagicMock()
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist(playlist_id=42, name="Tech House")), \
+             patch("djcues.server.start_dashboard_server", return_value=(fake_server, 54123)), \
+             patch("djcues.dashboard.render_dashboard_html", return_value="<html></html>") as mock_render, \
+             patch("webbrowser.open"), \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+            result = runner.invoke(cli, ["dashboard", "Tech House"])
+
+        assert result.exit_code == 0
+        _, kwargs = mock_render.call_args
+        assert kwargs["initial_playlist"] == {"id": 42, "name": "Tech House"}
+
+    def test_unresolvable_playlist_arg_degrades_to_no_initial_playlist(self, runner: CliRunner):
+        """Never a hard error -- matches the command's whole "you don't
+        need to already know exact names" premise: browsing manually is
+        always the fallback."""
+        fake_server = MagicMock()
+        with patch("djcues.cli.find_playlist", return_value=None), \
+             patch("djcues.server.start_dashboard_server", return_value=(fake_server, 54123)), \
+             patch("djcues.dashboard.render_dashboard_html", return_value="<html></html>") as mock_render, \
+             patch("webbrowser.open"), \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+            result = runner.invoke(cli, ["dashboard", "Nonexistent Playlist"])
+
+        assert result.exit_code == 0
+        _, kwargs = mock_render.call_args
+        assert kwargs["initial_playlist"] is None
+
+    def test_offset_and_loop_bars_passed_through(self, runner: CliRunner):
+        fake_server = MagicMock()
+        with patch("djcues.server.start_dashboard_server", return_value=(fake_server, 54123)), \
+             patch("djcues.dashboard.render_dashboard_html", return_value="<html></html>") as mock_render, \
+             patch("webbrowser.open"), \
+             patch("time.sleep", side_effect=KeyboardInterrupt):
+            runner.invoke(cli, ["dashboard", "--offset", "8", "--loop-bars", "2"])
+
+        _, kwargs = mock_render.call_args
+        assert kwargs["default_offset"] == 8
+        assert kwargs["default_loop_bars"] == 2
+
+
+# ---------------------------------------------------------------------------
 # apply
 # ---------------------------------------------------------------------------
 

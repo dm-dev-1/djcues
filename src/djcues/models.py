@@ -247,3 +247,34 @@ class DropRefinement:
     source: str
     note: str
     sustain_signature: str | None = None
+
+
+@dataclass
+class PlaylistNode:
+    """One node in the real rekordbox playlist folder tree (db.py's
+    build_playlist_tree()) -- deliberately lightweight, for browsing UIs
+    that need to list a whole library's playlists instantly, unlike
+    Track (below) which needs per-track ANLZ file reads."""
+
+    id: str
+    name: str
+    kind: str  # "folder" | "playlist" | "smart_playlist"
+    seq: int
+    track_count: int | None  # None for folders
+    children: list["PlaylistNode"]
+
+
+@dataclass
+class TrackSummary:
+    """One track's browsing-weight metadata (db.py's list_playlist_tracks())
+    -- title/artist/bpm/duration straight from rekordbox's own DjmdContent
+    row, zero ANLZ I/O. Not a substitute for Track: has no phrases, cues,
+    beat grid, or waveform -- load_track()/load_playlist_tracks() are still
+    what any real analysis needs, this is only for a fast track list."""
+
+    id: str
+    track_no: int | None
+    title: str
+    artist: str
+    bpm: float
+    duration_ms: float

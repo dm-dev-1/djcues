@@ -15,15 +15,20 @@ djcues.auth.*) are mocked.
 from __future__ import annotations
 
 import json
+import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from http.client import HTTPResponse
+from unittest.mock import patch
 
 import pytest
 
 from djcues.constants import CUE_SYSTEM_BY_PAD
-from djcues.server import start_auth_server, start_server
+from djcues.server import start_auth_server, start_dashboard_server, start_server
+from djcues.server import _DbWorker
+from tests.conftest import requires_rekordbox
 
 
 # ---------------------------------------------------------------------------
@@ -887,3 +892,407 @@ class TestAudioEndpoint:
             assert headers["Content-Type"] == expected_content_type
         finally:
             _shutdown(server)
+
+
+# ---------------------------------------------------------------------------
+# DashboardHandler / _DbWorker / start_dashboard_server
+#
+# Unlike ReviewHandler/AuthSetupHandler, the dashboard fundamentally needs a
+# real rekordbox connection for almost every route (playlist tree, track
+# detail, job execution all go through _DbWorker or a job's own dedicated
+# Rekordbox6Database -- neither is passed in, both construct their own).
+# Gated on @requires_rekordbox, matching test_db.py's own established
+# precedent for exactly this class of test -- a real DB is simpler and more
+# trustworthy here than a large, fragile from-scratch mock of pyrekordbox's
+# ORM. The expensive analysis internals (_get_proposer/_apply_refine_drops/
+# verify_beat_grid) are still mocked for job tests, at their source in
+# djcues.cli/djcues.beat_verify, matching test_cli.py's own established
+# mocking boundary -- these tests exercise DashboardHandler's own routing/
+# job-lifecycle/threading logic, not djcues's core analysis engines (which
+# have their own tests elsewhere).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def dashboard_server():
+    server, port = start_dashboard_server(html_body=b"<html><body>dashboard shell</body></html>")
+    base_url = f"http://127.0.0.1:{port}"
+    yield base_url, server
+    _shutdown(server)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_cache_writes_from_dashboard_jobs():
+    """Every dashboard job test in this section runs a real job thread
+    through the real _apply_cache/analysis_cache path -- without this,
+    a "fake proposer" test would still write a real (fake-content) row
+    into the actual ~/.djcues/analysis_cache.db on whatever machine runs
+    these tests. Matches test_cli.py's own no_analysis_cache autouse
+    fixture exactly, for the same reason."""
+    with patch("djcues.analysis_cache.get_cached", return_value=None), \
+         patch("djcues.analysis_cache.store_result"):
+        yield
+
+
+@requires_rekordbox
+class TestDbWorker:
+    def test_run_returns_fn_result(self):
+        worker = _DbWorker()
+        assert worker.run(lambda db: 1 + 1) == 2
+
+    def test_run_reraises_fn_exception_on_caller_thread(self):
+        worker = _DbWorker()
+
+        def raiser(db):
+            raise ValueError("boom")
+
+        with pytest.raises(ValueError, match="boom"):
+            worker.run(raiser)
+
+    def test_all_calls_observe_the_same_thread_identity(self):
+        """The core safety property _DbWorker exists for -- every unit of
+        DB work runs on the one thread the connection was created on,
+        never the caller's own thread."""
+        worker = _DbWorker()
+        idents = [worker.run(lambda db: threading.get_ident()) for _ in range(5)]
+        assert len(set(idents)) == 1
+        assert idents[0] != threading.get_ident()
+
+    def test_run_has_a_real_working_rekordbox_connection(self):
+        worker = _DbWorker()
+        playlists = worker.run(lambda db: list(db.get_playlist()))
+        assert any(p.Name == "Tech House" for p in playlists)
+
+
+@requires_rekordbox
+class TestDashboardHandlerGet:
+    def test_index_serves_html_body(self, dashboard_server):
+        base_url, _server = dashboard_server
+        resp = urllib.request.urlopen(base_url + "/", timeout=5)
+        assert resp.status == 200
+        assert b"dashboard shell" in resp.read()
+
+    def test_playlists_returns_real_tree(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/playlists")
+        assert status == 200
+        names = [n["name"] for n in data["tree"]]
+        assert "Tech House" in names
+        tech_house = next(n for n in data["tree"] if n["name"] == "Tech House")
+        assert tech_house["kind"] == "playlist"
+        assert tech_house["track_count"] == 10
+
+    def test_playlist_tracks_returns_real_tracks(self, dashboard_server):
+        base_url, _server = dashboard_server
+        _, tree = _get(base_url + "/api/playlists")
+        tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
+        status, data = _get(base_url + f"/api/playlists/{tech_house['id']}/tracks")
+        assert status == 200
+        assert len(data["tracks"]) == 10
+        assert all(t["title"] for t in data["tracks"])
+
+    def test_track_detail_returns_real_metadata(self, dashboard_server):
+        base_url, _server = dashboard_server
+        _, tree = _get(base_url + "/api/playlists")
+        tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
+        _, listing = _get(base_url + f"/api/playlists/{tech_house['id']}/tracks")
+        track = listing["tracks"][0]
+
+        status, detail = _get(base_url + f"/api/tracks/{track['id']}")
+
+        assert status == 200
+        assert detail["title"] == track["title"]
+        assert detail["has_phrases"] is True
+        assert detail["existing_cue_count"] > 0
+        # waveform/vocal_track are deliberately never included -- not
+        # needed until a job actually renders a timeline.
+        assert "waveform" not in detail
+        assert "vocal_track" not in detail
+
+    def test_track_detail_404_for_unknown_id(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/tracks/not-a-real-track-id")
+        assert status == 404
+
+    def test_job_404_for_unknown_id(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/jobs/not-a-real-job-id")
+        assert status == 404
+
+    def test_unknown_get_route_404(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/totally/not/a/route")
+        assert status == 404
+
+
+@requires_rekordbox
+class TestDashboardHandlerJobs:
+    @staticmethod
+    def _tech_house_track_id(base_url: str) -> str:
+        _, tree = _get(base_url + "/api/playlists")
+        tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
+        _, listing = _get(base_url + f"/api/playlists/{tech_house['id']}/tracks")
+        return listing["tracks"][0]["id"]
+
+    def test_rejects_unknown_kind(self, dashboard_server):
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+        status, data = _post(base_url + f"/api/tracks/{track_id}/jobs", {"kind": "not-a-real-kind"})
+        assert status == 400
+
+    def test_rejects_deep_without_refine_drops(self, dashboard_server):
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+        status, data = _post(
+            base_url + f"/api/tracks/{track_id}/jobs",
+            {"kind": "propose", "deep": True, "refine_drops": False},
+        )
+        assert status == 400
+        assert "deep" in data["error"].lower()
+
+    def _run_job_to_completion(self, base_url: str, track_id: str, body: dict, timeout: float = 20.0) -> dict:
+        status, data = _post(base_url + f"/api/tracks/{track_id}/jobs", body)
+        assert status == 202, data
+        job_id = data["job_id"]
+
+        deadline = time.monotonic() + timeout
+        job: dict = {}
+        while time.monotonic() < deadline:
+            status, job = _get(base_url + f"/api/jobs/{job_id}")
+            assert status == 200
+            if job["status"] != "running":
+                return job
+            time.sleep(0.2)
+        raise AssertionError(f"job {job_id} did not finish within {timeout}s: {job}")
+
+    def test_propose_job_completes_with_mocked_proposer(self, dashboard_server):
+        from djcues.models import CueProposal
+
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        def fake_get_proposer(*args, **kwargs):
+            def proposer(track):
+                return CueProposal(
+                    track=track, hot_cues=[], memory_cues=[], confidence={}, notes=["fake-propose-marker"]
+                )
+            return proposer, None, None, None
+
+        with patch("djcues.cli._get_proposer", side_effect=fake_get_proposer):
+            job = self._run_job_to_completion(base_url, track_id, {"kind": "propose"})
+
+        assert job["status"] == "done"
+        assert job["error"] is None
+        assert "fake-propose-marker" in job["output_text"]
+        assert job["html_fragment"]  # _render_track_body ran for real
+        assert job["cache"] == {"hits": 0, "misses": 1}
+
+    def test_compare_job_completes_with_mocked_proposer(self, dashboard_server):
+        from djcues.models import CueProposal
+
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        def fake_get_proposer(*args, **kwargs):
+            def proposer(track):
+                return CueProposal(track=track, hot_cues=[], memory_cues=[], confidence={}, notes=[])
+            return proposer, None, None, None
+
+        with patch("djcues.cli._get_proposer", side_effect=fake_get_proposer):
+            job = self._run_job_to_completion(base_url, track_id, {"kind": "compare"})
+
+        assert job["status"] == "done"
+        assert "Precision" in job["output_text"] or "No existing hot cues" in job["output_text"]
+
+    def test_beatgrid_job_completes_for_real(self, dashboard_server):
+        # No mocking needed -- the free self-consistency tier is pure,
+        # fast arithmetic over data the browsing routes already proved
+        # readable; this is the one job kind cheap enough to run
+        # genuinely end to end in a test.
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        job = self._run_job_to_completion(base_url, track_id, {"kind": "beatgrid"})
+
+        assert job["status"] == "done"
+        assert job["error"] is None
+        assert job["output_text"]
+        assert job["html_fragment"] is None  # beatgrid has no (Track, CueProposal) pair to render
+
+    def test_job_error_is_captured_not_a_crash(self, dashboard_server):
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        def raising_get_proposer(*args, **kwargs):
+            raise RuntimeError("synthetic failure for this test")
+
+        with patch("djcues.cli._get_proposer", side_effect=raising_get_proposer):
+            job = self._run_job_to_completion(base_url, track_id, {"kind": "propose"})
+
+        assert job["status"] == "error"
+        assert "synthetic failure" in job["error"]
+
+    def test_browsing_stays_responsive_while_a_job_is_running(self, dashboard_server):
+        """The actual proof of the whole thread-safety design (see
+        _DbWorker's docstring) -- a slow job must not block a concurrent
+        browsing request. An artificially slow mocked proposer stands in
+        for a real multi-minute --deep run (already confirmed live,
+        separately, against a real Demucs pass)."""
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        def slow_get_proposer(*args, **kwargs):
+            def proposer(track):
+                time.sleep(1.5)
+                from djcues.models import CueProposal
+                return CueProposal(track=track, hot_cues=[], memory_cues=[], confidence={}, notes=[])
+            return proposer, None, None, None
+
+        with patch("djcues.cli._get_proposer", side_effect=slow_get_proposer):
+            status, data = _post(base_url + f"/api/tracks/{track_id}/jobs", {"kind": "propose"})
+            assert status == 202
+            job_id = data["job_id"]
+
+            # The job is now running (sleeping) on its own thread. A
+            # browsing request must return promptly, not queue up behind it.
+            start = time.monotonic()
+            status, tree = _get(base_url + "/api/playlists")
+            elapsed = time.monotonic() - start
+
+            assert status == 200
+            assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running job"
+
+            # Drain the job so the test doesn't leave a stray thread mid-sleep.
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                status, job = _get(base_url + f"/api/jobs/{job_id}")
+                if job["status"] != "running":
+                    break
+                time.sleep(0.2)
+            assert job["status"] == "done"
+
+    def test_rejects_refine_drops_when_dependency_unavailable(self, dashboard_server):
+        """The upfront synchronous check (mirrors cli.py's own propose/
+        compare/review guard) -- a missing djcues[audio]/[ml] install is
+        an immediate 400 before any thread spawns, not a job that fails
+        after the fact. Mocked here rather than actually uninstalling
+        librosa, matching how a real absent-dependency failure surfaces."""
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        with patch("djcues.cli._check_refine_drops_available", return_value="Error: needs djcues[audio]"):
+            status, data = _post(
+                base_url + f"/api/tracks/{track_id}/jobs",
+                {"kind": "propose", "refine_drops": True},
+            )
+
+        assert status == 400
+        assert "djcues[audio]" in data["error"]
+
+
+@requires_rekordbox
+class TestDashboardHandlerLaunch:
+    @staticmethod
+    def _tech_house_playlist_and_track(base_url: str) -> tuple[str, str]:
+        _, tree = _get(base_url + "/api/playlists")
+        tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
+        _, listing = _get(base_url + f"/api/playlists/{tech_house['id']}/tracks")
+        return tech_house["id"], listing["tracks"][0]["id"]
+
+    def test_launch_viz_spawns_expected_argv_and_does_not_wait(self, dashboard_server):
+        base_url, _server = dashboard_server
+        playlist_id, track_id = self._tech_house_playlist_and_track(base_url)
+
+        with patch("djcues.server.subprocess.Popen") as mock_popen:
+            status, data = _post(
+                base_url + f"/api/tracks/{track_id}/launch/viz", {"playlist_id": playlist_id}
+            )
+
+        assert status == 200
+        assert data["playlist_name"] == "Tech House"
+        mock_popen.assert_called_once()
+        argv = mock_popen.call_args.args[0]
+        assert argv[0] == sys.executable
+        assert argv[1:4] == ["-m", "djcues.cli", "viz"]
+        assert argv[4] == "Tech House"
+        assert argv[5] == data["track_title"]
+        mock_popen.return_value.wait.assert_not_called()
+
+    def test_launch_review_includes_its_own_flags_not_shared_with_propose_panel(self, dashboard_server):
+        base_url, _server = dashboard_server
+        playlist_id, track_id = self._tech_house_playlist_and_track(base_url)
+
+        with patch("djcues.server.subprocess.Popen") as mock_popen:
+            status, data = _post(
+                base_url + f"/api/tracks/{track_id}/launch/review",
+                {"playlist_id": playlist_id, "refine_drops": True, "deep": False, "agentic": False},
+            )
+
+        assert status == 200
+        argv = mock_popen.call_args.args[0]
+        assert argv[3] == "review"
+        assert "--refine-drops" in argv
+        assert "--deep" not in argv
+        assert "--agentic" not in argv
+
+    def test_launch_unknown_tool_404(self, dashboard_server):
+        base_url, _server = dashboard_server
+        playlist_id, track_id = self._tech_house_playlist_and_track(base_url)
+        status, data = _post(
+            base_url + f"/api/tracks/{track_id}/launch/not-a-real-tool",
+            {"playlist_id": playlist_id},
+        )
+        assert status == 404
+
+    def test_launch_missing_playlist_id_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        _playlist_id, track_id = self._tech_house_playlist_and_track(base_url)
+        status, data = _post(base_url + f"/api/tracks/{track_id}/launch/viz", {})
+        assert status == 400
+
+    def test_launch_unknown_playlist_or_track_404(self, dashboard_server):
+        base_url, _server = dashboard_server
+        playlist_id, track_id = self._tech_house_playlist_and_track(base_url)
+
+        with patch("djcues.server.subprocess.Popen") as mock_popen:
+            status, data = _post(
+                base_url + f"/api/tracks/{track_id}/launch/viz",
+                {"playlist_id": "not-a-real-playlist-id"},
+            )
+        assert status == 404
+        mock_popen.assert_not_called()
+
+        with patch("djcues.server.subprocess.Popen") as mock_popen:
+            status, data = _post(
+                base_url + "/api/tracks/not-a-real-track-id/launch/viz",
+                {"playlist_id": playlist_id},
+            )
+        assert status == 404
+        mock_popen.assert_not_called()
+
+    def test_launch_db_worker_failure_returns_500_not_a_crash(self, dashboard_server):
+        base_url, _server = dashboard_server
+        playlist_id, track_id = self._tech_house_playlist_and_track(base_url)
+
+        with patch.object(_DbWorker, "run", side_effect=RuntimeError("worker exploded")):
+            status, data = _post(
+                base_url + f"/api/tracks/{track_id}/launch/viz", {"playlist_id": playlist_id}
+            )
+
+        assert status == 500
+        assert "worker exploded" in data["error"]
+
+    def test_launch_review_includes_agentic_and_deep_flags(self, dashboard_server):
+        base_url, _server = dashboard_server
+        playlist_id, track_id = self._tech_house_playlist_and_track(base_url)
+
+        with patch("djcues.server.subprocess.Popen") as mock_popen:
+            status, data = _post(
+                base_url + f"/api/tracks/{track_id}/launch/review",
+                {"playlist_id": playlist_id, "agentic": True, "deep": True, "refine_drops": False},
+            )
+
+        assert status == 200
+        argv = mock_popen.call_args.args[0]
+        assert "--agentic" in argv
+        assert "--deep" in argv
+        assert "--refine-drops" not in argv

@@ -81,6 +81,18 @@ In the review UI:
 - Press Delete to skip an individual cue
 - Memory cues auto-recalculate when you adjust their hot cue
 
+### Analysis dashboard
+
+```bash
+# Browse your library and run analysis from the browser
+djcues dashboard
+
+# Auto-select a playlist on load
+djcues dashboard "Playlist Name"
+```
+
+Browse your real rekordbox playlists (including folders) and tracks without already knowing exact names to type as CLI arguments. Select a track to see its metadata, then run `propose`, `compare`, or `beatgrid` against it with the same flags the CLI exposes (`--agentic`, `--refine-drops`, `--deep`, offset/loop-bars, etc.) — results, including a real waveform/timeline for propose/compare, render inline as the job completes. A `--deep` or `--agentic` run genuinely takes as long as it does from the CLI (minutes for Demucs, real API latency for agentic) without blocking the rest of the page — browse a different track while one runs. Every dashboard-triggered run shares the same [analysis cache](#analysis-cache) as the CLI, so a track already analyzed either way shows up instantly the second time. "Open in Viz" / "Open in Review" launch the existing, unmodified commands for the selected track in their own tab. Fully read-only, same guarantee as `propose`/`compare`/`viz`/`review`/`beatgrid`.
+
 ### Compare accuracy against curated tracks
 
 ```bash
@@ -193,7 +205,7 @@ Install with `pip install djcues[audio]` for `--refine-drops` (needs `librosa`/`
 - **Auto-backup**: `djcues apply` automatically backs up `master.db` before writing
 - **Overwrite protection**: Tracks with existing cues require explicit confirmation
 - **Rekordbox must be closed**: The apply command will not write while rekordbox is running
-- **Read-only by default**: `propose`, `compare`, `viz`, `review`, and `beatgrid` never modify the database
+- **Read-only by default**: `propose`, `compare`, `viz`, `review`, `beatgrid`, and `dashboard` never modify the database
 - **DB-only writes**: Cues are written to `master.db` only (not ANLZ files). rekordbox handles ANLZ sync on USB export.
 - **Analysis cache**: `propose`/`compare`/`review`/`beatgrid` cache results locally at `~/.djcues/analysis_cache.db` to avoid redundant recomputation — never touches the rekordbox database; use `--no-cache` to force a fresh run.
 
@@ -225,9 +237,10 @@ src/djcues/
     metrics.py      # Precision/recall/F1 for compare
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
-    server.py       # Local HTTP server for review sessions
+    dashboard.py    # Analysis dashboard HTML/CSS/JS (browse playlists/tracks, run propose/compare/beatgrid)
+    server.py       # Local HTTP server for review sessions, the BYOK setup wizard, and the dashboard
     writer.py       # DB backup and cue writes
-    cli.py          # Click CLI (propose, compare, viz, review, apply, beatgrid, auth, history)
+    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, auth, history, cache)
 ```
 
 ## License

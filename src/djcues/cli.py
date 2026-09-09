@@ -219,31 +219,32 @@ def _get_proposer(agentic, provider_name, model, offset, loop_bars, skip_critic)
     return proposer, telemetry_list, resolved_model, provider_name
 
 
-def _check_refine_drops_available(deep: bool) -> None:
+def _check_refine_drops_available(deep: bool) -> str | None:
     """Upfront fail-fast for --refine-drops[/--deep], matching
     _resolve_agentic_provider's existing pattern: fail with a clear
     install message before processing any track, not partway through a
-    playlist."""
+    playlist. Returns an error message string, or None if available --
+    a plain return (rather than echoing + raising SystemExit itself)
+    so this is reusable from an HTTP handler (dashboard.py's job-launch
+    route), which can't let a SystemExit propagate across that boundary
+    the way a CLI command can."""
     try:
         import librosa  # noqa: F401
     except ImportError:
-        click.echo(
+        return (
             "Error: --refine-drops needs the 'librosa'/'soundfile' packages. "
-            "Install them with: pip install djcues[audio]",
-            err=True,
+            "Install them with: pip install djcues[audio]"
         )
-        raise SystemExit(1)
     if deep:
         try:
             import demucs  # noqa: F401
             import torch  # noqa: F401
         except ImportError:
-            click.echo(
+            return (
                 "Error: --refine-drops --deep needs the 'demucs'/'torch' packages. "
-                "Install them with: pip install djcues[ml]",
-                err=True,
+                "Install them with: pip install djcues[ml]"
             )
-            raise SystemExit(1)
+    return None
 
 
 def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars):
@@ -594,7 +595,10 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         click.echo("Error: --deep only applies with --refine-drops.", err=True)
         raise SystemExit(1)
     if refine_drops:
-        _check_refine_drops_available(deep)
+        err = _check_refine_drops_available(deep)
+        if err:
+            click.echo(err, err=True)
+            raise SystemExit(1)
 
     playlist = find_playlist(playlist_name)
     if playlist is None:
@@ -670,7 +674,10 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         click.echo("Error: --deep only applies with --refine-drops.", err=True)
         raise SystemExit(1)
     if refine_drops:
-        _check_refine_drops_available(deep)
+        err = _check_refine_drops_available(deep)
+        if err:
+            click.echo(err, err=True)
+            raise SystemExit(1)
 
     playlist = find_playlist(playlist_name)
     if playlist is None:
@@ -848,7 +855,10 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
         click.echo("Error: --deep only applies with --refine-drops.", err=True)
         raise SystemExit(1)
     if refine_drops:
-        _check_refine_drops_available(deep)
+        err = _check_refine_drops_available(deep)
+        if err:
+            click.echo(err, err=True)
+            raise SystemExit(1)
 
     pl = find_playlist(playlist)
     if pl is None:
@@ -966,6 +976,44 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
     click.echo(f"Apply:   uv run djcues apply {session_path}")
 
     # Block until interrupted
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        click.echo("\nServer stopped.")
+
+
+@cli.command()
+@click.argument("playlist_name", required=False)
+@click.option("--offset", default=16, show_default=True, help="Default memory cue offset in bars (adjustable per-run in the browser).")
+@click.option("--loop-bars", default=4, show_default=True, help="Default loop length in bars (adjustable per-run in the browser).")
+def dashboard(playlist_name, offset, loop_bars):
+    """Launch the analysis dashboard: browse playlists/tracks in the
+    browser and run propose/compare/beatgrid without already knowing
+    exact names.
+    """
+    import time
+    import webbrowser
+    from djcues.dashboard import render_dashboard_html
+    from djcues.server import start_dashboard_server
+
+    # A convenience only, never a hard requirement -- browsing manually
+    # is always the fallback if the name isn't found, matching this
+    # command's whole "you don't need to already know exact names" point.
+    initial_playlist = None
+    if playlist_name:
+        pl = find_playlist(playlist_name)
+        if pl is not None:
+            initial_playlist = {"id": pl.ID, "name": pl.Name}
+
+    html = render_dashboard_html(
+        initial_playlist=initial_playlist, default_offset=offset, default_loop_bars=loop_bars
+    )
+    server, port = start_dashboard_server(html_body=html.encode("utf-8"))
+    server_url = f"http://127.0.0.1:{port}"
+    webbrowser.open(server_url)
+    click.echo(f"Dashboard: {server_url}")
+
     try:
         while True:
             time.sleep(1)
