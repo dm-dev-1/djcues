@@ -1275,8 +1275,16 @@ function postSettings(partial) {{
     method: 'POST',
     headers: {{ 'Content-Type': 'application/json' }},
     body: JSON.stringify(partial)
-  }}).then(res => res.json()).then(data => {{ previewSettings = data; }})
-    .catch(err => console.error('Failed to save playback settings:', err));
+  }}).then(res => res.json()).then(data => {{
+    previewSettings = data;
+    // The loop-bars setting is editable from two places -- the settings
+    // panel and the cue-editor popover -- so a change from either one
+    // needs to update both, not just the field that triggered it.
+    document.getElementById('setting-pre-roll').value = data.preview_pre_roll_bars;
+    document.getElementById('setting-loop-bars').value = data.preview_loop_bars;
+    document.getElementById('setting-loop-enabled').checked = data.preview_loop_enabled;
+    document.getElementById('editor-loop-bars').value = data.preview_loop_bars;
+  }}).catch(err => console.error('Failed to save playback settings:', err));
 }}
 
 document.getElementById('setting-pre-roll').addEventListener('change', function() {{
@@ -1289,6 +1297,13 @@ document.getElementById('setting-loop-bars').addEventListener('change', function
 }});
 document.getElementById('setting-loop-enabled').addEventListener('change', function() {{
   postSettings({{ preview_loop_enabled: this.checked }});
+}});
+// Same persistence as the settings panel's own loop-bars field above --
+// editing it here updates the real saved default too (real feedback:
+// "persist properly"), not just a value local to this popover.
+document.getElementById('editor-loop-bars').addEventListener('change', function() {{
+  const v = parseFloat(this.value);
+  if (Number.isFinite(v) && v > 0) postSettings({{ preview_loop_bars: v }});
 }});
 
 function toggleSettings() {{
