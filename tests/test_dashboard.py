@@ -59,17 +59,19 @@ class TestRenderDashboardHtml:
         assert 'id="flag-loop-bars" value="2"' in result
 
     def test_no_initial_playlist_by_default(self):
-        # selectPlaylist( legitimately appears once already, in the
-        # always-present tree-row click handler -- what must be absent
-        # is the *auto-call* appended after the JS body's own final
-        # loadPlaylists() statement.
         result = render_dashboard_html()
-        tail = result.rsplit("loadPlaylists();", 1)[1]
-        assert "selectPlaylist(" not in tail
+        assert "const INITIAL_PLAYLIST = null;" in result
 
     def test_initial_playlist_is_auto_selected(self):
         result = render_dashboard_html(initial_playlist={"id": "723183862", "name": "Tech House"})
-        assert 'selectPlaylist("723183862", "Tech House")' in result
+        assert 'const INITIAL_PLAYLIST = {"id": "723183862", "name": "Tech House"};' in result
+
+    def test_initial_playlist_defined_before_init_is_called(self):
+        # A real ordering bug: INITIAL_PLAYLIST must be assigned before
+        # initDashboard() (which reads it) runs, or the auto-select
+        # silently sees `undefined` instead of the real value.
+        result = render_dashboard_html(initial_playlist={"id": "1", "name": "X"})
+        assert result.index("INITIAL_PLAYLIST = ") < result.index("initDashboard();")
 
     def test_initial_playlist_name_is_safely_json_escaped(self):
         # A real regression guard: a playlist name containing a quote

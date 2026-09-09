@@ -16,15 +16,15 @@ import json
 from djcues.viz import _PAGE_CSS
 
 
-def _js_string(value: str) -> str:
-    """JSON-encode a string for safe embedding inside an HTML <script>
-    block. json.dumps() alone is NOT enough here: it escapes quotes and
-    backslashes but, being pure JSON (not JS-in-HTML aware), leaves "/"
-    untouched -- a value containing a literal "</script>" would close the
-    real script tag early at the HTML-parsing stage, before the JS
-    engine ever sees it as "just a string". Escaping every "/" as "\\/"
-    (a no-op for JSON/JS string parsing, valid in both) neutralizes that
-    regardless of where the slash falls."""
+def _js_value(value: object) -> str:
+    """JSON-encode any JSON-serializable value for safe embedding inside
+    an HTML <script> block. json.dumps() alone is NOT enough here: it
+    escapes quotes and backslashes but, being pure JSON (not JS-in-HTML
+    aware), leaves "/" untouched -- a value containing a literal
+    "</script>" would close the real script tag early at the HTML-parsing
+    stage, before the JS engine ever sees it as "just a string". Escaping
+    every "/" as "\\/" (a no-op for JSON/JS string parsing, valid in both)
+    neutralizes that regardless of where the slash falls."""
     return json.dumps(value).replace("/", "\\/")
 
 
@@ -42,12 +42,7 @@ def render_dashboard_html(
     (browsing manually is always the fallback); never a hard requirement
     for the page to work.
     """
-    initial_playlist_js = ""
-    if initial_playlist is not None:
-        initial_playlist_js = (
-            f"selectPlaylist({_js_string(initial_playlist['id'])}, "
-            f"{_js_string(initial_playlist['name'])});"
-        )
+    initial_playlist_js = f"const INITIAL_PLAYLIST = {_js_value(initial_playlist)};"
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -61,7 +56,7 @@ def render_dashboard_html(
 <div class="dashboard">
   <div class="sidebar">
     <div class="sidebar-header">
-      <h1>djcues</h1>
+      <h1 id="logo-home" title="Back to all playlists">djcues</h1>
       <input id="playlist-search" type="text" placeholder="Filter playlists&hellip;">
     </div>
     <div id="playlist-tree" class="playlist-tree">Loading&hellip;</div>
@@ -144,6 +139,7 @@ def render_dashboard_html(
 
 <script>{_render_dashboard_js(default_offset, default_loop_bars)}
 {initial_playlist_js}
+initDashboard();
 </script>
 </body>
 </html>"""
@@ -168,7 +164,8 @@ _DASHBOARD_CSS = """
     overflow: hidden;
   }
   .sidebar-header { padding: 16px; border-bottom: 1px solid #2a2a3e; }
-  .sidebar-header h1 { font-size: 1.1rem; margin: 0 0 10px; color: #17a2b8; }
+  .sidebar-header h1 { font-size: 1.1rem; margin: 0 0 10px; color: #17a2b8; cursor: pointer; user-select: none; }
+  .sidebar-header h1:hover { color: #1fc4dd; }
   .sidebar-header input, .flag-text, .flag-num {
     width: 100%;
     background: #1e1e3a;
@@ -277,6 +274,7 @@ def _render_dashboard_js(default_offset: int, default_loop_bars: int) -> str:
 
 const playlistTreeEl = document.getElementById('playlist-tree');
 const playlistSearchEl = document.getElementById('playlist-search');
+const logoHomeEl = document.getElementById('logo-home');
 const trackListPanelEl = document.getElementById('track-list-panel');
 const trackDetailPanelEl = document.getElementById('track-detail-panel');
 const currentPlaylistNameEl = document.getElementById('current-playlist-name');
@@ -301,6 +299,77 @@ let currentTrackId = null;
 let currentAction = 'propose';
 let pollTimer = null;
 let jobStartedAt = null;
+
+// --- Routing (landing / playlist / track, all reachable via browser
+// Back/Forward, a bookmark, or a page refresh -- not just forward-only
+// clicks) -----------------------------------------------------------
+//
+// One rule keeps this from drifting out of sync with itself: the ONLY
+// function allowed to touch history (pushState/replaceState) is
+// navigateTo(). Every click handler below calls navigateTo() with a
+// plain state object instead of mutating the DOM directly; a real
+// Back/Forward (popstate) re-renders that exact same kind of state
+// object through the exact same renderState() function, so "what a
+// click shows" and "what Back shows" can never disagree.
+
+function stateToUrl(state) {{
+  const params = new URLSearchParams();
+  if (state.playlistId) {{
+    params.set('playlist_id', state.playlistId);
+    params.set('playlist_name', state.playlistName || '');
+  }}
+  if (state.trackId) {{
+    params.set('track_id', state.trackId);
+    params.set('track_title', state.trackTitle || '');
+  }}
+  const qs = params.toString();
+  return qs ? ('?' + qs) : window.location.pathname;
+}}
+
+function urlToState() {{
+  const params = new URLSearchParams(window.location.search);
+  const playlistId = params.get('playlist_id');
+  const trackId = params.get('track_id');
+  if (trackId) {{
+    return {{
+      view: 'track', playlistId, playlistName: params.get('playlist_name'),
+      trackId, trackTitle: params.get('track_title'),
+    }};
+  }}
+  if (playlistId) {{
+    return {{ view: 'playlist', playlistId, playlistName: params.get('playlist_name') }};
+  }}
+  return {{ view: 'landing' }};
+}}
+
+async function renderState(state) {{
+  if (state.view === 'track') {{
+    await renderTrackDetail(state.playlistId, state.playlistName, state.trackId, state.trackTitle);
+  }} else if (state.view === 'playlist') {{
+    await renderPlaylistTracks(state.playlistId, state.playlistName);
+  }} else {{
+    renderLanding();
+  }}
+}}
+
+function navigateTo(state, mode) {{
+  // mode: 'push' for a real navigation (a click), 'replace' for
+  // restoring/correcting the current entry (initial load) -- 'replace'
+  // never adds a new Back stop.
+  const url = stateToUrl(state);
+  if (mode === 'push') {{
+    history.pushState(state, '', url);
+  }} else {{
+    history.replaceState(state, '', url);
+  }}
+  renderState(state);
+}}
+
+window.addEventListener('popstate', (event) => {{
+  renderState(event.state || urlToState());
+}});
+
+logoHomeEl.addEventListener('click', () => navigateTo({{ view: 'landing' }}, 'push'));
 
 // A plain network-level fetch failure (server unreachable, connection
 // refused, ...) throws a generic TypeError with an unhelpful browser
@@ -365,7 +434,7 @@ function renderPlaylistNode(node, depth) {{
       childrenWrap.classList.toggle('hidden');
       row.classList.toggle('expanded');
     }} else if (node.kind === 'playlist') {{
-      selectPlaylist(node.id, node.name);
+      navigateTo({{ view: 'playlist', playlistId: node.id, playlistName: node.name }}, 'push');
     }}
     // smart_playlist: not browsable here (rekordbox doesn't populate its
     // track membership the same way) -- click intentionally does nothing.
@@ -395,13 +464,31 @@ playlistSearchEl.addEventListener('input', () => {{
 
 // --- Track list ---------------------------------------------------
 
-async function selectPlaylist(playlistId, playlistName) {{
+function renderLanding() {{
+  currentPlaylistId = null;
+  currentTracks = [];
+  currentTrackId = null;
+  currentPlaylistNameEl.textContent = 'Select a playlist';
+  trackSearchEl.value = '';
+  trackSearchEl.classList.add('hidden');
+  trackListEl.innerHTML = '<p class="meta">Pick a playlist on the left to see its tracks.</p>';
+  trackListPanelEl.classList.remove('hidden');
+  trackDetailPanelEl.classList.add('hidden');
+  stopPolling();
+  document.title = 'djcues \\u2014 Analysis dashboard';
+}}
+
+async function renderPlaylistTracks(playlistId, playlistName) {{
   currentPlaylistId = playlistId;
+  currentTrackId = null;
   currentPlaylistNameEl.textContent = playlistName;
   trackSearchEl.value = '';
   trackSearchEl.classList.remove('hidden');
   trackListEl.innerHTML = 'Loading&hellip;';
-  showTrackListPanel();
+  trackListPanelEl.classList.remove('hidden');
+  trackDetailPanelEl.classList.add('hidden');
+  stopPolling();
+  document.title = 'djcues \\u2014 ' + playlistName;
 
   try {{
     const data = await fetchJson('/api/playlists/' + encodeURIComponent(playlistId) + '/tracks');
@@ -433,7 +520,10 @@ function renderTrackList(tracks) {{
     row.appendChild(titleSpan);
     row.appendChild(artistSpan);
     row.appendChild(metaSpan);
-    row.addEventListener('click', () => selectTrack(t.id, t.title));
+    row.addEventListener('click', () => navigateTo({{
+      view: 'track', playlistId: currentPlaylistId, playlistName: currentPlaylistNameEl.textContent,
+      trackId: t.id, trackTitle: t.title,
+    }}, 'push'));
     trackListEl.appendChild(row);
   }});
 }}
@@ -445,16 +535,18 @@ trackSearchEl.addEventListener('input', () => {{
   renderTrackList(filtered);
 }});
 
-function showTrackListPanel() {{
-  trackListPanelEl.classList.remove('hidden');
-  trackDetailPanelEl.classList.add('hidden');
-  stopPolling();
-}}
-backToListBtn.addEventListener('click', showTrackListPanel);
+// "Back to tracks" deliberately just calls history.back() rather than
+// re-implementing "go to the playlist view" directly -- that keeps this
+// button and a real Back-button press doing the exact same thing (and
+// means Forward correctly returns to this track afterward too), instead
+// of two subtly different code paths that could drift apart.
+backToListBtn.addEventListener('click', () => history.back());
 
 // --- Track detail / actions --------------------------------------
 
-async function selectTrack(trackId, trackTitle) {{
+async function renderTrackDetail(playlistId, playlistName, trackId, trackTitle) {{
+  currentPlaylistId = playlistId;
+  currentPlaylistNameEl.textContent = playlistName || currentPlaylistNameEl.textContent;
   currentTrackId = trackId;
   trackTitleEl.textContent = trackTitle;
   trackMetaEl.textContent = 'Loading&hellip;';
@@ -464,6 +556,19 @@ async function selectTrack(trackId, trackTitle) {{
   jobOutputWrapEl.classList.add('hidden');
   jobHtmlFragmentEl.innerHTML = '';
   stopPolling();
+  document.title = 'djcues \\u2014 ' + trackTitle;
+
+  // Reached directly (a bookmark, a refresh, or Back/Forward hopping
+  // over the landing/list view) rather than via a track-row click --
+  // currentTracks won't be populated yet, which "\\u2190 Back to tracks"
+  // needs. Fetch it now so that still works; failure here is non-fatal,
+  // the track detail below doesn't depend on it.
+  if (playlistId && (currentTracks.length === 0 || currentTracks[0] === undefined)) {{
+    try {{
+      const data = await fetchJson('/api/playlists/' + encodeURIComponent(playlistId) + '/tracks');
+      currentTracks = data.tracks;
+    }} catch (err) {{ /* non-fatal */ }}
+  }}
 
   try {{
     const track = await fetchJson('/api/tracks/' + encodeURIComponent(trackId));
@@ -636,5 +741,22 @@ async function launchTool(tool) {{
   }}
 }}
 
-loadPlaylists();
+// Called after INITIAL_PLAYLIST (server-embedded, from a
+// `djcues dashboard "Playlist Name"` argument) is defined -- see the
+// bottom of render_dashboard_html()'s <script> block.
+async function initDashboard() {{
+  await loadPlaylists();
+
+  const urlState = urlToState();
+  if (urlState.view !== 'landing') {{
+    // A real navigation already encoded in the URL (a bookmark, a
+    // refresh, or the address bar edited by hand) -- trust it over
+    // whatever the CLI's own playlist argument said.
+    navigateTo(urlState, 'replace');
+  }} else if (INITIAL_PLAYLIST) {{
+    navigateTo({{ view: 'playlist', playlistId: INITIAL_PLAYLIST.id, playlistName: INITIAL_PLAYLIST.name }}, 'replace');
+  }} else {{
+    navigateTo({{ view: 'landing' }}, 'replace');
+  }}
+}}
 """
