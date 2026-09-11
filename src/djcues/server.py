@@ -85,6 +85,66 @@ def _parse_range_header(header: str, file_size: int) -> tuple[int, int] | None:
     return start, end
 
 
+# Extensions the stdlib <audio> element genuinely cannot decode in Chromium
+# -- confirmed live via `new Audio().canPlayType('audio/aiff')` returning ""
+# (vs. "maybe"/"probably" for every other extension in _AUDIO_CONTENT_TYPES,
+# which all already play natively -- this set is deliberately narrow to
+# what's actually confirmed broken, not a guess at other formats).
+_NEEDS_TRANSCODE = {".aiff", ".aif"}
+
+
+def _transcode_cache_dir() -> Path:
+    """~/.djcues/audio_transcode_cache/, creating it if needed -- mirrors
+    analysis_cache.default_db_path()'s own ~/.djcues/ convention."""
+    cache_dir = Path.home() / ".djcues" / "audio_transcode_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def _ensure_playable_audio(path: Path, track_id: str) -> tuple[Path, str]:
+    """Returns (path_to_serve, content_type) -- the original file/type
+    unchanged, unless its format needs transcoding to be browser-playable
+    (see _NEEDS_TRANSCODE), in which case a cached WAV transcode is used
+    or created.
+
+    Transcoding is cheap here -- PCM-to-PCM via libsndfile, no resampling
+    or re-encoding involved (confirmed live at well under a second for a
+    real ~4.5 min track) -- so it runs synchronously on the request
+    thread rather than as a background job, same as every other step in
+    this handler. Cached at ~/.djcues/audio_transcode_cache/<track_id>.wav,
+    invalidated by comparing mtimes against the real source file so a
+    replaced/re-exported audio file doesn't keep serving a stale preview.
+    Written via a temp file + atomic rename so two requests racing the
+    same cold cache (e.g. the page's initial load firing several fetches
+    at once) can't hand a reader a half-written file. Falls back to
+    serving the original, untranscoded file on any failure (missing
+    soundfile, a corrupt source, a full disk) -- never worse than the
+    pre-transcoding behavior, just not yet fixed for that one track.
+    """
+    suffix = path.suffix.lower()
+    if suffix not in _NEEDS_TRANSCODE:
+        return path, _AUDIO_CONTENT_TYPES.get(suffix, "application/octet-stream")
+
+    cache_path = _transcode_cache_dir() / f"{track_id}.wav"
+    try:
+        if cache_path.is_file() and cache_path.stat().st_mtime >= path.stat().st_mtime:
+            return cache_path, "audio/wav"
+
+        import soundfile as sf
+
+        data, samplerate = sf.read(path, dtype="int16")
+        # format="WAV" explicit, not inferred from tmp_path's name -- its
+        # actual last suffix is ".tmp", and soundfile's filename-based
+        # format inference only looks at that, not "isn't .tmp itself a
+        # WAV-like name" (confirmed live: inference alone raises here).
+        tmp_path = cache_path.with_name(cache_path.name + ".tmp")
+        sf.write(tmp_path, data, samplerate, subtype="PCM_16", format="WAV")
+        tmp_path.replace(cache_path)
+        return cache_path, "audio/wav"
+    except Exception:
+        return path, _AUDIO_CONTENT_TYPES.get(suffix, "application/octet-stream")
+
+
 class _LocalJsonHandler(BaseHTTPRequestHandler):
     """Shared boilerplate for djcues's local-only (127.0.0.1) HTTP
     handlers -- request-logging suppression, JSON response/body helpers,
@@ -233,7 +293,12 @@ class ReviewHandler(_LocalJsonHandler):
         support so a browser <audio> element can seek without
         re-downloading from byte 0 every time. Not a nice-to-have --
         previewing a cue near the end of a long file would otherwise
-        stall on downloading everything before it first."""
+        stall on downloading everything before it first.
+
+        Formats Chromium can't natively decode (AIFF -- see
+        _NEEDS_TRANSCODE) are transcoded to a cached WAV first; every
+        other format streams straight from the original file, unchanged
+        from before transcoding support existed."""
         path_str = self.audio_paths.get(track_id)
         if not path_str:
             self._send_json({"error": "no audio available for this track"}, status=404)
@@ -244,7 +309,7 @@ class ReviewHandler(_LocalJsonHandler):
             self._send_json({"error": "audio file not found"}, status=404)
             return
 
-        content_type = _AUDIO_CONTENT_TYPES.get(path.suffix.lower(), "application/octet-stream")
+        path, content_type = _ensure_playable_audio(path, track_id)
         file_size = path.stat().st_size
         range_header = self.headers.get("Range")
 

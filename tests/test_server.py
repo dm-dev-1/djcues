@@ -875,8 +875,13 @@ class TestAudioEndpoint:
         [
             ("t.mp3", "audio/mpeg"),
             ("t.flac", "audio/flac"),
-            ("t.aiff", "audio/aiff"),
-            ("t.aif", "audio/aiff"),
+            # .aiff/.aif deliberately excluded -- those now go through
+            # _ensure_playable_audio's transcode path (see TestAudioTranscode),
+            # so their real content-type is audio/wav on success, not
+            # audio/aiff; this test's dummy (invalid-audio) fixture content
+            # would only exercise the transcode-failure fallback, which
+            # coincidentally also serves audio/aiff -- not a meaningful test
+            # of either the pre- or post-transcode behavior.
             ("t.m4a", "audio/mp4"),
             ("t.mp4", "audio/mp4"),
             ("t.wav", "audio/wav"),
@@ -890,6 +895,163 @@ class TestAudioEndpoint:
             status, headers, body = _get_raw(f"{base_url}/audio/1")
             assert status == 200
             assert headers["Content-Type"] == expected_content_type
+        finally:
+            _shutdown(server)
+
+
+class TestAudioTranscode:
+    """.aiff/.aif specifically -- confirmed live (real Chromium, via
+    `new Audio().canPlayType('audio/aiff')` returning "") to be
+    undecodable by a browser <audio> element, unlike every other format
+    in _AUDIO_CONTENT_TYPES. _ensure_playable_audio transcodes those to a
+    cached WAV; every other format is untouched (see
+    test_non_transcoded_format_is_served_unchanged below and
+    TestAudioEndpoint above, which already covers those)."""
+
+    @staticmethod
+    def _real_aiff_bytes(num_frames: int = 4410, samplerate: int = 44100) -> bytes:
+        """A real, valid, decodable AIFF file's bytes -- silence is fine,
+        transcoding only cares that soundfile can read the container/
+        subtype, not the audio content."""
+        import io
+
+        import numpy as np
+        import soundfile as sf
+
+        buf = io.BytesIO()
+        data = np.zeros((num_frames, 2), dtype="int16")
+        sf.write(buf, data, samplerate, format="AIFF", subtype="PCM_16")
+        return buf.getvalue()
+
+    def _start_with_aiff(self, tmp_path, monkeypatch, content: bytes | None = None):
+        from djcues import server as server_module
+
+        cache_dir = tmp_path / "cache"
+
+        def _fake_cache_dir():
+            # Real _transcode_cache_dir() creates the directory as a side
+            # effect -- a bare `lambda: cache_dir` stub skips that, so the
+            # transcode's write silently fails (no parent dir) and falls
+            # back to the original file, which looked exactly like an
+            # actual transcode bug the first time this was caught.
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            return cache_dir
+
+        monkeypatch.setattr(server_module, "_transcode_cache_dir", _fake_cache_dir)
+
+        html_path = tmp_path / "r.html"
+        html_path.write_text("<html></html>", encoding="utf-8")
+        session_path = tmp_path / "s.json"
+        session_path.write_text("{}", encoding="utf-8")
+        audio_file = tmp_path / "src" / "real.aiff"
+        audio_file.parent.mkdir()
+        audio_file.write_bytes(content if content is not None else self._real_aiff_bytes())
+        server, port = start_server(
+            html_path=html_path, session_path=session_path, audio_paths={"1": str(audio_file)}
+        )
+        return server, f"http://127.0.0.1:{port}", audio_file, cache_dir
+
+    def test_real_aiff_is_transcoded_to_playable_wav(self, tmp_path, monkeypatch):
+        server, base_url, _audio_file, cache_dir = self._start_with_aiff(tmp_path, monkeypatch)
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1")
+            assert status == 200
+            assert headers["Content-Type"] == "audio/wav"
+            assert body[:4] == b"RIFF"  # real WAV container, not the AIFF's "FORM"
+            assert (cache_dir / "1.wav").is_file()
+        finally:
+            _shutdown(server)
+
+    def test_range_request_works_against_transcoded_wav(self, tmp_path, monkeypatch):
+        """The whole point of transcoding through the cache rather than
+        on-the-fly is that seeking still works -- Range support on the
+        transcoded file, not just a whole-file fetch."""
+        server, base_url, _audio_file, _cache_dir = self._start_with_aiff(tmp_path, monkeypatch)
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1", headers={"Range": "bytes=0-9"})
+            assert status == 206
+            assert len(body) == 10
+            assert headers["Content-Range"].startswith("bytes 0-9/")
+        finally:
+            _shutdown(server)
+
+    def test_second_request_hits_cache_not_a_fresh_transcode(self, tmp_path, monkeypatch):
+        """soundfile is imported lazily inside _ensure_playable_audio, so
+        there's no module-level name to mock and assert-not-called on --
+        instead, a real re-transcode would rewrite (and thus re-stat a
+        newer mtime for) the cached WAV; an unchanged mtime across two
+        requests is direct proof the second one short-circuited on the
+        cache check before ever touching soundfile."""
+        server, base_url, _audio_file, cache_dir = self._start_with_aiff(tmp_path, monkeypatch)
+        try:
+            _get_raw(f"{base_url}/audio/1")
+            cached_mtime = (cache_dir / "1.wav").stat().st_mtime
+            time.sleep(0.05)
+
+            status, headers, _body = _get_raw(f"{base_url}/audio/1")
+            assert status == 200
+            assert headers["Content-Type"] == "audio/wav"
+            assert (cache_dir / "1.wav").stat().st_mtime == cached_mtime
+        finally:
+            _shutdown(server)
+
+    def test_cache_invalidated_when_source_file_changes(self, tmp_path, monkeypatch):
+        server, base_url, audio_file, cache_dir = self._start_with_aiff(tmp_path, monkeypatch)
+        try:
+            _get_raw(f"{base_url}/audio/1")
+            first_size = (cache_dir / "1.wav").stat().st_size
+
+            # A "changed" source file: different duration -> different
+            # transcoded size, and a newer mtime than the cached WAV.
+            time.sleep(0.05)
+            audio_file.write_bytes(self._real_aiff_bytes(num_frames=8820))
+
+            status, headers, _body = _get_raw(f"{base_url}/audio/1")
+            assert status == 200
+            assert (cache_dir / "1.wav").stat().st_size != first_size
+        finally:
+            _shutdown(server)
+
+    def test_transcode_failure_falls_back_to_original_file(self, tmp_path, monkeypatch):
+        """Not-actually-audio content (a corrupt/truncated download, say)
+        makes soundfile raise -- must degrade to serving the original
+        file/content-type, never a 500 or an empty response."""
+        server, base_url, audio_file, cache_dir = self._start_with_aiff(
+            tmp_path, monkeypatch, content=b"not a real aiff file"
+        )
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1")
+            assert status == 200
+            assert headers["Content-Type"] == "audio/aiff"
+            assert body == audio_file.read_bytes()
+            assert not (cache_dir / "1.wav").is_file()
+        finally:
+            _shutdown(server)
+
+    def test_non_transcoded_format_is_served_unchanged(self, tmp_path, monkeypatch):
+        """A format that doesn't need transcoding (e.g. .wav) must never
+        touch the cache dir or soundfile at all -- _ensure_playable_audio
+        should short-circuit before either."""
+        from djcues import server as server_module
+
+        cache_dir = tmp_path / "cache"
+        monkeypatch.setattr(server_module, "_transcode_cache_dir", lambda: cache_dir)
+        html_path = tmp_path / "r.html"
+        html_path.write_text("<html></html>", encoding="utf-8")
+        session_path = tmp_path / "s.json"
+        session_path.write_text("{}", encoding="utf-8")
+        audio_file = tmp_path / "t.wav"
+        audio_file.write_bytes(b"0123456789" * 10)
+        server, port = start_server(
+            html_path=html_path, session_path=session_path, audio_paths={"1": str(audio_file)}
+        )
+        base_url = f"http://127.0.0.1:{port}"
+        try:
+            status, headers, body = _get_raw(f"{base_url}/audio/1")
+            assert status == 200
+            assert headers["Content-Type"] == "audio/wav"
+            assert body == audio_file.read_bytes()
+            assert not cache_dir.exists()
         finally:
             _shutdown(server)
 

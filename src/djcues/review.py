@@ -1042,8 +1042,15 @@ document.getElementById('editor-time').addEventListener('keydown', function(e) {
 // --- Audio preview ---
 
 function canPlayFormat(format) {{
+  // aiff/aif are always playable: the server transcodes those to a
+  // cached WAV on the fly (see _NEEDS_TRANSCODE in server.py) rather
+  // than streaming the original bytes, specifically because no
+  // Chromium build actually decodes AIFF via <audio> natively -- so
+  // checking canPlayType('audio/aiff') here would always (correctly,
+  // but unhelpfully) say no, and block a preview that will actually work.
+  if (format === 'aiff' || format === 'aif') return true;
   const mimeByFormat = {{
-    mp3: 'audio/mpeg', flac: 'audio/flac', aiff: 'audio/aiff', aif: 'audio/aiff',
+    mp3: 'audio/mpeg', flac: 'audio/flac',
     m4a: 'audio/mp4', mp4: 'audio/mp4', wav: 'audio/wav', ogg: 'audio/ogg'
   }};
   const mime = mimeByFormat[format];
