@@ -28,6 +28,15 @@ import pytest
 from djcues.constants import CUE_SYSTEM_BY_PAD
 from djcues.server import start_auth_server, start_dashboard_server, start_server
 from djcues.server import _DbWorker
+
+# Captured before _no_real_cache_writes_from_dashboard_jobs (below) ever
+# patches djcues.analysis_cache.store_result into a no-op for the whole
+# dashboard-tests section -- TestDashboardEstimateEndpoint needs to
+# actually seed real rows, unlike every other test in that section
+# (which deliberately must NOT write to the real cache). A plain import
+# binds this name to the original function object regardless of what the
+# module's own store_result attribute later gets reassigned to.
+from djcues.analysis_cache import store_result as _real_store_result
 from tests.conftest import requires_rekordbox
 
 
@@ -1349,6 +1358,89 @@ class TestDashboardHandlerJobs:
 
         assert status == 400
         assert "djcues[audio]" in data["error"]
+
+
+@requires_rekordbox
+class TestDashboardEstimateEndpoint:
+    """GET /api/estimate -- real historical timing/cost for the
+    dashboard's preset picker (see analysis_cache.estimate() and
+    server.py's _handle_estimate_get). Isolated from the real
+    ~/.djcues/analysis_cache.db via default_db_path, same pattern
+    TestSettingsEndpoint uses for default_settings_path -- otherwise
+    these tests would read (and depend on the exact contents of)
+    whatever's really in the user's own cache."""
+
+    def test_no_data_returns_honest_zero(self, dashboard_server, tmp_path, monkeypatch):
+        from djcues import analysis_cache
+        monkeypatch.setattr(analysis_cache, "default_db_path", lambda: tmp_path / "cache.db")
+        base_url, _server = dashboard_server
+
+        status, data = _get(
+            base_url + "/api/estimate?kind=propose&agentic=false&refine_drops=false&deep=false"
+        )
+
+        assert status == 200
+        assert data == {"sample_count": 0, "avg_compute_seconds": None, "avg_cost_usd": None}
+
+    def test_invalid_kind_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/estimate?kind=nonsense")
+        assert status == 400
+        assert "kind" in data["error"]
+
+    def test_reflects_a_real_stored_entry(self, dashboard_server, tmp_path, monkeypatch):
+        from djcues import analysis_cache
+        db_path = tmp_path / "cache.db"
+        monkeypatch.setattr(analysis_cache, "default_db_path", lambda: db_path)
+        key = analysis_cache.cue_proposal_key(
+            agentic=False, provider=None, model=None, skip_critic=False,
+            refine_drops=True, deep=True, offset_bars=16, loop_bars=4,
+        )
+        _real_store_result(1, key, "fp", {"positions": {}, "confidence": {}, "notes": []},
+                            compute_seconds=180.0, db_path=db_path)
+        base_url, _server = dashboard_server
+
+        status, data = _get(
+            base_url + "/api/estimate?kind=propose&agentic=false&refine_drops=true&deep=true"
+        )
+
+        assert status == 200
+        assert data["sample_count"] == 1
+        assert data["avg_compute_seconds"] == pytest.approx(180.0)
+
+    def test_propose_and_compare_share_the_same_estimate_data(self, dashboard_server, tmp_path, monkeypatch):
+        """Both map to analysis_kind 'cue_proposal' -- see
+        _run_analysis_job, which caches propose/compare identically."""
+        from djcues import analysis_cache
+        db_path = tmp_path / "cache.db"
+        monkeypatch.setattr(analysis_cache, "default_db_path", lambda: db_path)
+        key = analysis_cache.cue_proposal_key(
+            agentic=True, provider="anthropic", model="claude-x", skip_critic=False,
+            refine_drops=False, deep=False, offset_bars=16, loop_bars=4,
+        )
+        _real_store_result(1, key, "fp", {"positions": {}, "confidence": {}, "notes": []},
+                            compute_seconds=5.0, cost_usd=0.01, db_path=db_path)
+        base_url, _server = dashboard_server
+
+        _, propose_est = _get(base_url + "/api/estimate?kind=propose&agentic=true")
+        _, compare_est = _get(base_url + "/api/estimate?kind=compare&agentic=true")
+
+        assert propose_est == compare_est
+        assert propose_est["sample_count"] == 1
+
+    def test_beatgrid_kind_ignores_agentic_and_refine_drops_params(self, dashboard_server, tmp_path, monkeypatch):
+        from djcues import analysis_cache
+        db_path = tmp_path / "cache.db"
+        monkeypatch.setattr(analysis_cache, "default_db_path", lambda: db_path)
+        key = analysis_cache.beatgrid_key(deep=True, tolerance_ms=30.0)
+        _real_store_result(1, key, "fp", {"status": "ok"}, compute_seconds=3.0, db_path=db_path)
+        base_url, _server = dashboard_server
+
+        status, data = _get(base_url + "/api/estimate?kind=beatgrid&deep=true")
+
+        assert status == 200
+        assert data["sample_count"] == 1
+        assert data["avg_compute_seconds"] == pytest.approx(3.0)
 
 
 @requires_rekordbox

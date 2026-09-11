@@ -14,6 +14,7 @@ from djcues.analysis_cache import (
     beatgrid_key,
     clear_all,
     cue_proposal_key,
+    estimate,
     fingerprint_beat_grid,
     fingerprint_track_analysis,
     get_cached,
@@ -344,3 +345,73 @@ class TestSummaryAndClear:
 
     def test_clear_all_nonexistent_db_returns_zero(self, tmp_path):
         assert clear_all(db_path=tmp_path / "never_created.db") == 0
+
+
+class TestEstimate:
+    """The dashboard's preset picker reads this for a real "here's what
+    this has actually cost/taken so far" instead of a hardcoded guess --
+    see server.py's _handle_estimate_get."""
+
+    def test_no_data_yet_is_honest_zero_not_a_fabricated_number(self, tmp_path):
+        result = estimate("cue_proposal", "heuristic", refine_drops=True, deep=True,
+                           db_path=tmp_path / "never_created.db")
+        assert result == {"sample_count": 0, "avg_compute_seconds": None, "avg_cost_usd": None}
+
+    def test_averages_across_matching_entries(self, db_path, heuristic_key, track):
+        fp = fingerprint_track_analysis(track)
+        payload = {"positions": {}, "confidence": {}, "notes": []}
+        store_result(1, heuristic_key, fp, payload, compute_seconds=100.0, cost_usd=0.01, db_path=db_path)
+        store_result(2, heuristic_key, fp, payload, compute_seconds=200.0, cost_usd=0.03, db_path=db_path)
+
+        result = estimate("cue_proposal", "heuristic", refine_drops=True, deep=True, db_path=db_path)
+
+        assert result["sample_count"] == 2
+        assert result["avg_compute_seconds"] == pytest.approx(150.0)
+        assert result["avg_cost_usd"] == pytest.approx(0.02)
+
+    def test_different_refine_drops_or_deep_combination_not_averaged_together(
+        self, db_path, track
+    ):
+        fp = fingerprint_track_analysis(track)
+        payload = {"positions": {}, "confidence": {}, "notes": []}
+        deep_key = cue_proposal_key(agentic=False, provider=None, model=None, skip_critic=False,
+                                     refine_drops=True, deep=True, offset_bars=16, loop_bars=4)
+        quick_key = cue_proposal_key(agentic=False, provider=None, model=None, skip_critic=False,
+                                      refine_drops=False, deep=False, offset_bars=16, loop_bars=4)
+        store_result(1, deep_key, fp, payload, compute_seconds=200.0, db_path=db_path)
+        store_result(2, quick_key, fp, payload, compute_seconds=1.0, db_path=db_path)
+
+        deep_est = estimate("cue_proposal", "heuristic", refine_drops=True, deep=True, db_path=db_path)
+        quick_est = estimate("cue_proposal", "heuristic", refine_drops=False, deep=False, db_path=db_path)
+
+        assert deep_est["sample_count"] == 1 and deep_est["avg_compute_seconds"] == pytest.approx(200.0)
+        assert quick_est["sample_count"] == 1 and quick_est["avg_compute_seconds"] == pytest.approx(1.0)
+
+    def test_entries_missing_compute_seconds_are_excluded_not_averaged_as_zero(
+        self, db_path, heuristic_key, track
+    ):
+        """A real gap this caught: fill_cache.py originally never passed
+        compute_seconds, and _run_analysis_job's beatgrid branch didn't
+        either -- both fixed, but the estimate query itself must also
+        never silently treat a missing value as 0s, which would make an
+        untimed batch look deceptively fast instead of just not counting."""
+        fp = fingerprint_track_analysis(track)
+        payload = {"positions": {}, "confidence": {}, "notes": []}
+        store_result(1, heuristic_key, fp, payload, db_path=db_path)  # no compute_seconds
+        store_result(2, heuristic_key, fp, payload, compute_seconds=50.0, db_path=db_path)
+
+        result = estimate("cue_proposal", "heuristic", refine_drops=True, deep=True, db_path=db_path)
+
+        assert result["sample_count"] == 1
+        assert result["avg_compute_seconds"] == pytest.approx(50.0)
+
+    def test_beatgrid_kind_uses_engine_n_a(self, db_path, track):
+        key = beatgrid_key(deep=True, tolerance_ms=30.0)
+        fp = fingerprint_beat_grid(None)
+        store_result(1, key, fp, {"status": "ok", "self_consistency": {}, "audio": None},
+                     compute_seconds=5.0, db_path=db_path)
+
+        result = estimate("beatgrid", "n/a", refine_drops=False, deep=True, db_path=db_path)
+
+        assert result["sample_count"] == 1
+        assert result["avg_compute_seconds"] == pytest.approx(5.0)

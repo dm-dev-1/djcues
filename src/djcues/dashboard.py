@@ -88,6 +88,29 @@ def render_dashboard_html(
         </div>
 
         <div id="action-flags" class="action-flags">
+          <p class="meta small">Pick a preset, or fine-tune the flags below directly:</p>
+          <div class="preset-row flags-propose-compare">
+            <button class="preset-btn" type="button" data-agentic="false" data-refine-drops="false" data-deep="false"
+              title="Local heuristic only -- no audio analysis, no API calls">Quick</button>
+            <button class="preset-btn" type="button" data-agentic="false" data-refine-drops="true" data-deep="false"
+              title="+ fast audio-based Drop/Breakdown/Special refinement">Refine Drops</button>
+            <button class="preset-btn" type="button" data-agentic="false" data-refine-drops="true" data-deep="true"
+              title="+ Demucs stem separation for a cleaner refinement signal -- the slowest local option">Deep Analysis</button>
+            <button class="preset-btn" type="button" data-agentic="true" data-refine-drops="false" data-deep="false"
+              title="LLM-based analysis instead of the heuristic -- costs API credits">Agentic</button>
+            <button class="preset-btn" type="button" data-agentic="true" data-refine-drops="true" data-deep="false"
+              title="LLM + fast audio refinement">Full Agentic</button>
+            <button class="preset-btn" type="button" data-agentic="true" data-refine-drops="true" data-deep="true"
+              title="LLM + Demucs refinement -- the slowest and most expensive option, but the most thorough">Full Agentic + Deep</button>
+          </div>
+          <div class="preset-row flags-beatgrid hidden">
+            <button class="preset-btn" type="button" data-beatgrid-deep="false"
+              title="Self-consistency check against rekordbox's own beat grid data only">Quick Check</button>
+            <button class="preset-btn" type="button" data-beatgrid-deep="true"
+              title="+ cross-check against the real audio file -- slower">Verify Audio</button>
+          </div>
+          <div id="estimate-display" class="meta small estimate-display"></div>
+
           <div class="flags-row flags-propose-compare">
             <label><input type="checkbox" id="flag-agentic"> Agentic</label>
             <label><input type="checkbox" id="flag-refine-drops"> Refine Drops</label>
@@ -246,6 +269,20 @@ _DASHBOARD_CSS = """
   .flags-row { display: flex; flex-wrap: wrap; gap: 16px; align-items: center; margin-bottom: 10px; font-size: 0.82rem; color: #ccc; }
   .flags-row label { display: flex; align-items: center; gap: 4px; }
 
+  .preset-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+  .preset-btn {
+    background: #1e1e3a;
+    color: #ccc;
+    border: 1px solid #2a2a3e;
+    border-radius: 4px;
+    padding: 6px 12px;
+    font-size: 0.8rem;
+    cursor: pointer;
+  }
+  .preset-btn:hover { border-color: #17a2b8; color: #fff; }
+  .preset-btn.active { background: #17a2b8; color: #fff; border-color: #17a2b8; }
+  .estimate-display { min-height: 1.3em; margin-bottom: 12px; }
+
   .launch-section { margin-top: 16px; padding: 16px; border-top: 1px solid #2a2a3e; }
   .launch-buttons { display: flex; gap: 8px; margin-top: 8px; }
 
@@ -292,6 +329,7 @@ const jobStatusEl = document.getElementById('job-status');
 const jobOutputWrapEl = document.getElementById('job-output-wrap');
 const jobOutputEl = document.getElementById('job-output');
 const jobHtmlFragmentEl = document.getElementById('job-html-fragment');
+const estimateDisplayEl = document.getElementById('estimate-display');
 
 let currentPlaylistId = null;
 let currentTracks = [];
@@ -299,6 +337,11 @@ let currentTrackId = null;
 let currentAction = 'propose';
 let pollTimer = null;
 let jobStartedAt = null;
+// Declared here, not inline near refreshEstimate() below, so it's
+// already initialized by the time updateActionFlags()'s own initial
+// call (which runs before this file's later `let` statements would
+// otherwise execute) reaches into refreshEstimate() for the first time.
+let estimateRequestId = 0;
 
 // --- Routing (landing / playlist / track, all reachable via browser
 // Back/Forward, a bookmark, or a page refresh -- not just forward-only
@@ -605,8 +648,81 @@ function updateActionFlags() {{
   const isBeatgrid = currentAction === 'beatgrid';
   document.querySelectorAll('.flags-propose-compare').forEach(el => el.classList.toggle('hidden', isBeatgrid));
   document.querySelectorAll('.flags-beatgrid').forEach(el => el.classList.toggle('hidden', !isBeatgrid));
+  refreshEstimate();
 }}
 updateActionFlags();
+
+// --- Presets + historical time/cost estimate -------------------------
+//
+// Presets are a fast path onto the same checkboxes below, not a
+// separate mechanism -- clicking one just sets flag-agentic/-refine-
+// drops/-deep (or flag-beatgrid-deep) and fires the run exactly like
+// hand-checking those boxes would. The estimate is real history from
+// this project's own analysis_cache (see analysis_cache.estimate() /
+// server.py's /api/estimate), not a hardcoded guess -- 0 prior runs of
+// a given combination shows honestly as "no data yet" rather than a
+// fabricated number.
+
+document.querySelectorAll('.preset-btn').forEach(btn => {{
+  btn.addEventListener('click', () => {{
+    if (btn.hasAttribute('data-beatgrid-deep')) {{
+      document.getElementById('flag-beatgrid-deep').checked = btn.getAttribute('data-beatgrid-deep') === 'true';
+    }} else {{
+      document.getElementById('flag-agentic').checked = btn.getAttribute('data-agentic') === 'true';
+      document.getElementById('flag-refine-drops').checked = btn.getAttribute('data-refine-drops') === 'true';
+      document.getElementById('flag-deep').checked = btn.getAttribute('data-deep') === 'true';
+    }}
+    btn.parentElement.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    refreshEstimate();
+  }});
+}});
+
+// A manual checkbox edit stops matching any one preset exactly -- clear
+// the highlight rather than leave it pointing at a now-stale combination.
+['flag-agentic', 'flag-refine-drops', 'flag-deep', 'flag-beatgrid-deep'].forEach(id => {{
+  document.getElementById(id).addEventListener('change', () => {{
+    document.querySelectorAll('.preset-btn.active').forEach(b => b.classList.remove('active'));
+    refreshEstimate();
+  }});
+}});
+
+function formatEstimate(est) {{
+  if (est.sample_count === 0) return 'No historical data yet for this combination.';
+  const parts = [];
+  if (est.avg_compute_seconds !== null) {{
+    const s = est.avg_compute_seconds;
+    parts.push(s < 90 ? Math.round(s) + 's' : (s / 60).toFixed(1) + 'min');
+  }}
+  if (est.avg_cost_usd) parts.push('$' + est.avg_cost_usd.toFixed(4));
+  const n = est.sample_count;
+  return '~' + parts.join(' \\u00b7 ') + ' (avg of ' + n + ' prior run' + (n === 1 ? '' : 's') + ')';
+}}
+
+// estimateRequestId (declared near the top, not here -- see its own
+// comment) guards against a slow, now-superseded request overwriting a
+// newer one's result -- rapid preset clicking fires overlapping fetches.
+async function refreshEstimate() {{
+  const isBeatgrid = currentAction === 'beatgrid';
+  const params = new URLSearchParams({{ kind: currentAction }});
+  if (isBeatgrid) {{
+    params.set('deep', document.getElementById('flag-beatgrid-deep').checked ? 'true' : 'false');
+  }} else {{
+    params.set('agentic', document.getElementById('flag-agentic').checked ? 'true' : 'false');
+    params.set('refine_drops', document.getElementById('flag-refine-drops').checked ? 'true' : 'false');
+    params.set('deep', document.getElementById('flag-deep').checked ? 'true' : 'false');
+  }}
+  const requestId = ++estimateRequestId;
+  estimateDisplayEl.textContent = 'Checking history\\u2026';
+  try {{
+    const est = await fetchJson('/api/estimate?' + params.toString());
+    if (requestId !== estimateRequestId) return;
+    estimateDisplayEl.textContent = formatEstimate(est);
+  }} catch (err) {{
+    if (requestId !== estimateRequestId) return;
+    estimateDisplayEl.textContent = '';
+  }}
+}}
 
 runBtn.addEventListener('click', async () => {{
   if (!currentTrackId) return;

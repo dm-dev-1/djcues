@@ -37,6 +37,18 @@ class TestRenderDashboardHtml:
         assert ".timeline-section" in result  # reused from viz._PAGE_CSS
         assert "loadPlaylists()" in result and "'/api/playlists'" in result  # JS (via the fetchJson() helper, not a bare fetch(...) call)
 
+    def test_analysis_presets_and_estimate_display_are_present(self):
+        """The preset picker (named shortcuts onto the same agentic/
+        refine-drops/deep checkboxes) and its cost/time estimate display,
+        backed by GET /api/estimate -- see analysis_cache.estimate()."""
+        result = render_dashboard_html()
+        for label in ("Quick", "Refine Drops", "Deep Analysis", "Agentic",
+                      "Full Agentic", "Full Agentic + Deep", "Quick Check", "Verify Audio"):
+            assert f">{label}<" in result
+        assert 'id="estimate-display"' in result
+        assert "function refreshEstimate" in result
+        assert "'/api/estimate?'" in result
+
     def test_never_embeds_a_server_url(self):
         # Same-origin like auth_web.py's page (served BY the local server
         # it talks to), unlike review.py's file://-opened page, which

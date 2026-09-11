@@ -307,6 +307,50 @@ def summary(db_path: Path | None = None) -> list[dict]:
         conn.close()
 
 
+def estimate(
+    analysis_kind: str,
+    engine: str = "n/a",
+    *,
+    refine_drops: bool = False,
+    deep: bool = False,
+    db_path: Path | None = None,
+) -> dict:
+    """Real historical average (compute_seconds, cost_usd) across every
+    cached run matching this (kind, engine, refine_drops, deep)
+    combination -- a data-driven "here's what this has actually cost so
+    far" for the dashboard's preset picker, not a hardcoded guess.
+
+    Deliberately does NOT also filter by provider/model/offset_bars/
+    loop_bars/skip_critic/tolerance_ms: those rarely vary in practice in
+    this project, and narrowing further would often leave too few
+    samples (or zero) to be a useful estimate. sample_count tells the
+    caller how much to trust the average -- 0 means genuinely no data
+    yet, not an error.
+    """
+    db_path = Path(db_path) if db_path else default_db_path()
+    if not db_path.exists():
+        return {"sample_count": 0, "avg_compute_seconds": None, "avg_cost_usd": None}
+    conn = _connect(db_path)
+    try:
+        row = conn.execute(
+            """
+            SELECT COUNT(*), AVG(compute_seconds), AVG(cost_usd)
+            FROM analysis_runs
+            WHERE analysis_kind = ? AND engine = ? AND refine_drops = ? AND deep = ?
+              AND compute_seconds IS NOT NULL
+            """,
+            (analysis_kind, engine, int(refine_drops), int(deep)),
+        ).fetchone()
+    finally:
+        conn.close()
+    count, avg_seconds, avg_cost = row
+    return {
+        "sample_count": count or 0,
+        "avg_compute_seconds": round(avg_seconds, 1) if avg_seconds is not None else None,
+        "avg_cost_usd": round(avg_cost, 4) if avg_cost is not None else None,
+    }
+
+
 def clear_all(db_path: Path | None = None) -> int:
     """Delete every cached entry. Returns the number of rows removed."""
     db_path = Path(db_path) if db_path else default_db_path()

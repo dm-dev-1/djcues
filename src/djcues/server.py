@@ -916,14 +916,17 @@ def _run_analysis_job(
 
                 if report is None:
                     cache_stats["misses"] += 1
+                    beatgrid_started = time_module.monotonic()
                     report = verify_beat_grid(
                         track, entries, force_deep=params["deep"],
                         audio_tolerance_ms=params["tolerance_ms"],
                     )
+                    beatgrid_elapsed = time_module.monotonic() - beatgrid_started
                     if not params["no_cache"]:
                         analysis_cache.store_result(
                             track.id, cache_key, fp, _shape_beatgrid_for_cache(report),
                             track_title=track.title, track_artist=track.artist,
+                            compute_seconds=beatgrid_elapsed,
                         )
 
                 _print_beatgrid_report(report)
@@ -989,6 +992,8 @@ class DashboardHandler(_LocalJsonHandler):
             self._serve_html()
         elif path == "/api/playlists":
             self._handle_playlists_get()
+        elif path == "/api/estimate":
+            self._handle_estimate_get()
         else:
             parts = [p for p in path.split("/") if p]
             if len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks":
@@ -1007,6 +1012,41 @@ class DashboardHandler(_LocalJsonHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _handle_estimate_get(self) -> None:
+        """Real historical time/cost for a given analysis configuration
+        (?kind=propose|compare|beatgrid&agentic=&refine_drops=&deep=),
+        so the dashboard's preset picker can show "here's roughly what
+        this has actually taken/cost so far" instead of the user having
+        to guess what each flag combination means before running it.
+        propose and compare share one cache namespace (analysis_kind
+        "cue_proposal") -- see _run_analysis_job, which caches both the
+        same way -- so both map there; beatgrid is the only other kind."""
+        from urllib.parse import parse_qs, urlsplit
+
+        from djcues import analysis_cache
+
+        query = parse_qs(urlsplit(self.path).query)
+
+        def _flag(name: str) -> bool:
+            return query.get(name, ["false"])[0] == "true"
+
+        kind = query.get("kind", [""])[0]
+        if kind not in ("propose", "compare", "beatgrid"):
+            self._send_json({"error": "kind must be propose, compare, or beatgrid"}, status=400)
+            return
+
+        if kind == "beatgrid":
+            analysis_kind, engine, refine_drops = "beatgrid", "n/a", False
+        else:
+            analysis_kind = "cue_proposal"
+            engine = "agentic" if _flag("agentic") else "heuristic"
+            refine_drops = _flag("refine_drops")
+
+        result = analysis_cache.estimate(
+            analysis_kind, engine, refine_drops=refine_drops, deep=_flag("deep"),
+        )
+        self._send_json(result)
 
     def _handle_playlists_get(self) -> None:
         from djcues.db import build_playlist_tree
