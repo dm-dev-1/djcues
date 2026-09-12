@@ -62,6 +62,18 @@ def test_save_then_load_config_roundtrip(tmp_path):
     assert auth.load_config(config_path) == {"provider": "anthropic", "model": "claude-haiku-4-5"}
 
 
+def test_device_key_survives_roundtrip_like_provider_and_model(tmp_path):
+    """load_config()/save_config() are generic, unfiltered dict I/O --
+    "device" (djcues.device's hardware preference, set via
+    `djcues auth device`) needs no special-casing to persist, exactly
+    like provider/model already don't."""
+    config_path = tmp_path / "config.json"
+    auth.save_config({"provider": "anthropic", "model": "claude-haiku-4-5", "device": "cuda"}, config_path)
+    assert auth.load_config(config_path) == {
+        "provider": "anthropic", "model": "claude-haiku-4-5", "device": "cuda",
+    }
+
+
 # --- API key storage (keyring, mocked) ------------------------------------
 
 

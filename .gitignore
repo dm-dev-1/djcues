@@ -13,6 +13,7 @@ wheels/
 htmlcov/
 # Virtual environments
 .venv
+.venv-directml
 
 # Superpowers brainstorm sessions
 .superpowers/

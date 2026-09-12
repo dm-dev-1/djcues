@@ -22,6 +22,7 @@ the free check.
 
 from __future__ import annotations
 
+import logging
 import statistics
 from typing import Any
 
@@ -55,8 +56,15 @@ _OCTAVE_RATIO_TOLERANCE = 0.15
 _MIN_BEATS_FOR_OCTAVE_CHECK = 8
 
 # Cached across calls so processing a whole playlist doesn't reload
-# model weights per track -- mirrors db.py's get_db() pattern.
+# model weights per track -- mirrors db.py's get_db() pattern. Unlike
+# demucs's apply_model() (drop_enhance.py), beat_this's Audio2Beats
+# bakes device into construction (Spect2Frames.__init__ -> self.device
+# -> load_model(..., self.device) -- confirmed by reading the installed
+# package), so switching devices means rebuilding the singleton, not
+# just passing a different kwarg per call -- hence tracking the device
+# it was built with alongside the tracker itself.
 _beat_tracker = None
+_beat_tracker_device = None
 
 
 def check_grid_self_consistency(
@@ -143,24 +151,47 @@ def check_grid_self_consistency(
     )
 
 
-def _get_beat_tracker() -> Any:
-    """Lazily construct and cache the real beat_this model. Live-only,
-    not unit-tested -- loads real model weights on first call."""
-    global _beat_tracker
-    if _beat_tracker is None:
+def _get_beat_tracker(device: str = "cpu") -> Any:
+    """Lazily construct and cache the real beat_this model, rebuilding
+    it if `device` differs from whatever it was last built with (see
+    the module-level comment on _beat_tracker for why that's necessary
+    here specifically, unlike drop_enhance.py's equivalent cache).
+    Live-only, not unit-tested for the "cpu, real weights" path --
+    loads real model weights on first call."""
+    global _beat_tracker, _beat_tracker_device
+    if _beat_tracker is None or _beat_tracker_device != device:
         from beat_this.inference import Audio2Beats
 
-        _beat_tracker = Audio2Beats(checkpoint_path="final0", device="cpu", dbn=False)
+        _beat_tracker = Audio2Beats(checkpoint_path="final0", device=device, dbn=False)
+        _beat_tracker_device = device
     return _beat_tracker
 
 
-def _run_beat_tracker(samples: Any, sr: int) -> list[float]:
+def _run_beat_tracker(samples: Any, sr: int, device: str = "cpu") -> list[float]:
     """Real beat_this inference against real audio samples. Live-only,
-    not unit-tested -- calls a real model (verified working this
-    session via direct testing, not assumed). Returns detected beat
-    times in milliseconds (beat_this's own native unit is seconds)."""
-    tracker = _get_beat_tracker()
-    beats, _downbeats = tracker(samples, sr)
+    not unit-tested for the "cpu, real weights" path -- calls a real
+    model (verified working this session via direct testing, not
+    assumed). Returns detected beat times in milliseconds (beat_this's
+    own native unit is seconds).
+
+    `device` defaults to "cpu" -- every existing caller that doesn't
+    pass it gets today's exact behavior, unchanged. A non-cpu device
+    that fails here retries once on cpu (rebuilding the tracker -- see
+    _get_beat_tracker()'s docstring for why that's costlier than
+    drop_enhance.py's equivalent retry); a cpu failure re-raises, since
+    there's nothing left to fall back to.
+    """
+    try:
+        tracker = _get_beat_tracker(device)
+        beats, _downbeats = tracker(samples, sr)
+    except Exception:
+        if device == "cpu":
+            raise
+        logging.getLogger(__name__).warning(
+            "beat_this failed on device=%r, retrying on cpu", device, exc_info=True
+        )
+        tracker = _get_beat_tracker("cpu")
+        beats, _downbeats = tracker(samples, sr)
     return [float(b) * 1000.0 for b in beats]
 
 
@@ -267,13 +298,17 @@ def verify_beat_grid_against_audio(
     samples: Any,
     sr: int,
     tolerance_ms: float = _DEFAULT_AUDIO_TOLERANCE_MS,
+    device: str = "cpu",
 ) -> AudioBeatVerification:
     """Real beat_this inference against real audio, compared to the
     track's stored BeatGrid. Live-only -- not unit-tested, calls a real
     model; see score_beat_alignment() for the testable comparison math
     this wraps.
+
+    `device` defaults to "cpu" -- every existing caller that doesn't
+    pass it gets today's exact behavior, unchanged.
     """
-    detected_ms = _run_beat_tracker(samples, sr)
+    detected_ms = _run_beat_tracker(samples, sr, device=device)
     return score_beat_alignment(detected_ms, track.beat_grid, tolerance_ms)
 
 
@@ -285,6 +320,7 @@ def verify_beat_grid(
     gap_error_tolerance_ms: float = _DEFAULT_GAP_ERROR_TOLERANCE_MS,
     drift_tolerance_ms: float = _DEFAULT_DRIFT_TOLERANCE_MS,
     audio_tolerance_ms: float = _DEFAULT_AUDIO_TOLERANCE_MS,
+    device: str = "cpu",
 ) -> BeatGridReport:
     """Top-level orchestration: always run the free self-consistency
     check first; only escalate to real audio analysis (needing the
@@ -350,9 +386,24 @@ def verify_beat_grid(
             status="decode_failed",
         )
 
-    audio_result = verify_beat_grid_against_audio(
-        track, loaded.samples, loaded.sr, audio_tolerance_ms
-    )
+    try:
+        audio_result = verify_beat_grid_against_audio(
+            track, loaded.samples, loaded.sr, audio_tolerance_ms, device=device
+        )
+    except ImportError:
+        # Pre-existing gap, fixed here: load_audio() above only needs the
+        # `audio` extra and can succeed while beat_this (the `ml` extra)
+        # is still missing -- this call is the first point that actually
+        # needs it, and was previously unguarded, crashing the whole
+        # `beatgrid` command with a raw ImportError instead of degrading
+        # like every other missing-capability case in this function does.
+        return BeatGridReport(
+            track_id=track.id,
+            title=track.title,
+            self_consistency=self_consistency,
+            audio=None,
+            status="ml_extra_missing",
+        )
     status = "ok" if audio_result.verdict == "consistent" else "flagged"
     return BeatGridReport(
         track_id=track.id,

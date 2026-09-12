@@ -839,6 +839,7 @@ def _run_analysis_job(
         _print_proposal,
         _print_refinement_summary,
         _rehydrate_beatgrid,
+        _resolve_device_for_run,
         _shape_beatgrid_for_cache,
     )
     from djcues.providers import estimate_cost
@@ -859,6 +860,16 @@ def _run_analysis_job(
         track = db_module.load_track(content, db=dedicated_db)
 
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+            # Resolved once per job, before any analysis -- matches
+            # cli.py's own "once per run" contract for
+            # _resolve_device_for_run (see its docstring). Inside the
+            # redirect context so a fallback warning (click.echo(err=True))
+            # lands in output_text for free, same as any other message
+            # this job prints. Unconditional, matching beatgrid's own CLI
+            # behavior -- escalation to real audio is data-dependent, not
+            # predictable from params alone before the job runs.
+            resolved_device = _resolve_device_for_run(params.get("device"))
+
             if params["kind"] in ("propose", "compare"):
                 proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
                     params["agentic"], params["provider"], params["model"],
@@ -866,7 +877,7 @@ def _run_analysis_job(
                 )
                 proposer, refinement_log = _apply_refine_drops(
                     proposer, params["refine_drops"], params["deep"],
-                    params["offset_bars"], params["loop_bars"],
+                    params["offset_bars"], params["loop_bars"], device=resolved_device,
                 )
                 cache_key = analysis_cache.cue_proposal_key(
                     agentic=params["agentic"], provider=resolved_provider, model=resolved_model,
@@ -878,6 +889,7 @@ def _run_analysis_job(
                     proposer, cache_key, params["offset_bars"], params["loop_bars"],
                     params["no_cache"], refinement_log=refinement_log,
                     telemetry_list=telemetry_list, resolved_model=resolved_model,
+                    device=resolved_device,
                 )
                 proposal = proposer(track)
 
@@ -919,14 +931,14 @@ def _run_analysis_job(
                     beatgrid_started = time_module.monotonic()
                     report = verify_beat_grid(
                         track, entries, force_deep=params["deep"],
-                        audio_tolerance_ms=params["tolerance_ms"],
+                        audio_tolerance_ms=params["tolerance_ms"], device=resolved_device,
                     )
                     beatgrid_elapsed = time_module.monotonic() - beatgrid_started
                     if not params["no_cache"]:
                         analysis_cache.store_result(
                             track.id, cache_key, fp, _shape_beatgrid_for_cache(report),
                             track_title=track.title, track_artist=track.artist,
-                            compute_seconds=beatgrid_elapsed,
+                            compute_seconds=beatgrid_elapsed, device=resolved_device,
                         )
 
                 _print_beatgrid_report(report)
@@ -994,6 +1006,8 @@ class DashboardHandler(_LocalJsonHandler):
             self._handle_playlists_get()
         elif path == "/api/estimate":
             self._handle_estimate_get()
+        elif path == "/api/devices":
+            self._handle_devices_get()
         else:
             parts = [p for p in path.split("/") if p]
             if len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks":
@@ -1015,13 +1029,19 @@ class DashboardHandler(_LocalJsonHandler):
 
     def _handle_estimate_get(self) -> None:
         """Real historical time/cost for a given analysis configuration
-        (?kind=propose|compare|beatgrid&agentic=&refine_drops=&deep=),
+        (?kind=propose|compare|beatgrid&agentic=&refine_drops=&deep=&device=),
         so the dashboard's preset picker can show "here's roughly what
         this has actually taken/cost so far" instead of the user having
         to guess what each flag combination means before running it.
         propose and compare share one cache namespace (analysis_kind
         "cue_proposal") -- see _run_analysis_job, which caches both the
-        same way -- so both map there; beatgrid is the only other kind."""
+        same way -- so both map there; beatgrid is the only other kind.
+
+        `device` is optional -- omitted (the common case), the estimate
+        averages across every device that's ever computed this
+        combination; passed, it narrows to just that device's own
+        average (e.g. a real "cpu: ~150s" vs "cuda: ~20s" comparison,
+        once both have real data)."""
         from urllib.parse import parse_qs, urlsplit
 
         from djcues import analysis_cache
@@ -1043,10 +1063,47 @@ class DashboardHandler(_LocalJsonHandler):
             engine = "agentic" if _flag("agentic") else "heuristic"
             refine_drops = _flag("refine_drops")
 
+        device = query.get("device", [None])[0]
         result = analysis_cache.estimate(
-            analysis_kind, engine, refine_drops=refine_drops, deep=_flag("deep"),
+            analysis_kind, engine, refine_drops=refine_drops, deep=_flag("deep"), device=device,
         )
         self._send_json(result)
+
+    def _handle_devices_get(self) -> None:
+        """What device(s) are actually available right now, plus the
+        persisted preference -- same ~/.djcues/config.json the CLI's
+        `djcues auth device` reads/writes, so the dashboard is never a
+        second source of truth for this setting."""
+        from djcues.auth import load_config
+        from djcues.device import list_available_backends
+
+        available = [
+            {"device": p.device, "ok": p.ok, "error": p.error}
+            for p in list_available_backends()
+        ]
+        self._send_json({"available": available, "configured": load_config().get("device", "auto")})
+
+    def _handle_devices_post(self) -> None:
+        """Persist a new device preference -- validated against
+        VALID_PREFERENCES only (not probed here); a preference that
+        turns out unusable when a job actually runs degrades via the
+        same resolve_device() fallback every other caller goes through,
+        it doesn't get a special "reject at save time" error here --
+        matching djcues auth device's own "save anyway" allowance for
+        exactly this case."""
+        from djcues.auth import load_config, save_config
+        from djcues.device import VALID_PREFERENCES
+
+        body = self._read_body()
+        device = body.get("device")
+        if device not in VALID_PREFERENCES:
+            self._send_json({"error": f"device must be one of {VALID_PREFERENCES}"}, status=400)
+            return
+
+        config = load_config()
+        config["device"] = device
+        save_config(config)
+        self._send_json({"ok": True, "device": device})
 
     def _handle_playlists_get(self) -> None:
         from djcues.db import build_playlist_tree
@@ -1130,11 +1187,14 @@ class DashboardHandler(_LocalJsonHandler):
             self._handle_job_post(parts[2])
         elif len(parts) == 5 and parts[0:2] == ["api", "tracks"] and parts[3] == "launch":
             self._handle_launch_post(parts[2], parts[4])
+        elif path == "/api/devices":
+            self._handle_devices_post()
         else:
             self._send_json({"error": "not found"}, status=404)
 
     def _handle_job_post(self, track_id: str) -> None:
         from djcues.cli import _check_refine_drops_available
+        from djcues.device import VALID_PREFERENCES
 
         body = self._read_body()
         kind = body.get("kind")
@@ -1154,6 +1214,11 @@ class DashboardHandler(_LocalJsonHandler):
                     self._send_json({"error": err}, status=400)
                     return
 
+        device = body.get("device") or None
+        if device is not None and device not in VALID_PREFERENCES:
+            self._send_json({"error": f"device must be one of {VALID_PREFERENCES}"}, status=400)
+            return
+
         params = {
             "kind": kind,
             "agentic": bool(body.get("agentic", False)),
@@ -1162,6 +1227,7 @@ class DashboardHandler(_LocalJsonHandler):
             "skip_critic": bool(body.get("skip_critic", False)),
             "refine_drops": refine_drops,
             "deep": deep,
+            "device": device,
             "offset_bars": int(body.get("offset_bars", 16)),
             "loop_bars": int(body.get("loop_bars", 4)),
             "no_cache": bool(body.get("no_cache", False)),

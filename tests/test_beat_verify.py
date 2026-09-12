@@ -1,5 +1,6 @@
 import pytest
 
+from djcues import beat_verify
 from djcues.beat_verify import (
     check_grid_self_consistency,
     score_beat_alignment,
@@ -324,6 +325,124 @@ def test_verify_beat_grid_decode_failure_reports_decode_failed(grid: BeatGrid, t
 
     assert report.status == "decode_failed"
     assert report.audio is None
+
+
+@requires_audio
+def test_verify_beat_grid_ml_extra_missing_reports_status_not_crash(monkeypatch, grid: BeatGrid, tmp_path):
+    """The pre-existing gap fixed alongside device support: load_audio()
+    only needs djcues[audio] and can succeed while beat_this (djcues[ml])
+    is still missing -- verify_beat_grid_against_audio is the first call
+    that actually needs it, and was previously unguarded, crashing the
+    whole beatgrid command with a raw ImportError instead of degrading
+    like every other missing-capability case in this function does.
+    Mocking the ImportError directly (rather than requiring a machine
+    without djcues[ml] installed) means this test exercises the real
+    scenario regardless of what's actually installed here."""
+    import numpy as np
+    import soundfile as sf
+
+    audio_path = tmp_path / "track.wav"
+    sf.write(audio_path, np.zeros(2205, dtype=np.float32), 22050)
+    track = Track(
+        id=42, title="Test", artist="Test", bpm=grid.bpm, duration_ms=200_000.0,
+        analysis_path="", cues=[], phrases=[], beat_grid=grid, audio_path=str(audio_path),
+    )
+
+    def _raise_import_error(*args, **kwargs):
+        raise ImportError("beat_this not installed")
+
+    monkeypatch.setattr(beat_verify, "verify_beat_grid_against_audio", _raise_import_error)
+
+    entries = _constant_tempo_entries(bpm=128.0, count=20)
+    report = verify_beat_grid(track, raw_entries=entries, force_deep=True)
+
+    assert report.status == "ml_extra_missing"
+    assert report.audio is None
+
+
+# --- device selection: _get_beat_tracker/_run_beat_tracker ----------------
+#
+# Real beat_this.inference import (needs djcues[ml]) but Audio2Beats
+# itself replaced with a lightweight fake, so these stay fast/isolated
+# from real model loading, unlike the smoke test below which is
+# deliberately end-to-end real.
+
+
+@requires_ml
+def test_get_beat_tracker_rebuilds_on_device_change(monkeypatch):
+    """Unlike drop_enhance.py's _get_stem_separator (demucs places the
+    model per-call via apply_model's own device= arg), beat_this's
+    Audio2Beats bakes device into construction -- confirmed by reading
+    the installed package. Switching devices must rebuild the cached
+    singleton, not silently keep serving a tracker built for a
+    different device."""
+    monkeypatch.setattr(beat_verify, "_beat_tracker", None)
+    monkeypatch.setattr(beat_verify, "_beat_tracker_device", None)
+
+    built_with = []
+
+    class _FakeTracker:
+        def __init__(self, checkpoint_path, device, dbn):
+            built_with.append(device)
+
+    monkeypatch.setattr("beat_this.inference.Audio2Beats", _FakeTracker)
+
+    t1 = beat_verify._get_beat_tracker("cpu")
+    t2 = beat_verify._get_beat_tracker("cpu")  # same device -> reused, not rebuilt
+    t3 = beat_verify._get_beat_tracker("cuda")  # different device -> rebuilt
+
+    assert built_with == ["cpu", "cuda"]
+    assert t1 is t2
+    assert t1 is not t3
+
+
+@requires_ml
+def test_run_beat_tracker_retries_on_cpu_when_non_cpu_device_fails(monkeypatch):
+    """The concrete "Layer 2" defense-in-depth guarantee, beat_this's
+    side: a device that passed its startup probe can still fail on a
+    specific call later -- must retry once on cpu rather than losing
+    beat-grid audio verification for that track entirely."""
+    monkeypatch.setattr(beat_verify, "_beat_tracker", None)
+    monkeypatch.setattr(beat_verify, "_beat_tracker_device", None)
+
+    calls = []
+
+    class _FakeTracker:
+        def __init__(self, checkpoint_path, device, dbn):
+            self.device = device
+
+        def __call__(self, samples, sr):
+            calls.append(self.device)
+            if self.device != "cpu":
+                raise RuntimeError("simulated GPU failure")
+            return [0.5, 1.0], [0.5]
+
+    monkeypatch.setattr("beat_this.inference.Audio2Beats", _FakeTracker)
+
+    result = beat_verify._run_beat_tracker(samples=None, sr=22050, device="cuda")
+
+    assert calls == ["cuda", "cpu"]  # first attempt on cuda, retried (rebuilt) on cpu
+    assert result == [500.0, 1000.0]  # beat_this's seconds -> this codebase's ms
+
+
+@requires_ml
+def test_run_beat_tracker_cpu_failure_reraises_not_infinite_loop(monkeypatch):
+    """Nothing left to fall back to once cpu itself fails -- must
+    re-raise, not loop or swallow the error silently."""
+    monkeypatch.setattr(beat_verify, "_beat_tracker", None)
+    monkeypatch.setattr(beat_verify, "_beat_tracker_device", None)
+
+    class _AlwaysFails:
+        def __init__(self, checkpoint_path, device, dbn):
+            pass
+
+        def __call__(self, samples, sr):
+            raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("beat_this.inference.Audio2Beats", _AlwaysFails)
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        beat_verify._run_beat_tracker(samples=None, sr=22050, device="cpu")
 
 
 # --- real model inference (live-only) -------------------------------------

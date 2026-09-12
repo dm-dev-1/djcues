@@ -49,6 +49,18 @@ class TestRenderDashboardHtml:
         assert "function refreshEstimate" in result
         assert "'/api/estimate?'" in result
 
+    def test_device_selector_is_present(self):
+        """Reads/writes ~/.djcues/config.json via GET/POST /api/devices --
+        the same config djcues.auth's CLI commands use, not a separate
+        dashboard-only setting."""
+        result = render_dashboard_html()
+        assert 'id="flag-device"' in result
+        for value in ("auto", "cpu", "cuda", "directml"):
+            assert f'value="{value}"' in result
+        assert 'id="device-status"' in result
+        assert "function loadDevices" in result
+        assert "'/api/devices'" in result
+
     def test_never_embeds_a_server_url(self):
         # Same-origin like auth_web.py's page (served BY the local server
         # it talks to), unlike review.py's file://-opened page, which

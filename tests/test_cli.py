@@ -145,6 +145,95 @@ def test_resolve_agentic_provider_explicit_args_override_config():
         assert model == "explicit-model"
 
 
+# --- _resolve_device_for_run: mirrors the _resolve_agentic_provider trio
+# above exactly -- same arg > config > default precedence shape, applied
+# to the device preference instead of provider/model. resolve_device()
+# itself is mocked throughout (not relying on this test machine's real
+# cpu-only/no-directml environment) so these test precedence and
+# argument-passing, independent of what's actually installed. ----------
+
+
+def test_resolve_device_for_run_returns_configured_value():
+    from djcues.cli import _resolve_device_for_run
+    from djcues.device import ResolvedDevice
+
+    fake_result = ResolvedDevice(requested="cpu", active="cpu", fell_back=False, reason=None, torch_device=None)
+    with patch("djcues.auth.load_config", return_value={"device": "cpu"}), \
+         patch("djcues.device.resolve_device", return_value=fake_result) as mock_resolve:
+        result = _resolve_device_for_run(None)
+        assert result == "cpu"
+        mock_resolve.assert_called_once_with("cpu")
+
+
+def test_resolve_device_for_run_explicit_arg_overrides_config():
+    from djcues.cli import _resolve_device_for_run
+    from djcues.device import ResolvedDevice
+
+    fake_result = ResolvedDevice(requested="directml", active="directml", fell_back=False, reason=None, torch_device=None)
+    with patch("djcues.auth.load_config", return_value={"device": "cpu"}), \
+         patch("djcues.device.resolve_device", return_value=fake_result) as mock_resolve:
+        result = _resolve_device_for_run("directml")
+        assert result == "directml"
+        mock_resolve.assert_called_once_with("directml")
+
+
+def test_resolve_device_for_run_defaults_to_auto_when_unconfigured():
+    from djcues.cli import _resolve_device_for_run
+    from djcues.device import ResolvedDevice
+
+    fake_result = ResolvedDevice(requested="auto", active="cpu", fell_back=False, reason="no accelerator available", torch_device=None)
+    with patch("djcues.auth.load_config", return_value={}), \
+         patch("djcues.device.resolve_device", return_value=fake_result) as mock_resolve:
+        result = _resolve_device_for_run(None)
+        assert result == "cpu"
+        mock_resolve.assert_called_once_with("auto")
+
+
+def test_resolve_device_for_run_warns_on_fallback_and_returns_active_device(capsys):
+    """The one-time fallback warning users actually see -- confirms both
+    the returned device (cpu, the safe fallback) and that the warning
+    text names the reason, not just a generic failure message."""
+    from djcues.cli import _resolve_device_for_run
+    from djcues.device import ResolvedDevice
+
+    fake_result = ResolvedDevice(requested="cuda", active="cpu", fell_back=True, reason="no GPU found", torch_device=None)
+    with patch("djcues.auth.load_config", return_value={}), \
+         patch("djcues.device.resolve_device", return_value=fake_result):
+        result = _resolve_device_for_run("cuda")
+
+    assert result == "cpu"
+    captured = capsys.readouterr()
+    assert "Warning" in captured.err
+    assert "no GPU found" in captured.err
+
+
+def test_resolve_device_for_run_silent_on_success(capsys):
+    from djcues.cli import _resolve_device_for_run
+    from djcues.device import ResolvedDevice
+
+    fake_result = ResolvedDevice(requested="cpu", active="cpu", fell_back=False, reason=None, torch_device=None)
+    with patch("djcues.auth.load_config", return_value={}), \
+         patch("djcues.device.resolve_device", return_value=fake_result):
+        _resolve_device_for_run("cpu")
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_resolve_device_for_run_handles_torch_not_installed(capsys):
+    """beatgrid calls this unconditionally, with no upfront capability
+    gate the way propose/compare/review have via
+    _check_refine_drops_available -- must not raise a raw ImportError
+    if torch genuinely isn't installed, just degrade to cpu."""
+    from djcues.cli import _resolve_device_for_run
+
+    with patch("djcues.auth.load_config", return_value={}), \
+         patch("djcues.device.resolve_device", side_effect=ImportError("no torch")):
+        result = _resolve_device_for_run(None)
+
+    assert result == "cpu"
+
+
 # ---------------------------------------------------------------------------
 # propose
 # ---------------------------------------------------------------------------
@@ -241,7 +330,7 @@ class TestPropose:
             offset_ms=200.0, strength=2.0, source="full_mix", note="test",
         )
 
-        def fake_enhance(proposal, t, offset, loop_bars, deep=False):
+        def fake_enhance(proposal, t, offset, loop_bars, deep=False, device="cpu"):
             return proposal, [fake_refinement]
 
         with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
@@ -252,6 +341,38 @@ class TestPropose:
         assert "1 cue(s) checked against real audio" in result.output
         assert "1 refined" in result.output
         assert "1.0s -> 1.2s" in result.output
+
+    def test_deep_with_unavailable_device_warns_and_still_completes(self, runner: CliRunner, track: Track):
+        """The end-to-end "no regression" guarantee at the CLI level:
+        an unavailable --device must never crash the run -- it warns
+        once and completes using the resolved (cpu) fallback, which
+        this test confirms actually reaches enhance_proposal_drops."""
+        from djcues.device import ResolvedDevice
+        from djcues.models import DropRefinement
+
+        fake_refinement = DropRefinement(
+            pad="D", outcome="confirmed", original_ms=1000.0, refined_ms=1000.0,
+            offset_ms=0.0, strength=1.0, source="stems", note="test",
+        )
+        seen_devices = []
+
+        def fake_enhance(proposal, t, offset, loop_bars, deep=False, device="cpu"):
+            seen_devices.append(device)
+            return proposal, [fake_refinement]
+
+        fake_result = ResolvedDevice(requested="cuda", active="cpu", fell_back=True, reason="no GPU found", torch_device=None)
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.drop_enhance.enhance_proposal_drops", side_effect=fake_enhance), \
+             patch("djcues.device.resolve_device", return_value=fake_result):
+            result = runner.invoke(
+                cli, ["propose", "Test Playlist", "Test Track", "--refine-drops", "--deep", "--device", "cuda"]
+            )
+
+        assert result.exit_code == 0, result.output
+        assert "Warning: device 'cuda' isn't usable right now" in result.output
+        assert "no GPU found" in result.output
+        assert seen_devices == ["cpu"]  # the resolved fallback, not the requested "cuda"
 
     def test_refine_drops_without_librosa_errors(self, runner: CliRunner, track: Track):
         with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
@@ -1013,12 +1134,102 @@ class TestAuthSet:
         assert "could not validate key" in result.output
 
 
+class TestAuthDevice:
+    """Mirrors TestAuthSet's own conventions -- prompt/flag -> live
+    probe/validate -> persist, just for the device preference instead
+    of provider/model. resolve_device()/list_available_backends() are
+    always mocked here, matching test_resolve_device_for_run's own
+    reasoning: these tests exercise auth_device's own logic (probe
+    display, confirm-on-fallback, persistence), independent of what
+    this particular machine actually has installed."""
+
+    @staticmethod
+    def _fake_probes():
+        from djcues.device import DeviceProbeResult
+        return [
+            DeviceProbeResult("cpu", ok=True, error=None),
+            DeviceProbeResult("cuda", ok=False, error="no GPU found"),
+            DeviceProbeResult("directml", ok=False, error="not installed"),
+        ]
+
+    def test_happy_path_saves_config_no_confirmation_needed(self, runner: CliRunner):
+        from djcues.device import ResolvedDevice
+
+        fake_result = ResolvedDevice(requested="cpu", active="cpu", fell_back=False, reason=None, torch_device=None)
+        saved_config = {}
+        with patch("djcues.device.list_available_backends", return_value=self._fake_probes()), \
+             patch("djcues.device.resolve_device", return_value=fake_result), \
+             patch("djcues.auth.load_config", return_value={}), \
+             patch("djcues.auth.save_config", side_effect=saved_config.update):
+            result = runner.invoke(cli, ["auth", "device", "--device", "cpu"])
+
+        assert result.exit_code == 0, result.output
+        assert saved_config["device"] == "cpu"
+        assert "passed a live smoke test" in result.output
+        assert "Saved. Device preference: cpu." in result.output
+
+    def test_fallback_prompts_and_saves_on_confirm(self, runner: CliRunner):
+        from djcues.device import ResolvedDevice
+
+        fake_result = ResolvedDevice(requested="cuda", active="cpu", fell_back=True, reason="no GPU found", torch_device=None)
+        saved_config = {}
+        with patch("djcues.device.list_available_backends", return_value=self._fake_probes()), \
+             patch("djcues.device.resolve_device", return_value=fake_result), \
+             patch("djcues.auth.load_config", return_value={}), \
+             patch("djcues.auth.save_config", side_effect=saved_config.update):
+            result = runner.invoke(cli, ["auth", "device", "--device", "cuda"], input="y\n")
+
+        assert result.exit_code == 0, result.output
+        assert saved_config["device"] == "cuda"
+        assert "isn't usable right now" in result.output
+        assert "no GPU found" in result.output
+
+    def test_fallback_declined_aborts_without_saving(self, runner: CliRunner):
+        from djcues.device import ResolvedDevice
+
+        fake_result = ResolvedDevice(requested="cuda", active="cpu", fell_back=True, reason="no GPU found", torch_device=None)
+        with patch("djcues.device.list_available_backends", return_value=self._fake_probes()), \
+             patch("djcues.device.resolve_device", return_value=fake_result), \
+             patch("djcues.auth.load_config", return_value={}), \
+             patch("djcues.auth.save_config") as mock_save:
+            result = runner.invoke(cli, ["auth", "device", "--device", "cuda"], input="n\n")
+
+        assert result.exit_code == 1
+        mock_save.assert_not_called()
+
+    def test_lists_every_probed_backend(self, runner: CliRunner):
+        from djcues.device import ResolvedDevice
+
+        fake_result = ResolvedDevice(requested="cpu", active="cpu", fell_back=False, reason=None, torch_device=None)
+        with patch("djcues.device.list_available_backends", return_value=self._fake_probes()), \
+             patch("djcues.device.resolve_device", return_value=fake_result), \
+             patch("djcues.auth.load_config", return_value={}), \
+             patch("djcues.auth.save_config"):
+            result = runner.invoke(cli, ["auth", "device", "--device", "cpu"])
+
+        assert "cpu: OK" in result.output
+        assert "cuda: unavailable (no GPU found)" in result.output
+        assert "directml: unavailable (not installed)" in result.output
+
+
 class TestAuthStatus:
     def test_not_configured(self, runner: CliRunner):
         with patch("djcues.auth.load_config", return_value={}):
             result = runner.invoke(cli, ["auth", "status"])
         assert result.exit_code == 0
         assert "No agentic provider configured" in result.output
+
+    def test_shows_device_default_when_unconfigured(self, runner: CliRunner):
+        with patch("djcues.auth.load_config", return_value={}):
+            result = runner.invoke(cli, ["auth", "status"])
+        assert result.exit_code == 0
+        assert "Device: auto" in result.output
+
+    def test_shows_configured_device(self, runner: CliRunner):
+        with patch("djcues.auth.load_config", return_value={"device": "cuda"}):
+            result = runner.invoke(cli, ["auth", "status"])
+        assert result.exit_code == 0
+        assert "Device: cuda" in result.output
 
     def test_configured_with_key(self, runner: CliRunner):
         with patch("djcues.auth.load_config", return_value={"provider": "anthropic", "model": "claude-x"}), \

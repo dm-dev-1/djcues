@@ -247,7 +247,44 @@ def _check_refine_drops_available(deep: bool) -> str | None:
     return None
 
 
-def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars):
+def _resolve_device_for_run(device_arg: str | None) -> str:
+    """--device arg > configured preference > 'auto', validated via a
+    real smoke test (djcues.device.resolve_device) with automatic CPU
+    fallback -- never raises on an unavailable device, matching this
+    feature's "gracefully degrade, never crash a run" requirement.
+    Echoes a one-time warning to stderr when a fallback happens; a
+    successful resolution (including auto's normal "no accelerator,
+    using cpu" case) is silent. Returns the concrete device string to
+    actually use.
+
+    Safe to call even when torch isn't installed at all -- unlike
+    resolve_device() itself (which assumes torch is importable),
+    this wrapper catches that case too and returns "cpu" silently.
+    Necessary because not every caller has an upfront capability gate
+    the way propose/compare/review do via _check_refine_drops_available:
+    beatgrid calls this unconditionally (its escalation to real audio
+    is data-dependent per track, so it can't gate on --deep the way
+    the others gate on refine_drops), so this must degrade gracefully
+    on its own rather than assume torch already works.
+    """
+    from djcues.auth import load_config
+    from djcues.device import resolve_device  # zero-dependency import, safe unconditionally
+
+    preference = device_arg or load_config().get("device", "auto")
+    try:
+        result = resolve_device(preference)  # this is what actually needs torch
+    except ImportError:
+        return "cpu"
+    if result.fell_back:
+        click.echo(
+            f"Warning: device '{preference}' isn't usable right now "
+            f"({result.reason}) -- using cpu for this run.",
+            err=True,
+        )
+    return result.active
+
+
+def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars, device="cpu"):
     """Wrap a proposer(track) -> CueProposal callable so it also
     refines D/E/F against real audio afterward, when --refine-drops is
     set -- composes with either the heuristic or --agentic proposer
@@ -255,6 +292,11 @@ def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars):
     vs. heuristic behind one callable. Returns (proposer, refinement_log)
     where refinement_log is None when --refine-drops wasn't requested,
     else a list of (track, list[DropRefinement]) accumulated per call.
+
+    `device` is only meaningful when `deep=True` (passed straight
+    through to enhance_proposal_drops/separate_stems); ignored
+    otherwise. Defaults to "cpu" -- a caller that doesn't resolve a
+    device via _resolve_device_for_run() gets today's exact behavior.
     """
     if not refine_drops:
         return proposer, None
@@ -266,7 +308,7 @@ def _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars):
     def wrapped(track):
         proposal = proposer(track)
         refined, refinements = enhance_proposal_drops(
-            proposal, track, offset, loop_bars, deep=deep
+            proposal, track, offset, loop_bars, deep=deep, device=device
         )
         refinement_log.append((track, refinements))
         return refined
@@ -313,7 +355,7 @@ def _rehydrate_proposal(result, track, offset, loop_bars):
 
 
 def _apply_cache(proposer, cache_key, offset, loop_bars, no_cache,
-                  refinement_log=None, telemetry_list=None, resolved_model=None):
+                  refinement_log=None, telemetry_list=None, resolved_model=None, device="cpu"):
     """Wraps proposer(track) -> CueProposal so a cache hit (matching
     track_id + cache_key, with an unchanged input fingerprint) short-
     circuits the real call and rehydrates an equivalent CueProposal
@@ -379,7 +421,7 @@ def _apply_cache(proposer, cache_key, offset, loop_bars, no_cache,
             analysis_cache.store_result(
                 track.id, cache_key, fp, _shape_proposal_for_cache(proposal, refinements),
                 track_title=track.title, track_artist=track.artist,
-                cost_usd=cost, compute_seconds=elapsed,
+                cost_usd=cost, compute_seconds=elapsed, device=device,
             )
         except Exception as e:
             _warn_once(e)
@@ -585,8 +627,9 @@ def cli():
 @click.option("--estimate-only", is_flag=True, help="Print an estimated --agentic cost and exit without calling the model.")
 @click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
 @click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
+@click.option("--device", default=None, type=click.Choice(["auto", "cpu", "cuda", "directml"]), help="Hardware device for --deep. Defaults to your configured preference (djcues auth device).")
 @click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
-def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, estimate_only, refine_drops, deep, no_cache):
+def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, estimate_only, refine_drops, deep, device, no_cache):
     """Propose cue placements for tracks in a playlist."""
     if estimate_only and not agentic:
         click.echo("Error: --estimate-only only applies with --agentic.", err=True)
@@ -599,6 +642,7 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         if err:
             click.echo(err, err=True)
             raise SystemExit(1)
+    resolved_device = _resolve_device_for_run(device) if deep else "cpu"
 
     playlist = find_playlist(playlist_name)
     if playlist is None:
@@ -628,7 +672,9 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
-    proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
+    proposer, refinement_log = _apply_refine_drops(
+        proposer, refine_drops, deep, offset, loop_bars, device=resolved_device
+    )
     cache_key = analysis_cache.cue_proposal_key(
         agentic=agentic, provider=resolved_provider, model=resolved_model,
         skip_critic=skip_critic, refine_drops=refine_drops, deep=deep,
@@ -637,6 +683,7 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     proposer, cache_stats = _apply_cache(
         proposer, cache_key, offset, loop_bars, no_cache,
         refinement_log=refinement_log, telemetry_list=telemetry_list, resolved_model=resolved_model,
+        device=resolved_device,
     )
 
     analyzed = 0
@@ -667,8 +714,9 @@ def propose(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
 @click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
 @click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
 @click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
+@click.option("--device", default=None, type=click.Choice(["auto", "cpu", "cuda", "directml"]), help="Hardware device for --deep. Defaults to your configured preference (djcues auth device).")
 @click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
-def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, refine_drops, deep, no_cache):
+def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, provider, model, skip_critic, refine_drops, deep, device, no_cache):
     """Compare existing cues with proposed placements."""
     if deep and not refine_drops:
         click.echo("Error: --deep only applies with --refine-drops.", err=True)
@@ -678,6 +726,7 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
         if err:
             click.echo(err, err=True)
             raise SystemExit(1)
+    resolved_device = _resolve_device_for_run(device) if deep else "cpu"
 
     playlist = find_playlist(playlist_name)
     if playlist is None:
@@ -692,7 +741,9 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
-    proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
+    proposer, refinement_log = _apply_refine_drops(
+        proposer, refine_drops, deep, offset, loop_bars, device=resolved_device
+    )
     cache_key = analysis_cache.cue_proposal_key(
         agentic=agentic, provider=resolved_provider, model=resolved_model,
         skip_critic=skip_critic, refine_drops=refine_drops, deep=deep,
@@ -701,6 +752,7 @@ def compare(playlist_name, track_name, all_tracks, offset, loop_bars, agentic, p
     proposer, cache_stats = _apply_cache(
         proposer, cache_key, offset, loop_bars, no_cache,
         refinement_log=refinement_log, telemetry_list=telemetry_list, resolved_model=resolved_model,
+        device=resolved_device,
     )
 
     if all_tracks:
@@ -842,8 +894,9 @@ def viz(playlist, track_name, all_tracks, compare_mode, offset, loop_bars, outpu
 @click.option("--skip-critic", is_flag=True, help="Skip the --agentic critic pass (3 calls/track instead of 4).")
 @click.option("--refine-drops", is_flag=True, help="Refine Drop/Breakdown/Special cue positions against the real audio file (needs djcues[audio]).")
 @click.option("--deep", is_flag=True, help="With --refine-drops, also run Demucs source separation for a cleaner signal (needs djcues[ml], ~7-12 min/track CPU).")
+@click.option("--device", default=None, type=click.Choice(["auto", "cpu", "cuda", "directml"]), help="Hardware device for --deep. Defaults to your configured preference (djcues auth device).")
 @click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
-def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic, provider, model, skip_critic, refine_drops, deep, no_cache):
+def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic, provider, model, skip_critic, refine_drops, deep, device, no_cache):
     """Launch interactive review session in browser."""
     import pathlib
     import time
@@ -859,6 +912,7 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
         if err:
             click.echo(err, err=True)
             raise SystemExit(1)
+    resolved_device = _resolve_device_for_run(device) if deep else "cpu"
 
     pl = find_playlist(playlist)
     if pl is None:
@@ -873,7 +927,9 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
     proposer, telemetry_list, resolved_model, resolved_provider = _get_proposer(
         agentic, provider, model, offset, loop_bars, skip_critic
     )
-    proposer, refinement_log = _apply_refine_drops(proposer, refine_drops, deep, offset, loop_bars)
+    proposer, refinement_log = _apply_refine_drops(
+        proposer, refine_drops, deep, offset, loop_bars, device=resolved_device
+    )
     cache_key = analysis_cache.cue_proposal_key(
         agentic=agentic, provider=resolved_provider, model=resolved_model,
         skip_critic=skip_critic, refine_drops=refine_drops, deep=deep,
@@ -882,6 +938,7 @@ def review(playlist, track_name, all_tracks, offset, loop_bars, output, agentic,
     proposer, cache_stats = _apply_cache(
         proposer, cache_key, offset, loop_bars, no_cache,
         refinement_log=refinement_log, telemetry_list=telemetry_list, resolved_model=resolved_model,
+        device=resolved_device,
     )
 
     if all_tracks:
@@ -1187,8 +1244,9 @@ def _print_beatgrid_summary(reports) -> None:
 @click.option("--all", "all_tracks", is_flag=True, help="Check all tracks in the playlist.")
 @click.option("--deep", is_flag=True, help="Force real audio-based verification even when the free check already looks fine.")
 @click.option("--tolerance-ms", default=30.0, show_default=True, help="Audio-based drift tolerance in ms.")
+@click.option("--device", default=None, type=click.Choice(["auto", "cpu", "cuda", "directml"]), help="Hardware device for real audio-based verification. Defaults to your configured preference (djcues auth device).")
 @click.option("--no-cache", is_flag=True, help="Recompute even if a cached result exists; the fresh result still refreshes the cache.")
-def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms, no_cache):
+def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms, device, no_cache):
     """Verify Rekordbox's stored beat grid is still trustworthy.
 
     Always runs a free, audio-independent self-consistency check first
@@ -1222,6 +1280,12 @@ def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms, no_cache
         click.echo("Error: provide a track name or use --all.", err=True)
         raise SystemExit(1)
 
+    # Unconditional, unlike propose/compare/review gating on --deep:
+    # escalation to real audio here is data-dependent per track (the
+    # free self-consistency check decides), not predictable before the
+    # loop starts, so --device is meaningful even without --deep.
+    resolved_device = _resolve_device_for_run(device)
+
     cache_key = analysis_cache.beatgrid_key(deep=deep, tolerance_ms=tolerance_ms)
     cache_stats = {"hits": 0, "misses": 0}
     cache_warned = False
@@ -1249,12 +1313,17 @@ def beatgrid(playlist_name, track_name, all_tracks, deep, tolerance_ms, no_cache
 
         if report is None:
             cache_stats["misses"] += 1
-            report = verify_beat_grid(t, entries, force_deep=deep, audio_tolerance_ms=tolerance_ms)
+            beatgrid_started = time.monotonic()
+            report = verify_beat_grid(
+                t, entries, force_deep=deep, audio_tolerance_ms=tolerance_ms, device=resolved_device
+            )
+            beatgrid_elapsed = time.monotonic() - beatgrid_started
             if not no_cache:
                 try:
                     analysis_cache.store_result(
                         t.id, cache_key, fp, _shape_beatgrid_for_cache(report),
                         track_title=t.title, track_artist=t.artist,
+                        compute_seconds=beatgrid_elapsed, device=resolved_device,
                     )
                 except Exception as e:
                     if not cache_warned:
@@ -1356,12 +1425,53 @@ def auth_set(provider):
     )
 
 
+@auth.command("device")
+@click.option(
+    "--device", "device_pref",
+    type=click.Choice(["auto", "cpu", "cuda", "directml"]),
+    prompt=True,
+    help="Which device preference to configure.",
+)
+def auth_device(device_pref):
+    """Configure which hardware device runs --deep/beatgrid analysis, with a live smoke test.
+
+    Nothing secret here (unlike `auth set`) and validation is a local,
+    sub-second smoke test rather than a network round-trip -- no
+    browser wizard twin, unlike `auth set`/`auth web`.
+    """
+    from djcues.auth import load_config, save_config
+    from djcues.device import list_available_backends, resolve_device
+
+    click.echo("Probing available devices...")
+    for probe in list_available_backends():
+        status = "OK" if probe.ok else f"unavailable ({probe.error})"
+        click.echo(f"  {probe.device}: {status}")
+
+    result = resolve_device(device_pref, force_recheck=True)
+    if result.fell_back:
+        click.echo(
+            f"\nWarning: '{device_pref}' isn't usable right now ({result.reason}) "
+            f"-- djcues would fall back to cpu automatically during a real run."
+        )
+        if not click.confirm("Save this preference anyway?"):
+            raise SystemExit(1)
+    else:
+        click.echo(f"\n'{device_pref}' resolved to '{result.active}' and passed a live smoke test.")
+
+    config = load_config()
+    config["device"] = device_pref
+    save_config(config)
+    click.echo(f"Saved. Device preference: {device_pref}.")
+
+
 @auth.command("status")
 def auth_status():
-    """Show the configured provider/model and where the key came from (never the key itself)."""
+    """Show the configured provider/model/device and where the key came from (never the key itself)."""
     from djcues.auth import load_config, resolve_api_key
 
     config = load_config()
+    click.echo(f"Device: {config.get('device', 'auto')}")
+
     provider = config.get("provider")
     model = config.get("model")
     if not provider:

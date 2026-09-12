@@ -1359,6 +1359,44 @@ class TestDashboardHandlerJobs:
         assert status == 400
         assert "djcues[audio]" in data["error"]
 
+    def test_invalid_device_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        status, data = _post(
+            base_url + f"/api/tracks/{track_id}/jobs", {"kind": "propose", "device": "quantum"}
+        )
+
+        assert status == 400
+        assert "device must be one of" in data["error"]
+
+    def test_device_fallback_warning_reaches_job_output(self, dashboard_server):
+        """Confirms _resolve_device_for_run actually runs inside
+        _run_analysis_job's redirect_stdout/stderr context, the way
+        server.py's own comment claims -- a fallback warning must reach
+        output_text for free, not get silently dropped."""
+        from djcues.device import ResolvedDevice
+        from djcues.models import CueProposal
+
+        base_url, _server = dashboard_server
+        track_id = self._tech_house_track_id(base_url)
+
+        def fake_get_proposer(*args, **kwargs):
+            def proposer(track):
+                return CueProposal(track=track, hot_cues=[], memory_cues=[], confidence={}, notes=[])
+            return proposer, None, None, None
+
+        fake_result = ResolvedDevice(requested="cuda", active="cpu", fell_back=True, reason="no GPU found", torch_device=None)
+        with patch("djcues.cli._get_proposer", side_effect=fake_get_proposer), \
+             patch("djcues.device.resolve_device", return_value=fake_result):
+            job = self._run_job_to_completion(
+                base_url, track_id, {"kind": "propose", "device": "cuda"}
+            )
+
+        assert job["status"] == "done"
+        assert "isn't usable right now" in job["output_text"]
+        assert "no GPU found" in job["output_text"]
+
 
 @requires_rekordbox
 class TestDashboardEstimateEndpoint:
@@ -1441,6 +1479,77 @@ class TestDashboardEstimateEndpoint:
         assert status == 200
         assert data["sample_count"] == 1
         assert data["avg_compute_seconds"] == pytest.approx(3.0)
+
+
+@requires_rekordbox
+class TestDashboardDevicesEndpoint:
+    """GET/POST /api/devices -- reads/writes the same ~/.djcues/config.json
+    the CLI's `djcues auth device` does, isolated from the real file via
+    monkeypatching auth.default_config_path, exactly matching
+    TestSettingsEndpoint's own established pattern for
+    settings.default_settings_path."""
+
+    @staticmethod
+    def _isolate_config(monkeypatch, tmp_path):
+        from djcues import auth as auth_module
+        config_path = tmp_path / "config.json"
+        monkeypatch.setattr(auth_module, "default_config_path", lambda: config_path)
+        return config_path
+
+    def test_get_defaults_to_auto_when_unconfigured(self, dashboard_server, tmp_path, monkeypatch):
+        self._isolate_config(monkeypatch, tmp_path)
+        base_url, _server = dashboard_server
+
+        status, data = _get(base_url + "/api/devices")
+
+        assert status == 200
+        assert data["configured"] == "auto"
+        assert [d["device"] for d in data["available"]] == ["cpu", "cuda", "directml"]
+        assert data["available"][0] == {"device": "cpu", "ok": True, "error": None}
+
+    def test_get_reflects_previously_saved_preference(self, dashboard_server, tmp_path, monkeypatch):
+        config_path = self._isolate_config(monkeypatch, tmp_path)
+        config_path.write_text('{"device": "cuda"}', encoding="utf-8")
+        base_url, _server = dashboard_server
+
+        status, data = _get(base_url + "/api/devices")
+
+        assert status == 200
+        assert data["configured"] == "cuda"
+
+    def test_post_saves_preference(self, dashboard_server, tmp_path, monkeypatch):
+        config_path = self._isolate_config(monkeypatch, tmp_path)
+        base_url, _server = dashboard_server
+
+        status, data = _post(base_url + "/api/devices", {"device": "directml"})
+
+        assert status == 200
+        assert data == {"ok": True, "device": "directml"}
+        assert json.loads(config_path.read_text(encoding="utf-8"))["device"] == "directml"
+
+    def test_post_preserves_other_config_keys(self, dashboard_server, tmp_path, monkeypatch):
+        """save_config()/load_config() are generic dict I/O with no
+        filtering (see auth.py) -- confirms _handle_devices_post
+        actually reads-then-writes rather than clobbering the whole
+        file, the same way auth_device's own CLI command does."""
+        config_path = self._isolate_config(monkeypatch, tmp_path)
+        config_path.write_text('{"provider": "anthropic", "model": "claude-x"}', encoding="utf-8")
+        base_url, _server = dashboard_server
+
+        _post(base_url + "/api/devices", {"device": "cpu"})
+
+        saved = json.loads(config_path.read_text(encoding="utf-8"))
+        assert saved == {"provider": "anthropic", "model": "claude-x", "device": "cpu"}
+
+    def test_post_invalid_device_is_400_and_does_not_save(self, dashboard_server, tmp_path, monkeypatch):
+        config_path = self._isolate_config(monkeypatch, tmp_path)
+        base_url, _server = dashboard_server
+
+        status, data = _post(base_url + "/api/devices", {"device": "quantum"})
+
+        assert status == 400
+        assert "device must be one of" in data["error"]
+        assert not config_path.exists()
 
 
 @requires_rekordbox

@@ -111,6 +111,18 @@ def render_dashboard_html(
           </div>
           <div id="estimate-display" class="meta small estimate-display"></div>
 
+          <div class="flags-row device-row">
+            <label>Device
+              <select id="flag-device">
+                <option value="auto">Auto</option>
+                <option value="cpu">CPU</option>
+                <option value="cuda">CUDA (NVIDIA)</option>
+                <option value="directml">DirectML (AMD / Intel iGPU)</option>
+              </select>
+            </label>
+            <span id="device-status" class="meta small device-status"></span>
+          </div>
+
           <div class="flags-row flags-propose-compare">
             <label><input type="checkbox" id="flag-agentic"> Agentic</label>
             <label><input type="checkbox" id="flag-refine-drops"> Refine Drops</label>
@@ -283,6 +295,18 @@ _DASHBOARD_CSS = """
   .preset-btn.active { background: #17a2b8; color: #fff; border-color: #17a2b8; }
   .estimate-display { min-height: 1.3em; margin-bottom: 12px; }
 
+  .device-row { margin-bottom: 14px; padding-bottom: 14px; border-bottom: 1px solid #2a2a3e; }
+  #flag-device {
+    background: #1e1e3a;
+    color: #eee;
+    border: 1px solid #2a2a3e;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font-size: 0.82rem;
+  }
+  .device-status { margin-left: 4px; }
+  .device-status.warn { color: #e0a030; }
+
   .launch-section { margin-top: 16px; padding: 16px; border-top: 1px solid #2a2a3e; }
   .launch-buttons { display: flex; gap: 8px; margin-top: 8px; }
 
@@ -330,6 +354,8 @@ const jobOutputWrapEl = document.getElementById('job-output-wrap');
 const jobOutputEl = document.getElementById('job-output');
 const jobHtmlFragmentEl = document.getElementById('job-html-fragment');
 const estimateDisplayEl = document.getElementById('estimate-display');
+const flagDeviceEl = document.getElementById('flag-device');
+const deviceStatusEl = document.getElementById('device-status');
 
 let currentPlaylistId = null;
 let currentTracks = [];
@@ -724,6 +750,55 @@ async function refreshEstimate() {{
   }}
 }}
 
+// --- Device selection -------------------------------------------------
+//
+// Reads/writes the same ~/.djcues/config.json the CLI's `djcues auth
+// device` does (via GET/POST /api/devices), not a separate dashboard-
+// only setting -- one source of truth. Device applies to both propose/
+// compare and beatgrid, so this control lives outside the tab-specific
+// flag rows (see updateActionFlags()) and is never hidden.
+
+let deviceProbes = [];  // cached from the one /api/devices GET on load;
+// availability is real-time hardware state, doesn't change based on
+// what the user picks, so this isn't re-fetched on every selection.
+
+function updateDeviceStatus(configured) {{
+  const entry = deviceProbes.find(d => d.device === configured);
+  if (!entry || configured === 'auto' || entry.ok) {{
+    deviceStatusEl.textContent = '';
+    deviceStatusEl.className = 'meta small device-status';
+    return;
+  }}
+  deviceStatusEl.textContent = '⚠ ' + entry.error;
+  deviceStatusEl.className = 'meta small device-status warn';
+}}
+
+async function loadDevices() {{
+  try {{
+    const data = await fetchJson('/api/devices');
+    deviceProbes = data.available;
+    flagDeviceEl.value = data.configured;
+    updateDeviceStatus(data.configured);
+  }} catch (err) {{
+    deviceStatusEl.textContent = '';
+  }}
+}}
+
+flagDeviceEl.addEventListener('change', async () => {{
+  const chosen = flagDeviceEl.value;
+  updateDeviceStatus(chosen);
+  try {{
+    await fetchJson('/api/devices', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ device: chosen }}),
+    }});
+  }} catch (err) {{
+    deviceStatusEl.textContent = '⚠ ' + friendlyErrorMessage(err);
+    deviceStatusEl.className = 'meta small device-status warn';
+  }}
+}});
+
 runBtn.addEventListener('click', async () => {{
   if (!currentTrackId) return;
 
@@ -732,6 +807,7 @@ runBtn.addEventListener('click', async () => {{
     body = {{
       kind: 'beatgrid',
       deep: document.getElementById('flag-beatgrid-deep').checked,
+      device: document.getElementById('flag-device').value,
       no_cache: document.getElementById('flag-beatgrid-no-cache').checked,
       tolerance_ms: parseFloat(document.getElementById('flag-tolerance').value) || 30.0,
     }};
@@ -752,6 +828,7 @@ runBtn.addEventListener('click', async () => {{
       skip_critic: document.getElementById('flag-skip-critic').checked,
       refine_drops: refineDropsChecked,
       deep: deepChecked,
+      device: document.getElementById('flag-device').value,
       offset_bars: parseInt(document.getElementById('flag-offset').value, 10) || {default_offset},
       loop_bars: parseInt(document.getElementById('flag-loop-bars').value, 10) || {default_loop_bars},
       no_cache: document.getElementById('flag-no-cache').checked,
@@ -861,6 +938,7 @@ async function launchTool(tool) {{
 // `djcues dashboard "Playlist Name"` argument) is defined -- see the
 // bottom of render_dashboard_html()'s <script> block.
 async function initDashboard() {{
+  await loadDevices();
   await loadPlaylists();
 
   const urlState = urlToState();

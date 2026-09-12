@@ -64,6 +64,34 @@ ml = [
     "beat-this>=1.1",
     "demucs>=4.1",
 ]
+# Optional: DirectML backend detection for AMD/Intel iGPU on Windows.
+# Standalone, not folded into `ml` -- torch-directml hard-pins an exact
+# torch version (confirmed live: 0.2.5.dev240914 requires torch==2.4.1,
+# which would downgrade whatever demucs/beat-this's own unpinned torch
+# resolution installed), and can only be installed under Python
+# 3.8-3.12 (confirmed live against PyPI, 2026-09-11: no build exists for
+# 3.13+; djcues's own `requires-python = ">=3.10"` above is otherwise
+# unaffected -- only this specific extra needs an older interpreter).
+#
+# IMPORTANT, confirmed live in a separate Python 3.12 verification venv
+# (2026-09-12): installing this and selecting --device directml will
+# NEVER actually accelerate djcues's analysis. The device itself is
+# real and works for ordinary tensor math (verified on real Intel Iris
+# Xe Graphics hardware), but both of djcues's ML models -- htdemucs
+# (drop_enhance.py) and beat_this's LogMelSpect frontend
+# (beat_verify.py) -- depend on STFT/complex-tensor operations that
+# DirectML has no support for, and crash with a native, unrecoverable
+# process abort ("Invalid or unsupported data type ComplexFloat") the
+# instant they're routed through it -- not a catchable Python exception,
+# so no retry-on-cpu fallback can save it. djcues.device._probe_directml
+# knows this and always reports ok=False for this reason, permanently
+# keeping resolve_device() from ever selecting it for real work. This
+# extra exists purely so `djcues auth device`/the dashboard can show an
+# accurate "torch_directml installed, hardware detected, but
+# incompatible with djcues's models" message instead of a generic
+# "not installed" one -- it is not a path to real AMD/Intel
+# acceleration today.
+directml = ["torch-directml"]
 
 [project.urls]
 Homepage = "https://github.com/mcroydon/djcues"

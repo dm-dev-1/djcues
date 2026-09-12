@@ -33,6 +33,7 @@ consistent instead of being hand-rolled a third time.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import numpy as np
@@ -281,7 +282,7 @@ def _get_stem_separator() -> Any:
     return _stem_separator
 
 
-def separate_stems(samples: np.ndarray, sr: int) -> dict[str, np.ndarray]:
+def separate_stems(samples: np.ndarray, sr: int, device: str = "cpu") -> dict[str, np.ndarray]:
     """Real Demucs source separation -- isolates drums/bass/other/vocals
     from a mono mix. Live-only, covered only by a requires_ml smoke
     test; the underlying get_model()/apply_model() call was confirmed
@@ -299,6 +300,16 @@ def separate_stems(samples: np.ndarray, sr: int) -> dict[str, np.ndarray]:
     contract). ~1.6-1.7s of CPU wall-clock per second of audio on the
     machine this was measured on -- not fast, only called from
     enhance_proposal_drops when --deep is explicitly passed.
+
+    `device` defaults to "cpu" -- every existing caller that doesn't
+    pass it gets today's exact behavior, unchanged. apply_model()
+    itself handles `.to(device)` internally (confirmed by reading
+    demucs's own source); _get_stem_separator()'s cache needs no
+    device-awareness since placement happens per-call, not at
+    model-load time. A non-cpu device that fails here retries once on
+    cpu (see djcues.device's module docstring for the two-layer
+    fallback design this is "Layer 2" of) -- a cpu failure re-raises,
+    since there's nothing left to fall back to.
     """
     import librosa
     import torch
@@ -316,7 +327,15 @@ def separate_stems(samples: np.ndarray, sr: int) -> dict[str, np.ndarray]:
     mix = torch.from_numpy(stereo).unsqueeze(0)
 
     with torch.no_grad():
-        out = apply_model(model, mix, device="cpu", progress=False, shifts=0)
+        try:
+            out = apply_model(model, mix, device=device, progress=False, shifts=0)
+        except Exception:
+            if device == "cpu":
+                raise
+            logging.getLogger(__name__).warning(
+                "Demucs failed on device=%r, retrying on cpu", device, exc_info=True
+            )
+            out = apply_model(model, mix, device="cpu", progress=False, shifts=0)
 
     stems: dict[str, np.ndarray] = {}
     for i, name in enumerate(model.sources):
@@ -335,11 +354,17 @@ def enhance_proposal_drops(
     memory_offset_bars: int,
     loop_length_bars: int,
     deep: bool = False,
+    device: str = "cpu",
 ) -> tuple[CueProposal, list[DropRefinement]]:
     """Refine the D (Drop), E (Breakdown), and F (Special) cues of an
     already-built proposal against the track's real audio -- D/F look
     for a dominant energy rise, E for a dominant energy dip, via
     refine_drop_position()/refine_breakdown_position() respectively.
+
+    `device` is only meaningful when `deep=True` (passed straight through
+    to separate_stems()); ignored otherwise. See djcues.device.resolve_device()
+    for how a caller should arrive at a `device` value -- this function
+    itself does no resolution or validation, just uses whatever it's given.
 
     Degrades to a no-op (the original proposal, empty refinement list)
     whenever real audio isn't actually available for this specific
@@ -367,7 +392,7 @@ def enhance_proposal_drops(
     source = "full_mix"
     if deep:
         try:
-            stems = separate_stems(loaded.samples, loaded.sr)
+            stems = separate_stems(loaded.samples, loaded.sr, device=device)
             analysis_samples = stems["bass"] + stems["drums"]
             source = "stems"
         except Exception:

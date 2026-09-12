@@ -180,8 +180,12 @@ djcues review "Playlist Name" --all --refine-drops
 
 # --deep additionally runs Demucs source separation for a cleaner bass/drums
 # signal before refining -- meaningfully slower (~7-12 minutes per track on
-# CPU), so use it sparingly, on 1-2 tracks at a time
+# CPU; see --device below to use a GPU instead), so use it sparingly,
+# on 1-2 tracks at a time
 djcues propose "Playlist Name" "Track Name" --refine-drops --deep
+
+# Configure which hardware device runs --deep/beatgrid analysis, with a live smoke test
+djcues auth device --device cuda
 ```
 
 `beatgrid` always runs a free, audio-independent self-consistency check first (no extra install needed) using rekordbox's own full per-beat grid data, and only escalates to real audio when that check looks suspicious or `--deep` forces it. `--refine-drops` never does an independent redetection — it only looks for a dominant energy transition (a rise for Drop/Special, a dip for Breakdown) in a bounded window around the position the heuristic (or `--agentic`) already proposed, and only moves the cue when the audio evidence is clearly dominant; otherwise it leaves the existing position untouched and says so in the notes. Neither feature ever writes to rekordbox — same read-only guarantee as every other command until `apply`.
@@ -189,6 +193,15 @@ djcues propose "Playlist Name" "Track Name" --refine-drops --deep
 Every cue `--refine-drops` actually moves gets an extra diagnostic hint in the output — `energy pattern: oscillating` (the energy swings back within a beat or two, more likely a false positive) or `stable` (the new position holds steady, more likely a genuine improvement). This is an unverified heuristic, not a verdict — checked against real tracks but not proven reliable — meant to help you prioritize which moved cues are most worth a quick listen, not to replace listening.
 
 Install with `pip install djcues[audio]` for `--refine-drops` (needs `librosa`/`soundfile`), or `djcues[ml]` for `--deep` and `beatgrid --deep` (adds `beat-this` and `demucs`, which pull in `torch` — a large, platform-specific download, hundreds of MB+).
+
+#### Hardware acceleration (`--device`)
+
+`--deep` and `beatgrid` default to CPU, but accept `--device auto|cpu|cuda|directml` (or a persistent default via `djcues auth device`, same precedence as `--provider`/`--model`: flag > configured preference > `auto`). `auto` tries CUDA then DirectML and falls back to CPU automatically; an explicit choice that turns out unavailable also falls back to CPU with a one-time warning rather than failing the run — CPU always works.
+
+- **NVIDIA (CUDA)**: needs a CUDA-enabled torch build, which `pip install djcues[ml]` alone does not provide (CUDA wheels live on a separate index, not PyPI). If `torch.cuda.is_available()` is `False` after installing djcues, reinstall torch by following [pytorch.org/get-started/locally](https://pytorch.org/get-started/locally/) for your CUDA version, in the same environment.
+- **AMD and Intel iGPU (DirectML, Windows only)**: detected but never used for real analysis, permanently -- `--device directml` always falls back to CPU with a clear message. This isn't a "not implemented yet"; it's confirmed live (a separate Python 3.12 environment, real Intel Iris Xe Graphics hardware) that DirectML itself works fine for ordinary tensor math, but both of djcues's actual models (Demucs, beat_this) depend on STFT/complex-number operations that DirectML cannot run -- they crash the whole process outright rather than raising a normal error, so no fallback logic could safely use this backend even if djcues tried. `cpu`/`cuda`/`auto` are fully working. If you install the `directml` extra anyway (needs Python 3.10-3.12 -- `torch-directml` has no build for 3.13+), `djcues auth device`/the dashboard will show real detected hardware info alongside this same explanation, rather than a generic "not installed" message.
+
+Run `djcues auth device --device <choice>` any time to see what's actually detected on your machine and confirm your preference passes a real smoke test before saving it.
 
 ## How It Works
 

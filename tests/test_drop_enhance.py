@@ -340,6 +340,66 @@ def test_separate_stems_runs_real_demucs_and_returns_four_stems():
         assert not np.isnan(arr).any()
 
 
+# --- separate_stems: device fallback -- real torch/demucs.apply import
+# (needs djcues[ml]), but apply_model itself mocked so this stays fast
+# and isolated from real inference/model-download, unlike the smoke
+# test above which is deliberately end-to-end real. ----------------------
+
+
+@requires_ml
+def test_separate_stems_retries_on_cpu_when_non_cpu_device_fails(monkeypatch):
+    """The concrete "Layer 2" defense-in-depth guarantee: a device that
+    passed its startup probe can still fail on a specific call later
+    (VRAM exhaustion, driver hiccup) -- separate_stems must retry once
+    on cpu rather than losing stem-separated analysis for that track."""
+    import torch
+
+    sr = 22050
+    n = 4410
+    mono = np.zeros(n, dtype=np.float32)
+
+    fake_model = type("FakeModel", (), {"samplerate": sr, "sources": ["drums", "bass", "other", "vocals"]})()
+    monkeypatch.setattr(drop_enhance, "_get_stem_separator", lambda: fake_model)
+
+    fake_output = torch.zeros(1, 4, 2, n)
+    calls = []
+
+    def _fake_apply_model(model, mix, device, **kwargs):
+        calls.append(device)
+        if device != "cpu":
+            raise RuntimeError("simulated GPU failure")
+        return fake_output
+
+    monkeypatch.setattr("demucs.apply.apply_model", _fake_apply_model)
+
+    stems = drop_enhance.separate_stems(mono, sr, device="cuda")
+
+    assert calls == ["cuda", "cpu"]  # first attempt on cuda, retried on cpu
+    assert set(stems.keys()) == {"drums", "bass", "other", "vocals"}
+
+
+@requires_ml
+def test_separate_stems_cpu_failure_reraises_not_infinite_loop(monkeypatch):
+    """Nothing left to fall back to once cpu itself fails -- must
+    re-raise (letting enhance_proposal_drops's own outer fallback to
+    full_mix handle it), not loop or swallow the error silently."""
+    fake_model = type("FakeModel", (), {"samplerate": 22050, "sources": ["drums", "bass", "other", "vocals"]})()
+    monkeypatch.setattr(drop_enhance, "_get_stem_separator", lambda: fake_model)
+
+    calls = []
+
+    def _always_fails(model, mix, device, **kwargs):
+        calls.append(device)
+        raise RuntimeError("simulated failure")
+
+    monkeypatch.setattr("demucs.apply.apply_model", _always_fails)
+
+    with pytest.raises(RuntimeError, match="simulated failure"):
+        drop_enhance.separate_stems(np.zeros(4410, dtype=np.float32), 22050, device="cpu")
+
+    assert calls == ["cpu"]  # exactly one attempt, no retry-of-a-retry
+
+
 # --- enhance_proposal_drops: orchestration, monkeypatched, no real dependency ---
 
 
@@ -556,8 +616,8 @@ def test_enhance_proposal_drops_deep_uses_stems_and_falls_back_on_failure(monkey
     # Deep path succeeds -> source should be "stems"
     monkeypatch.setattr(
         drop_enhance, "separate_stems",
-        lambda samples, sr: {"bass": np.full(1000, 2.0, dtype=np.float32),
-                               "drums": np.full(1000, 3.0, dtype=np.float32)},
+        lambda samples, sr, device="cpu": {"bass": np.full(1000, 2.0, dtype=np.float32),
+                                             "drums": np.full(1000, 3.0, dtype=np.float32)},
     )
     enhance_proposal_drops(proposal, track, 16, 4, deep=True)
     assert seen_sources == ["stems"]
@@ -565,7 +625,7 @@ def test_enhance_proposal_drops_deep_uses_stems_and_falls_back_on_failure(monkey
     # Deep path raises -> must fall back to full_mix, not crash the run
     seen_sources.clear()
 
-    def _raise(samples, sr):
+    def _raise(samples, sr, device="cpu"):
         raise RuntimeError("demucs blew up")
 
     monkeypatch.setattr(drop_enhance, "separate_stems", _raise)

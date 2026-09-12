@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     cost_usd REAL,
     compute_seconds REAL,
     source TEXT NOT NULL DEFAULT 'cli',
+    device TEXT NOT NULL DEFAULT 'cpu',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     UNIQUE(track_id, analysis_kind, engine, provider, model, skip_critic,
@@ -72,6 +73,18 @@ def default_db_path() -> Path:
 def _connect(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.executescript(_SCHEMA)
+    # Additive migration for a database created before "device" existed
+    # (CREATE TABLE IF NOT EXISTS above is a no-op against an existing
+    # table, so a pre-existing db needs this separately). No IF NOT
+    # EXISTS for ADD COLUMN in sqlite -- the standard idiom is to just
+    # attempt it and swallow the "duplicate column" failure, which is
+    # exactly what happens harmlessly here on every db that already has
+    # it (including, ordinarily, every brand-new one created moments
+    # ago by the CREATE TABLE above).
+    try:
+        conn.execute("ALTER TABLE analysis_runs ADD COLUMN device TEXT NOT NULL DEFAULT 'cpu'")
+    except sqlite3.OperationalError:
+        pass
     return conn
 
 
@@ -238,11 +251,22 @@ def store_result(
     cost_usd: float | None = None,
     compute_seconds: float | None = None,
     source: str = "cli",
+    device: str = "cpu",
     db_path: Path | None = None,
 ) -> None:
     """Upsert one cache entry. Uses ON CONFLICT ... DO UPDATE rather
     than history.py's INSERT OR REPLACE, which deletes+reinserts and
-    would reset created_at on every refresh instead of preserving it."""
+    would reset created_at on every refresh instead of preserving it.
+
+    `device` is informational only (which hardware actually computed
+    this particular row, for estimate()'s optional per-device
+    breakdown) -- deliberately NOT part of the UNIQUE constraint or any
+    lookup key: a cache hit is the same result regardless of which
+    device computed it, by this feature's own design (see the project
+    plan), so a track already cached under cpu still hits on a later
+    cuda run of the identical analysis, and vice versa -- this column
+    just records which one happened to write the row last.
+    """
     db_path = Path(db_path) if db_path else default_db_path()
     conn = _connect(db_path)
     now = datetime.now().replace(microsecond=0).isoformat()
@@ -253,9 +277,9 @@ def store_result(
                 track_id, track_title, track_artist, analysis_kind, engine,
                 provider, model, skip_critic, refine_drops, deep,
                 offset_bars, loop_bars, tolerance_ms, input_fingerprint,
-                result_json, cost_usd, compute_seconds, source,
+                result_json, cost_usd, compute_seconds, source, device,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(track_id, analysis_kind, engine, provider, model,
                         skip_critic, refine_drops, deep, offset_bars,
                         loop_bars, tolerance_ms)
@@ -267,6 +291,7 @@ def store_result(
                 cost_usd = excluded.cost_usd,
                 compute_seconds = excluded.compute_seconds,
                 source = excluded.source,
+                device = excluded.device,
                 updated_at = excluded.updated_at
             """,
             (
@@ -274,7 +299,7 @@ def store_result(
                 key.provider, key.model, int(key.skip_critic), int(key.refine_drops),
                 int(key.deep), key.offset_bars, key.loop_bars, key.tolerance_ms,
                 input_fingerprint, json.dumps(result), cost_usd, compute_seconds,
-                source, now, now,
+                source, device, now, now,
             ),
         )
         conn.commit()
@@ -313,6 +338,7 @@ def estimate(
     *,
     refine_drops: bool = False,
     deep: bool = False,
+    device: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
     """Real historical average (compute_seconds, cost_usd) across every
@@ -326,21 +352,31 @@ def estimate(
     samples (or zero) to be a useful estimate. sample_count tells the
     caller how much to trust the average -- 0 means genuinely no data
     yet, not an error.
+
+    `device`, when given, additionally filters to rows computed on that
+    specific device (e.g. "cpu" vs "cuda" averages, kept separate) --
+    optional and off by default, since most callers just want "how long
+    does this take on average" regardless of hardware. Unlike every
+    other filter here, this one is NOT part of the cache-hit lookup
+    itself (get_cached()/the UNIQUE constraint) -- it only narrows this
+    reporting query.
     """
     db_path = Path(db_path) if db_path else default_db_path()
     if not db_path.exists():
         return {"sample_count": 0, "avg_compute_seconds": None, "avg_cost_usd": None}
     conn = _connect(db_path)
     try:
-        row = conn.execute(
-            """
+        query = """
             SELECT COUNT(*), AVG(compute_seconds), AVG(cost_usd)
             FROM analysis_runs
             WHERE analysis_kind = ? AND engine = ? AND refine_drops = ? AND deep = ?
               AND compute_seconds IS NOT NULL
-            """,
-            (analysis_kind, engine, int(refine_drops), int(deep)),
-        ).fetchone()
+        """
+        params: list = [analysis_kind, engine, int(refine_drops), int(deep)]
+        if device is not None:
+            query += " AND device = ?"
+            params.append(device)
+        row = conn.execute(query, params).fetchone()
     finally:
         conn.close()
     count, avg_seconds, avg_cost = row

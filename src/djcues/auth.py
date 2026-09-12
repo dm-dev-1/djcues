@@ -4,9 +4,12 @@ API keys live in the OS-native credential store via ``keyring`` --
 Windows Credential Manager, macOS Keychain, or the Linux Secret Service --
 never in a plaintext file, never logged, never written to
 ``~/.djcues/history.db`` or any session JSON. Non-secret settings
-(provider, model, batch preference) live alongside in a plain JSON file,
-following the exact directory convention ``history.py`` already
-established.
+(provider, model, batch preference, device) live alongside in a plain
+JSON file, following the exact directory convention ``history.py``
+already established. "device" specifically is the hardware-device
+preference for --deep/beatgrid analysis (see ``djcues.device`` and
+``djcues auth device``) -- CLI/batch-wide config like everything else
+here, nothing secret about it.
 
 ``keyring`` is an optional dependency (see the ``agentic`` extra in
 pyproject.toml) and is imported lazily so importing this module doesn't
