@@ -1012,6 +1012,8 @@ class DashboardHandler(_LocalJsonHandler):
             parts = [p for p in path.split("/") if p]
             if len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks":
                 self._handle_playlist_tracks_get(parts[2])
+            elif len(parts) == 4 and parts[0:2] == ["api", "tracks"] and parts[3] == "suggestions":
+                self._handle_track_suggestions_get(parts[2])
             elif len(parts) == 3 and parts[0:2] == ["api", "tracks"]:
                 self._handle_track_detail_get(parts[2])
             elif len(parts) == 3 and parts[0:2] == ["api", "jobs"]:
@@ -1139,6 +1141,90 @@ class DashboardHandler(_LocalJsonHandler):
                 }
                 for t in tracks
             ],
+        })
+
+    def _handle_track_suggestions_get(self, track_id: str) -> None:
+        """GET /api/tracks/<track_id>/suggestions?playlist_id=&library=&bpm_tolerance=&limit=&half_double=
+
+        Read-only -- no write-safety handling needed (unlike the playlist
+        write routes). Only the cheap list_playlist_tracks()/
+        list_all_tracks() calls happen inside the _db_worker closure;
+        harmony.suggest_compatible_tracks() itself needs no DB access and
+        runs outside it, minimizing time held on the shared worker thread.
+        """
+        from urllib.parse import parse_qs, urlsplit
+
+        from djcues import harmony
+        from djcues.db import list_all_tracks, list_playlist_tracks
+
+        query = parse_qs(urlsplit(self.path).query)
+        playlist_id = query.get("playlist_id", [None])[0]
+        if not playlist_id:
+            self._send_json({"error": "playlist_id is required"}, status=400)
+            return
+
+        library = query.get("library", ["false"])[0] == "true"
+        half_double = query.get("half_double", ["true"])[0] != "false"
+        try:
+            bpm_tolerance = float(query.get("bpm_tolerance", [str(harmony.DEFAULT_BPM_TOLERANCE_PCT)])[0])
+            limit = int(query.get("limit", ["10"])[0])
+        except ValueError:
+            self._send_json({"error": "bpm_tolerance and limit must be numbers"}, status=400)
+            return
+
+        try:
+            playlist_tracks = self._db_worker.run(lambda db: list_playlist_tracks(playlist_id, db=db))
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+
+        reference = next((t for t in playlist_tracks if str(t.id) == str(track_id)), None)
+        if reference is None:
+            self._send_json({"error": "track not found in playlist"}, status=404)
+            return
+
+        if library:
+            try:
+                candidates = self._db_worker.run(lambda db: list_all_tracks(db=db))
+            except Exception as e:
+                self._send_json({"error": str(e)}, status=500)
+                return
+        else:
+            candidates = playlist_tracks
+
+        try:
+            result = harmony.suggest_compatible_tracks(
+                reference, candidates,
+                bpm_tolerance_pct=bpm_tolerance, allow_half_double=half_double, limit=limit,
+            )
+        except ValueError as e:
+            self._send_json({"error": str(e)}, status=400)
+            return
+
+        def _track_json(t):
+            return {"id": t.id, "title": t.title, "artist": t.artist, "bpm": t.bpm, "key": t.key}
+
+        excluded_summary = {"no_key": 0, "non_camelot_key": 0, "encrypted_metadata": 0}
+        for e in result.excluded:
+            excluded_summary[e.reason] = excluded_summary.get(e.reason, 0) + 1
+
+        self._send_json({
+            "reference": _track_json(result.reference),
+            "suggestions": [
+                {
+                    "track": _track_json(s.track),
+                    "key_relation": s.key_relation,
+                    "key_relation_label": harmony.KEY_RELATION_LABELS[s.key_relation],
+                    "bpm_relation": {
+                        "kind": s.bpm_relation.kind,
+                        "label": harmony.BPM_RELATION_LABELS[s.bpm_relation.kind],
+                        "target_bpm": s.bpm_relation.target_bpm,
+                        "pitch_shift_pct": s.bpm_relation.pitch_shift_pct,
+                    },
+                }
+                for s in result.suggestions
+            ],
+            "excluded_summary": excluded_summary,
         })
 
     def _handle_track_detail_get(self, track_id: str) -> None:

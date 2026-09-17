@@ -253,6 +253,94 @@ class TestListPlaylistTracks:
 
         assert tracks[0].artist == ""
 
+    def test_key_scale_name_flows_into_key_field(self):
+        from djcues.db import list_playlist_tracks
+
+        song = MagicMock()
+        song.TrackNo = 1
+        song.Content.ID = "c1"
+        song.Content.Title = "Track"
+        song.Content.Artist = None
+        song.Content.BPM = 12800
+        song.Content.Length = 100
+        song.Content.Key.ScaleName = "9A"
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = [song]
+
+        tracks = list_playlist_tracks("playlist1", db=fake_db)
+
+        assert tracks[0].key == "9A"
+
+    def test_missing_key_relationship_is_none(self):
+        from djcues.db import list_playlist_tracks
+
+        song = MagicMock()
+        song.TrackNo = 1
+        song.Content.ID = "c1"
+        song.Content.Title = "Track"
+        song.Content.Artist = None
+        song.Content.BPM = 12800
+        song.Content.Length = 100
+        song.Content.Key = None
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = [song]
+
+        tracks = list_playlist_tracks("playlist1", db=fake_db)
+
+        assert tracks[0].key is None
+
+
+class TestListAllTracks:
+    def test_maps_content_rows_to_track_summaries_with_track_no_always_none(self):
+        from djcues.db import list_all_tracks
+
+        def _mock_content(id_, title, bpm, key_scale):
+            content = MagicMock()
+            content.ID = id_
+            content.Title = title
+            content.Artist.Name = "Some Artist"
+            content.BPM = bpm
+            content.Length = 200
+            content.Key.ScaleName = key_scale
+            return content
+
+        rows = [_mock_content("1", "Track A", 12800, "9A"), _mock_content("2", "Track B", 17400, "8B")]
+        fake_db = MagicMock()
+        fake_db.get_content.return_value = rows
+
+        tracks = list_all_tracks(db=fake_db)
+
+        assert [t.title for t in tracks] == ["Track A", "Track B"]
+        assert [t.key for t in tracks] == ["9A", "8B"]
+        assert all(t.track_no is None for t in tracks)
+        fake_db.get_content.assert_called_once_with()
+
+    def test_skips_nothing_extra_missing_key_is_none(self):
+        from djcues.db import list_all_tracks
+
+        content = MagicMock()
+        content.ID = "1"
+        content.Title = "Track"
+        content.Artist = None
+        content.BPM = 12800
+        content.Length = 100
+        content.Key = None
+        fake_db = MagicMock()
+        fake_db.get_content.return_value = [content]
+
+        tracks = list_all_tracks(db=fake_db)
+
+        assert tracks[0].key is None
+
+    def test_skips_shared_db_when_given(self):
+        from djcues.db import list_all_tracks
+
+        fake_db = MagicMock()
+        fake_db.get_content.return_value = []
+        with patch("djcues.db.get_db") as mock_get_db:
+            list_all_tracks(db=fake_db)
+        mock_get_db.assert_not_called()
+
 
 class TestFindPlaylistSongEntries:
     def test_sorts_by_track_no(self):
@@ -297,7 +385,11 @@ def test_build_playlist_tree_real_library_contains_tech_house():
     assert "Tech House" in names
     tech_house = next(n for n in tree if n.name == "Tech House")
     assert tech_house.kind == "playlist"
-    assert tech_house.track_count == 10
+    # Not a hardcoded count -- this real library's playlists change over
+    # time (e.g. a real djcues playlist move/add/remove), confirmed live
+    # when this exact assertion broke after moving a real track into
+    # Tech House earlier in this project's history.
+    assert tech_house.track_count > 0
 
 
 @requires_rekordbox
@@ -310,3 +402,18 @@ def test_list_playlist_tracks_real_library_matches_load_playlist_tracks():
 
     assert len(summaries) == len(full_tracks)
     assert {s.title for s in summaries} == {t.title for t in full_tracks}
+
+
+@requires_rekordbox
+def test_list_all_tracks_real_library_has_camelot_parseable_keys():
+    from djcues.db import list_all_tracks
+    from djcues.harmony import parse_camelot_key
+
+    tracks = list_all_tracks()
+
+    # Structural properties, not hardcoded counts -- the real library's
+    # size/coverage can change over time (confirmed non-theoretical
+    # above, in test_build_playlist_tree_real_library_contains_tech_house).
+    assert len(tracks) > 0
+    assert all(t.track_no is None for t in tracks)
+    assert any(parse_camelot_key(t.key) is not None for t in tracks)

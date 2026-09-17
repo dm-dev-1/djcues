@@ -61,6 +61,18 @@ class TestRenderDashboardHtml:
         assert "function loadDevices" in result
         assert "'/api/devices'" in result
 
+    def test_harmonic_suggestions_section_is_present(self):
+        """Camelot Wheel + BPM suggestions for the currently-viewed track
+        -- GET /api/tracks/<id>/suggestions, see djcues.harmony/server.py's
+        _handle_track_suggestions_get."""
+        result = render_dashboard_html()
+        assert 'id="suggest-library"' in result
+        assert 'id="suggest-half-double"' in result
+        assert 'id="suggest-bpm-tolerance"' in result
+        assert 'id="suggestions-list"' in result
+        assert "function loadSuggestions" in result
+        assert "/suggestions?" in result
+
     def test_never_embeds_a_server_url(self):
         # Same-origin like auth_web.py's page (served BY the local server
         # it talks to), unlike review.py's file://-opened page, which

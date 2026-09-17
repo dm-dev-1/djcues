@@ -19,7 +19,7 @@ import pytest
 from click.testing import CliRunner
 
 from djcues.cli import cli
-from djcues.models import BeatGrid, CueProposal, Phrase, Track
+from djcues.models import BeatGrid, CueProposal, Phrase, Track, TrackSummary
 from djcues.strategy import CueStrategy
 
 
@@ -1483,3 +1483,137 @@ class TestPlaylistCommands:
             result = runner.invoke(cli, ["playlist", "move", "Same", "Test Track", "Same"])
         assert result.exit_code == 1
         assert "source and destination playlists are the same" in result.output
+
+
+# ---------------------------------------------------------------------------
+# suggest -- harmonic mixing suggestions. djcues.harmony's own logic
+# (Camelot compatibility, BPM tolerance) has its own exhaustive tests in
+# test_harmony.py; these only cover cli.py's resolution/dispatch/
+# presentation layer, using real TrackSummary fixtures (cheap, no
+# ANLZ-reading Track needed) mirroring TestPlaylistCommands's mocking shape.
+# ---------------------------------------------------------------------------
+
+
+def _summary(id_: str, title: str, artist: str = "Artist", bpm: float = 128.0, key: str | None = "8A") -> TrackSummary:
+    return TrackSummary(id=id_, track_no=None, title=title, artist=artist, bpm=bpm, duration_ms=200_000.0, key=key)
+
+
+class TestSuggest:
+    def test_playlist_not_found(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=None):
+            result = runner.invoke(cli, ["suggest", "Nope", "Track"])
+        assert result.exit_code == 1
+        assert "'Nope' not found" in result.output
+
+    def test_no_track_matches(self, runner: CliRunner):
+        ref = _summary("1", "Some Track")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref]):
+            result = runner.invoke(cli, ["suggest", "Playlist", "Nonexistent"])
+        assert result.exit_code == 1
+        assert "no track matching" in result.output
+
+    def test_ambiguous_track_matches_lists_candidates(self, runner: CliRunner):
+        t1 = _summary("1", "Test Track", artist="Artist A")
+        t2 = _summary("2", "Test Track Two", artist="Artist B")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[t1, t2]):
+            result = runner.invoke(cli, ["suggest", "Playlist", "Test Track"])
+        assert result.exit_code == 1
+        assert "2 tracks match" in result.output
+        assert "Test Track -- Artist A" in result.output
+        assert "Test Track Two -- Artist B" in result.output
+
+    def test_reference_with_no_key_errors_clearly(self, runner: CliRunner):
+        ref = _summary("1", "Test Track", key=None)
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref]):
+            result = runner.invoke(cli, ["suggest", "Playlist", "Test Track"])
+        assert result.exit_code == 1
+        assert "no usable Camelot key" in result.output
+
+    def test_happy_path_ranked_output(self, runner: CliRunner):
+        ref = _summary("1", "Reference Track", bpm=128.0, key="8A")
+        same_key = _summary("2", "Same Key Match", bpm=128.0, key="8A")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref, same_key]):
+            result = runner.invoke(cli, ["suggest", "Playlist", "Reference Track"])
+        assert result.exit_code == 0
+        assert "Reference Track" in result.output
+        assert "Same Key Match" in result.output
+        assert "Same key" in result.output
+        assert "Same tempo" in result.output
+
+    def test_no_matches_found_message(self, runner: CliRunner):
+        ref = _summary("1", "Reference Track", bpm=128.0, key="8A")
+        far = _summary("2", "Far Off", bpm=145.0, key="3B")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref, far]):
+            result = runner.invoke(cli, ["suggest", "Playlist", "Reference Track"])
+        assert result.exit_code == 0
+        assert "No compatible tracks found." in result.output
+
+    def test_library_flag_uses_list_all_tracks(self, runner: CliRunner):
+        ref = _summary("1", "Reference Track", bpm=128.0, key="8A")
+        library_track = _summary("2", "Library Match", bpm=128.0, key="8A")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref]), \
+             patch("djcues.cli.list_all_tracks", return_value=[ref, library_track]) as mock_all:
+            result = runner.invoke(cli, ["suggest", "Playlist", "Reference Track", "--library"])
+        assert result.exit_code == 0
+        mock_all.assert_called_once()
+        assert "Library Match" in result.output
+        assert "whole library" in result.output
+
+    def test_without_library_flag_never_calls_list_all_tracks(self, runner: CliRunner):
+        ref = _summary("1", "Reference Track", bpm=128.0, key="8A")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref]), \
+             patch("djcues.cli.list_all_tracks") as mock_all:
+            result = runner.invoke(cli, ["suggest", "Playlist", "Reference Track"])
+        assert result.exit_code == 0
+        mock_all.assert_not_called()
+
+    def test_bpm_tolerance_and_no_half_double_and_limit_passed_through(self, runner: CliRunner):
+        ref = _summary("1", "Reference Track", bpm=128.0, key="8A")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref]), \
+             patch("djcues.cli.suggest_compatible_tracks") as mock_suggest:
+            mock_suggest.return_value = MagicMock(reference=ref, suggestions=[], excluded=[])
+            result = runner.invoke(cli, [
+                "suggest", "Playlist", "Reference Track",
+                "--bpm-tolerance", "10", "--no-half-double", "--limit", "3",
+            ])
+        assert result.exit_code == 0
+        mock_suggest.assert_called_once()
+        _args, kwargs = mock_suggest.call_args
+        assert kwargs["bpm_tolerance_pct"] == 10.0
+        assert kwargs["allow_half_double"] is False
+        assert kwargs["limit"] == 3
+
+    def test_excluded_tracks_summary_line_printed(self, runner: CliRunner):
+        ref = _summary("1", "Reference Track", bpm=128.0, key="8A")
+        no_key = _summary("2", "No Key Track", bpm=128.0, key=None)
+        non_camelot = _summary("3", "Weird Key Track", bpm=128.0, key="Dm")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref, no_key, non_camelot]):
+            result = runner.invoke(cli, ["suggest", "Playlist", "Reference Track"])
+        assert result.exit_code == 0
+        assert "excluded: 1 no-key, 1 non-Camelot key" in result.output
+
+    def test_encrypted_metadata_track_excluded_not_shown_as_garbage(self, runner: CliRunner):
+        # Real Rekordbox behavior: a streaming-linked (e.g. Spotify) track
+        # can have a real Key/BPM but an encrypted Title -- must never be
+        # printed as a suggestion, and must be counted separately in the
+        # excluded summary rather than folded into "no-key"/"non-Camelot".
+        ref = _summary("1", "Reference Track", bpm=128.0, key="8A")
+        encrypted = _summary(
+            "2", "$A7:v1:cXRGX5Nhvaa9rt8efO7O4g==:9qEcCSYCFHtls1UhP1IHWTd312u5L59/27m9UzFbZs4=",
+            bpm=128.0, key="8A",
+        )
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[ref, encrypted]):
+            result = runner.invoke(cli, ["suggest", "Playlist", "Reference Track"])
+        assert result.exit_code == 0
+        assert "$A7:" not in result.output
+        assert "streaming-linked" in result.output

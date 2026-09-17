@@ -1150,7 +1150,12 @@ class TestDashboardHandlerGet:
         assert "Tech House" in names
         tech_house = next(n for n in data["tree"] if n["name"] == "Tech House")
         assert tech_house["kind"] == "playlist"
-        assert tech_house["track_count"] == 10
+        # Not a hardcoded count -- this real library's playlists change
+        # over time (e.g. a real djcues playlist move/add/remove);
+        # confirmed live when this exact assertion broke after moving a
+        # real track into Tech House earlier in this project's history
+        # (see the identical fix in test_db.py).
+        assert tech_house["track_count"] > 0
 
     def test_playlist_tracks_returns_real_tracks(self, dashboard_server):
         base_url, _server = dashboard_server
@@ -1158,7 +1163,7 @@ class TestDashboardHandlerGet:
         tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
         status, data = _get(base_url + f"/api/playlists/{tech_house['id']}/tracks")
         assert status == 200
-        assert len(data["tracks"]) == 10
+        assert len(data["tracks"]) > 0
         assert all(t["title"] for t in data["tracks"])
 
     def test_track_detail_returns_real_metadata(self, dashboard_server):
@@ -1692,6 +1697,102 @@ class TestDashboardPlaylistWrites:
                 base_url + "/api/playlists/pl1/tracks/c1/move", {"dest_playlist_id": "pl2"}
             )
         assert status == 409
+
+
+class TestDashboardSuggestionsEndpoint:
+    """GET /api/tracks/<id>/suggestions -- read-only, so unlike
+    TestDashboardPlaylistWrites there's no write-safety/backup concern,
+    just routing/validation/status-code mapping. Reuses that class's
+    exact patch.object(_DbWorker, "run", ...) technique so this needs no
+    real Rekordbox database. djcues.harmony's own compatibility logic
+    has its own exhaustive tests in test_harmony.py.
+    """
+
+    @staticmethod
+    def _worker_calls_fn_with(fake_db):
+        return lambda fn, timeout=30.0: fn(fake_db)
+
+    @staticmethod
+    def _tracks():
+        from djcues.models import TrackSummary
+
+        ref = TrackSummary(id="1", track_no=1, title="Reference", artist="Artist", bpm=128.0, duration_ms=200_000.0, key="8A")
+        match = TrackSummary(id="2", track_no=2, title="Match", artist="Other", bpm=128.0, duration_ms=200_000.0, key="8A")
+        return ref, match
+
+    def test_missing_playlist_id_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/tracks/1/suggestions")
+        assert status == 400
+        assert "playlist_id is required" in data["error"]
+
+    def test_invalid_bpm_tolerance_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/tracks/1/suggestions?playlist_id=pl1&bpm_tolerance=not-a-number")
+        assert status == 400
+
+    def test_track_not_found_in_playlist_is_404(self, dashboard_server):
+        base_url, _server = dashboard_server
+        ref, _match = self._tracks()
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_playlist_tracks", return_value=[ref]):
+            status, _data = _get(base_url + "/api/tracks/not-a-real-id/suggestions?playlist_id=pl1")
+        assert status == 404
+
+    def test_happy_path_ranked_json(self, dashboard_server):
+        base_url, _server = dashboard_server
+        ref, match = self._tracks()
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_playlist_tracks", return_value=[ref, match]):
+            status, data = _get(base_url + "/api/tracks/1/suggestions?playlist_id=pl1")
+        assert status == 200
+        assert data["reference"]["id"] == "1"
+        assert len(data["suggestions"]) == 1
+        assert data["suggestions"][0]["track"]["id"] == "2"
+        assert data["suggestions"][0]["key_relation"] == "same"
+        assert data["suggestions"][0]["bpm_relation"]["kind"] == "same_tempo"
+
+    def test_library_true_widens_pool(self, dashboard_server):
+        from djcues.models import TrackSummary
+
+        base_url, _server = dashboard_server
+        ref, match = self._tracks()
+        library_only = TrackSummary(
+            id="3", track_no=None, title="Library Only", artist="X", bpm=128.0, duration_ms=1.0, key="8A"
+        )
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_playlist_tracks", return_value=[ref, match]), \
+             patch("djcues.db.list_all_tracks", return_value=[ref, match, library_only]) as mock_all:
+            status, data = _get(base_url + "/api/tracks/1/suggestions?playlist_id=pl1&library=true")
+        assert status == 200
+        mock_all.assert_called_once()
+        assert {s["track"]["id"] for s in data["suggestions"]} == {"2", "3"}
+
+    def test_library_false_never_calls_list_all_tracks(self, dashboard_server):
+        base_url, _server = dashboard_server
+        ref, match = self._tracks()
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_playlist_tracks", return_value=[ref, match]), \
+             patch("djcues.db.list_all_tracks") as mock_all:
+            status, _data = _get(base_url + "/api/tracks/1/suggestions?playlist_id=pl1")
+        assert status == 200
+        mock_all.assert_not_called()
+
+    def test_reference_with_no_key_is_400(self, dashboard_server):
+        from djcues.models import TrackSummary
+
+        base_url, _server = dashboard_server
+        ref = TrackSummary(id="1", track_no=1, title="Reference", artist="Artist", bpm=128.0, duration_ms=1.0, key=None)
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_playlist_tracks", return_value=[ref]):
+            status, data = _get(base_url + "/api/tracks/1/suggestions?playlist_id=pl1")
+        assert status == 400
+        assert "no usable Camelot key" in data["error"]
 
 
 @requires_rekordbox

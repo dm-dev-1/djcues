@@ -99,6 +99,21 @@ djcues playlist remove "Playlist Name" "Track Name" --position 2
 
 Requires rekordbox to be closed (same rule as `apply`) and only works between playlists that already exist — it won't create, delete, or rename one. If more than one track in the playlist matches the name you gave, the command lists every match instead of guessing which one you meant. The same three actions are also available from the dashboard's track detail view.
 
+### Harmonic mixing suggestions
+
+```bash
+# Suggest harmonically- and tempo-compatible tracks, within the same playlist
+djcues suggest "Drum & Bass" "Darkest Hour"
+
+# Search the whole collection instead of just this playlist
+djcues suggest "Drum & Bass" "Darkest Hour" --library
+
+# Adjust matching
+djcues suggest "Drum & Bass" "Darkest Hour" --bpm-tolerance 10 --no-half-double --limit 5
+```
+
+Ranks other tracks by Camelot Wheel key compatibility (same key, energy boost/drop, relative major/minor — diagonal moves are deliberately not treated as compatible, per the standard Camelot rules) and BPM closeness, including half/double-time matches (e.g. a 174 BPM track mixing cleanly with an 87 BPM one). The default 6% BPM tolerance matches Rekordbox's own default pitch fader range. Defaults to searching just the given playlist — a DJ building a Drum & Bass set wants D&B suggestions, not something from an unrelated playlist; `--library` widens the search to the whole collection. A track with no Key data, a non-Camelot Key, or Rekordbox's own encrypted metadata (streaming-linked tracks, e.g. Spotify) is excluded from results with a reason shown in the summary line, never guessed at or shown as raw text. Read-only — never writes to the database. Also available from the dashboard's track detail view, updating live as you adjust its BPM-tolerance/half-double/library controls.
+
 ### Analysis dashboard
 
 ```bash
@@ -266,12 +281,13 @@ src/djcues/
     history.py      # Correction-history logging
     analysis_cache.py # Persistent cache of completed analysis runs (propose/compare/review/beatgrid)
     metrics.py      # Precision/recall/F1 for compare
+    harmony.py      # Camelot Wheel key compatibility + BPM closeness (djcues suggest)
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
     dashboard.py    # Analysis dashboard HTML/CSS/JS (browse playlists/tracks, run propose/compare/beatgrid)
     server.py       # Local HTTP server for review sessions, the BYOK setup wizard, and the dashboard
-    writer.py       # DB backup and cue writes
-    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, auth, history, cache)
+    writer.py       # DB backup, cue writes, and playlist add/remove/move
+    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, auth, history, cache)
 ```
 
 ## License

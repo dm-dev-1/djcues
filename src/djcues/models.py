@@ -278,3 +278,8 @@ class TrackSummary:
     artist: str
     bpm: float
     duration_ms: float
+    # Raw DjmdKey.ScaleName -- Camelot notation ("9A") in the common case,
+    # but a real library can have non-Camelot raw values ("E", "Dm") or no
+    # Key at all (None). See harmony.parse_camelot_key for turning this
+    # into something usable.
+    key: str | None = None

@@ -16,7 +16,13 @@ warnings.filterwarnings("ignore", module="pyrekordbox")
 
 from djcues import analysis_cache
 from djcues.constants import CUE_SYSTEM_BY_PAD, KIND_TO_PAD
-from djcues.db import find_playlist, load_playlist_tracks
+from djcues.db import find_playlist, list_all_tracks, list_playlist_tracks, load_playlist_tracks
+from djcues.harmony import (
+    BPM_RELATION_LABELS,
+    DEFAULT_BPM_TOLERANCE_PCT,
+    KEY_RELATION_LABELS,
+    suggest_compatible_tracks,
+)
 from djcues.metrics import compare_cues, merge_pad_stats, overall_stats
 from djcues.models import CueProposal
 from djcues.strategy import CueStrategy, build_cue_points
@@ -1708,3 +1714,104 @@ def playlist_move(source_playlist, track_name, dest_playlist, position):
         _exit_on_playlist_write_error(e)
 
     click.echo(f"Moved '{track.title}' from '{source_playlist}' to '{dest_playlist}'.")
+
+
+def _resolve_reference_track(playlist_name, track_name):
+    """suggest's own track resolution -- built on the cheap
+    list_playlist_tracks() (TrackSummary: id/title/artist/bpm/key), not
+    the ANLZ-reading load_playlist_tracks() _resolve_single_track uses,
+    since suggest never needs phrases/cues/waveform. Same hard-erroring
+    behavior on 0/>1 substring matches as the playlist-write commands --
+    guessing the reference track wrong would produce misleading
+    harmonic-mixing advice.
+
+    Returns (playlist, playlist_tracks, reference_track) so the caller
+    can reuse playlist_tracks as the default candidate pool without a
+    second, redundant list_playlist_tracks() call.
+    """
+    playlist = find_playlist(playlist_name)
+    if playlist is None:
+        click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    tracks = list_playlist_tracks(playlist.ID)
+    matches = [t for t in tracks if track_name.lower() in t.title.lower()]
+    if not matches:
+        click.echo(f"Error: no track matching '{track_name}' in playlist '{playlist_name}'.", err=True)
+        raise SystemExit(1)
+    if len(matches) > 1:
+        click.echo(
+            f"Error: {len(matches)} tracks match '{track_name}' in playlist "
+            f"'{playlist_name}' -- be more specific:",
+            err=True,
+        )
+        for t in matches:
+            click.echo(f"  {t.title} -- {t.artist}", err=True)
+        raise SystemExit(1)
+
+    return playlist, tracks, matches[0]
+
+
+def _print_suggestions(result, scope: str) -> None:
+    ref = result.reference
+    click.echo(f"\n{'=' * 60}")
+    click.echo(f"  {ref.title} — {ref.artist}")
+    click.echo(f"  {ref.key}  ·  {ref.bpm:.1f} BPM  ·  scope: {scope}")
+    click.echo(f"{'=' * 60}")
+
+    if not result.suggestions:
+        click.echo("\n  No compatible tracks found.")
+    else:
+        click.echo(f"\n  {len(result.suggestions)} suggestion(s):")
+        for s in result.suggestions:
+            key_label = KEY_RELATION_LABELS[s.key_relation]
+            bpm_label = BPM_RELATION_LABELS[s.bpm_relation.kind]
+            click.echo(
+                f"    {s.track.title:<40.40s} {s.track.artist:<20.20s} "
+                f"{(s.track.key or ''):<4s} {s.track.bpm:>6.1f} BPM  "
+                f"{key_label:<22s} {bpm_label} ({s.bpm_relation.pitch_shift_pct:.1f}%)"
+            )
+
+    if result.excluded:
+        no_key = sum(1 for e in result.excluded if e.reason == "no_key")
+        non_camelot = sum(1 for e in result.excluded if e.reason == "non_camelot_key")
+        encrypted = sum(1 for e in result.excluded if e.reason == "encrypted_metadata")
+        parts = [f"{no_key} no-key", f"{non_camelot} non-Camelot key"]
+        if encrypted:
+            parts.append(f"{encrypted} streaming-linked (unreadable metadata)")
+        click.echo(f"\n  (excluded: {', '.join(parts)})")
+
+
+@cli.command()
+@click.argument("playlist_name")
+@click.argument("track_name")
+@click.option("--library", is_flag=True, help="Search the whole collection instead of just this playlist.")
+@click.option(
+    "--bpm-tolerance", default=DEFAULT_BPM_TOLERANCE_PCT, show_default=True,
+    help="Max tempo difference to still count as mixable, as a percent (Rekordbox's default pitch fader range).",
+)
+@click.option("--no-half-double", is_flag=True, help="Only match same-tempo tracks, not half/double-time.")
+@click.option("--limit", default=10, show_default=True, help="Max number of suggestions to show.")
+def suggest(playlist_name, track_name, library, bpm_tolerance, no_half_double, limit):
+    """Suggest harmonically- and tempo-compatible tracks for a track.
+
+    Camelot Wheel key compatibility (same key, energy boost/drop,
+    relative major/minor) plus BPM closeness, including half/double-time
+    matches. Defaults to searching PLAYLIST_NAME only -- a DJ building a
+    Drum & Bass set wants D&B suggestions, not random tracks from
+    elsewhere; --library widens the search to the whole collection.
+    """
+    _playlist, playlist_tracks, reference = _resolve_reference_track(playlist_name, track_name)
+    candidates = list_all_tracks() if library else playlist_tracks
+
+    try:
+        result = suggest_compatible_tracks(
+            reference, candidates,
+            bpm_tolerance_pct=bpm_tolerance, allow_half_double=not no_half_double, limit=limit,
+        )
+    except ValueError as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+
+    scope = "whole library" if library else playlist_name
+    _print_suggestions(result, scope)

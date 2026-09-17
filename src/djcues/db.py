@@ -114,8 +114,29 @@ def build_playlist_tree(db: Rekordbox6Database | None = None) -> list[PlaylistNo
     return [build(row) for row in roots]
 
 
+def _track_summary_from_content(content: Any, track_no: int | None) -> TrackSummary:
+    """Shared by list_playlist_tracks()/list_all_tracks() -- same cheap
+    field extraction off one DjmdContent row, zero ANLZ I/O, differing
+    only in how each function finds its content rows in the first place."""
+    artist_name = ""
+    if content.Artist:
+        artist_name = content.Artist.Name or ""
+    key = None
+    if content.Key:
+        key = content.Key.ScaleName or None
+    return TrackSummary(
+        id=content.ID,
+        track_no=track_no,
+        title=content.Title or "",
+        artist=artist_name,
+        bpm=(content.BPM or 0) / 100,
+        duration_ms=float(content.Length or 0) * 1000,
+        key=key,
+    )
+
+
 def list_playlist_tracks(playlist_id: str, db: Rekordbox6Database | None = None) -> list[TrackSummary]:
-    """Cheap track listing for one playlist -- title/artist/bpm/duration
+    """Cheap track listing for one playlist -- title/artist/bpm/duration/key
     straight from DjmdContent via the DjmdSongPlaylist relationship, zero
     ANLZ I/O (unlike load_playlist_tracks() below, which is what makes a
     full-library enumeration take ~90-100s in practice). Use this for
@@ -130,18 +151,20 @@ def list_playlist_tracks(playlist_id: str, db: Rekordbox6Database | None = None)
         content = song.Content
         if content is None:
             continue  # a stale/orphaned song row with no matching content
-        artist_name = ""
-        if content.Artist:
-            artist_name = content.Artist.Name or ""
-        summaries.append(TrackSummary(
-            id=content.ID,
-            track_no=song.TrackNo,
-            title=content.Title or "",
-            artist=artist_name,
-            bpm=(content.BPM or 0) / 100,
-            duration_ms=float(content.Length or 0) * 1000,
-        ))
+        summaries.append(_track_summary_from_content(content, track_no=song.TrackNo))
     return summaries
+
+
+def list_all_tracks(db: Rekordbox6Database | None = None) -> list[TrackSummary]:
+    """Every track in the whole collection, not playlist-scoped -- same
+    cheap, ANLZ-free shape as list_playlist_tracks(), scanning DjmdContent
+    directly instead of one playlist's DjmdSongPlaylist rows. track_no is
+    always None (TrackNo is playlist-membership metadata, meaningless
+    outside of one). Powers whole-library scoped features (e.g. harmony.py's
+    --library search) where a single curated playlist is too narrow.
+    """
+    db = db if db is not None else get_db()
+    return [_track_summary_from_content(content, track_no=None) for content in db.get_content()]
 
 
 def find_playlist_song_entries(

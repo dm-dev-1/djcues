@@ -176,6 +176,16 @@ def render_dashboard_html(
         <div id="playlist-action-status" class="job-status"></div>
       </div>
 
+      <div class="harmonic-suggestions-section">
+        <p class="meta small">Harmonically- and tempo-compatible tracks (Camelot Wheel + BPM):</p>
+        <div class="flags-row">
+          <label><input type="checkbox" id="suggest-library"> Search whole library</label>
+          <label><input type="checkbox" id="suggest-half-double" checked> Include half/double-time</label>
+          <label>BPM tolerance % <input type="number" id="suggest-bpm-tolerance" value="6" step="0.5" min="0" class="flag-num"></label>
+        </div>
+        <div id="suggestions-list" class="suggestions-list"></div>
+      </div>
+
       <div id="results-panel" class="results-panel hidden">
         <div id="job-status" class="job-status"></div>
         <div id="job-output-wrap" class="hidden">
@@ -337,6 +347,24 @@ _DASHBOARD_CSS = """
     font-size: 0.82rem;
   }
 
+  .harmonic-suggestions-section { margin-top: 16px; padding: 16px; border-top: 1px solid #2a2a3e; }
+  .suggestions-list { margin-top: 10px; display: flex; flex-direction: column; gap: 4px; }
+  .suggestion-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 8px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.82rem;
+  }
+  .suggestion-row:hover { background: #1e1e3a; }
+  .suggestion-title { flex: 2; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #eee; }
+  .suggestion-artist { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #999; }
+  .suggestion-key { color: #17a2b8; font-weight: 600; width: 2.5em; }
+  .suggestion-bpm { color: #ccc; width: 5em; text-align: right; }
+  .suggestion-relation { color: #999; }
+
   .results-panel { margin-top: 18px; padding: 16px; background: #12122a; border: 1px solid #2a2a3e; border-radius: 6px; }
   .job-status { font-size: 0.9rem; margin-bottom: 8px; }
   .job-status.info { color: #17a2b8; }
@@ -388,6 +416,10 @@ const playlistMoveBtn = document.getElementById('playlist-move-btn');
 const playlistAddBtn = document.getElementById('playlist-add-btn');
 const playlistRemoveBtn = document.getElementById('playlist-remove-btn');
 const playlistActionStatusEl = document.getElementById('playlist-action-status');
+const suggestLibraryEl = document.getElementById('suggest-library');
+const suggestHalfDoubleEl = document.getElementById('suggest-half-double');
+const suggestBpmToleranceEl = document.getElementById('suggest-bpm-tolerance');
+const suggestionsListEl = document.getElementById('suggestions-list');
 
 let currentPlaylistId = null;
 let currentTracks = [];
@@ -696,6 +728,7 @@ async function renderTrackDetail(playlistId, playlistName, trackId, trackTitle) 
   playlistRemoveBtn.disabled = !currentPlaylistId;
   playlistActionStatusEl.textContent = '';
   playlistActionStatusEl.className = 'job-status';
+  loadSuggestions();
 
   try {{
     const track = await fetchJson('/api/tracks/' + encodeURIComponent(trackId));
@@ -1083,6 +1116,107 @@ playlistRemoveBtn.addEventListener('click', async () => {{
   );
   if (ok) history.back();
 }});
+
+// --- Harmonic mixing suggestions -------------------------------------
+//
+// Unlike Propose/Compare/Beatgrid, this needs no async job-queue/polling
+// machinery -- it's a fast, synchronous, in-memory computation over
+// already-cheap TrackSummary lists (no ANLZ/audio/LLM I/O), so a plain
+// fetchJson() call, auto-triggered on track load and re-triggered on
+// control change, mirrors flagDeviceEl's own change-triggered refresh.
+
+async function loadSuggestions() {{
+  if (!currentTrackId || !currentPlaylistId) {{
+    suggestionsListEl.innerHTML = '';
+    return;
+  }}
+  const isLibrary = suggestLibraryEl.checked;
+  const params = new URLSearchParams({{
+    playlist_id: currentPlaylistId,
+    library: isLibrary ? 'true' : 'false',
+    half_double: suggestHalfDoubleEl.checked ? 'true' : 'false',
+    bpm_tolerance: suggestBpmToleranceEl.value || '6',
+  }});
+  suggestionsListEl.innerHTML = '<p class="meta small">Loading&hellip;</p>';
+  try {{
+    const data = await fetchJson(
+      '/api/tracks/' + encodeURIComponent(currentTrackId) + '/suggestions?' + params.toString()
+    );
+    renderSuggestions(data, isLibrary);
+  }} catch (err) {{
+    suggestionsListEl.innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'meta small';
+    p.textContent = 'Error: ' + friendlyErrorMessage(err);
+    suggestionsListEl.appendChild(p);
+  }}
+}}
+
+function renderSuggestions(data, isLibrary) {{
+  suggestionsListEl.innerHTML = '';
+  if (data.suggestions.length === 0) {{
+    suggestionsListEl.innerHTML = '<p class="meta small">No compatible tracks found.</p>';
+  }}
+  data.suggestions.forEach(s => {{
+    const row = document.createElement('div');
+    row.className = 'suggestion-row';
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'suggestion-title';
+    titleSpan.textContent = s.track.title;
+
+    const artistSpan = document.createElement('span');
+    artistSpan.className = 'suggestion-artist';
+    artistSpan.textContent = s.track.artist;
+
+    const keySpan = document.createElement('span');
+    keySpan.className = 'suggestion-key';
+    keySpan.textContent = s.track.key || '';
+
+    const bpmSpan = document.createElement('span');
+    bpmSpan.className = 'suggestion-bpm';
+    bpmSpan.textContent = s.track.bpm.toFixed(1) + ' BPM';
+
+    const relationSpan = document.createElement('span');
+    relationSpan.className = 'suggestion-relation';
+    relationSpan.textContent = s.key_relation_label + ' \\u00b7 ' + s.bpm_relation.label;
+
+    row.appendChild(titleSpan);
+    row.appendChild(artistSpan);
+    row.appendChild(keySpan);
+    row.appendChild(bpmSpan);
+    row.appendChild(relationSpan);
+
+    // A --library match may not belong to currentPlaylistId -- navigate
+    // with playlistId: null in that case; renderTrackDetail() already
+    // handles that gracefully (disables Move/Remove, skips the stale-
+    // list refetch), no special-casing needed here beyond passing it.
+    row.addEventListener('click', () => navigateTo({{
+      view: 'track',
+      playlistId: isLibrary ? null : currentPlaylistId,
+      playlistName: isLibrary ? null : currentPlaylistNameEl.textContent,
+      trackId: s.track.id,
+      trackTitle: s.track.title,
+    }}, 'push'));
+
+    suggestionsListEl.appendChild(row);
+  }});
+
+  const excluded = data.excluded_summary;
+  const excludedTotal = excluded.no_key + excluded.non_camelot_key + excluded.encrypted_metadata;
+  if (excludedTotal > 0) {{
+    const note = document.createElement('p');
+    note.className = 'meta small';
+    const parts = [excluded.no_key + ' no-key', excluded.non_camelot_key + ' non-Camelot key'];
+    if (excluded.encrypted_metadata) parts.push(excluded.encrypted_metadata + ' streaming-linked');
+    note.textContent = '(excluded: ' + parts.join(', ') + ')';
+    suggestionsListEl.appendChild(note);
+  }}
+}}
+
+suggestLibraryEl.addEventListener('change', loadSuggestions);
+suggestHalfDoubleEl.addEventListener('change', loadSuggestions);
+suggestBpmToleranceEl.addEventListener('change', loadSuggestions);
 
 // Called after INITIAL_PLAYLIST (server-embedded, from a
 // `djcues dashboard "Playlist Name"` argument) is defined -- see the
