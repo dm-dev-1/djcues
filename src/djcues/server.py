@@ -1189,6 +1189,12 @@ class DashboardHandler(_LocalJsonHandler):
             self._handle_launch_post(parts[2], parts[4])
         elif path == "/api/devices":
             self._handle_devices_post()
+        elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks":
+            self._handle_playlist_track_add_post(parts[2])
+        elif len(parts) == 6 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks" and parts[5] == "remove":
+            self._handle_playlist_track_remove_post(parts[2], parts[4])
+        elif len(parts) == 6 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks" and parts[5] == "move":
+            self._handle_playlist_track_move_post(parts[2], parts[4])
         else:
             self._send_json({"error": "not found"}, status=404)
 
@@ -1314,6 +1320,113 @@ class DashboardHandler(_LocalJsonHandler):
         subprocess.Popen(argv, **popen_kwargs)  # fire-and-forget, never .wait()ed on
 
         self._send_json({"ok": True, "playlist_name": playlist_name, "track_title": track_title})
+
+    # --- Playlist membership writes ----------------------------------
+    #
+    # djcues's first dashboard routes that mutate the database rather
+    # than just reading it. Routed through the same _db_worker as every
+    # browsing route above (not a fresh connection) -- a write still
+    # needs commit()'s own Rekordbox-running check to not race anything
+    # else touching the file, and _db_worker's one dedicated thread is
+    # exactly what already makes both that and the SingletonThreadPool
+    # hazard moot; a second connection would reopen the hazard _db_worker
+    # exists to prevent, for no benefit (writes are fast -- there's no
+    # "don't block browsing" argument for them the way there is for a
+    # multi-minute analysis job).
+
+    def _run_playlist_write(self, fn) -> bool | None:
+        """Run fn(db) on the db worker and map djcues.writer's playlist
+        exception hierarchy to HTTP status codes -- shared by all three
+        routes below since each needs the same four-way mapping.
+        Returns None (a JSON error response has already been sent) on
+        failure, or True on success; callers `return` immediately when
+        this returns None.
+        """
+        from djcues.writer import (
+            AmbiguousTrackEntryError,
+            PlaylistWriteError,
+            RekordboxRunningError,
+            TrackNotInPlaylistError,
+        )
+
+        try:
+            self._db_worker.run(fn)
+        except RekordboxRunningError as e:
+            # 409, not 400/500: a valid request that conflicts with
+            # current server-side state (Rekordbox is open), not a
+            # malformed request or an unexpected failure -- lets the
+            # dashboard JS tell the user to close Rekordbox rather than
+            # implying their input was wrong.
+            self._send_json({"error": str(e)}, status=409)
+            return None
+        except TrackNotInPlaylistError as e:
+            self._send_json({"error": str(e)}, status=404)
+            return None
+        except AmbiguousTrackEntryError as e:
+            self._send_json({"error": str(e), "candidates": e.candidates}, status=400)
+            return None
+        except (PlaylistWriteError, ValueError) as e:
+            self._send_json({"error": str(e)}, status=400)
+            return None
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return None
+        return True
+
+    def _handle_playlist_track_add_post(self, dest_playlist_id: str) -> None:
+        """POST /api/playlists/<dest_playlist_id>/tracks -- add a track
+        to this playlist. Body: {"content_id"}."""
+        from djcues.writer import add_track_to_playlist
+
+        body = self._read_body()
+        content_id = body.get("content_id")
+        if not content_id:
+            self._send_json({"error": "content_id is required"}, status=400)
+            return
+
+        ok = self._run_playlist_write(
+            lambda db: add_track_to_playlist(dest_playlist_id, content_id, db=db)
+        )
+        if ok is None:
+            return
+        self._send_json({"ok": True})
+
+    def _handle_playlist_track_remove_post(self, playlist_id: str, content_id: str) -> None:
+        """POST /api/playlists/<playlist_id>/tracks/<content_id>/remove
+        -- remove a track from this playlist. Body: {"position": int|null}."""
+        from djcues.writer import remove_track_from_playlist
+
+        body = self._read_body()
+        position = body.get("position")
+
+        ok = self._run_playlist_write(
+            lambda db: remove_track_from_playlist(playlist_id, content_id, position=position, db=db)
+        )
+        if ok is None:
+            return
+        self._send_json({"ok": True})
+
+    def _handle_playlist_track_move_post(self, source_playlist_id: str, content_id: str) -> None:
+        """POST /api/playlists/<source_playlist_id>/tracks/<content_id>/move
+        -- move a track to another playlist. Body:
+        {"dest_playlist_id", "position": int|null}."""
+        from djcues.writer import move_track_between_playlists
+
+        body = self._read_body()
+        dest_playlist_id = body.get("dest_playlist_id")
+        if not dest_playlist_id:
+            self._send_json({"error": "dest_playlist_id is required"}, status=400)
+            return
+        position = body.get("position")
+
+        ok = self._run_playlist_write(
+            lambda db: move_track_between_playlists(
+                source_playlist_id, dest_playlist_id, content_id, position=position, db=db
+            )
+        )
+        if ok is None:
+            return
+        self._send_json({"ok": True})
 
 
 def start_dashboard_server(

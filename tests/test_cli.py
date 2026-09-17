@@ -1325,3 +1325,161 @@ class TestAuthWeb:
             result = runner.invoke(cli, ["auth", "web"])
         assert result.exit_code == 1
         assert "Timed out" in result.output
+
+
+# ---------------------------------------------------------------------------
+# playlist add/remove/move -- djcues's first commands that write to the
+# database. djcues.writer's actual write functions are always mocked here
+# (they have their own real-logic tests in test_writer.py); these tests
+# only cover cli.py's own resolution/dispatch/error-mapping layer:
+# find_playlist -> load_playlist_tracks -> substring match (shared with
+# propose/compare via the same djcues.cli.find_playlist/load_playlist_tracks
+# mock points), and mapping djcues.writer's exception hierarchy to exit
+# codes and messages.
+# ---------------------------------------------------------------------------
+
+
+class TestPlaylistCommands:
+    def test_add_source_playlist_not_found(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=None):
+            result = runner.invoke(cli, ["playlist", "add", "Nope", "Track", "Dest"])
+        assert result.exit_code == 1
+        assert "'Nope' not found" in result.output
+
+    def test_add_dest_playlist_not_found(self, runner: CliRunner, track: Track):
+        def _find(name):
+            return _mock_playlist(name=name) if name == "Source" else None
+
+        with patch("djcues.cli.find_playlist", side_effect=_find), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]):
+            result = runner.invoke(cli, ["playlist", "add", "Source", "Test Track", "NopeDest"])
+        assert result.exit_code == 1
+        assert "'NopeDest' not found" in result.output
+
+    def test_add_no_track_matches(self, runner: CliRunner, track: Track):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]):
+            result = runner.invoke(cli, ["playlist", "add", "Source", "Nonexistent", "Dest"])
+        assert result.exit_code == 1
+        assert "no track matching" in result.output
+
+    def test_add_ambiguous_track_name_lists_candidates(
+        self, runner: CliRunner, track: Track, beat_grid: BeatGrid, phrases: list[Phrase]
+    ):
+        track2 = Track(
+            id=3, title="Test Track Two", artist="Other Artist", bpm=128.0,
+            duration_ms=200_000.0, analysis_path="", cues=[], phrases=phrases, beat_grid=beat_grid,
+        )
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track, track2]):
+            result = runner.invoke(cli, ["playlist", "add", "Source", "Test Track", "Dest"])
+        assert result.exit_code == 1
+        assert "2 tracks match" in result.output
+        assert "Test Track -- Test Artist" in result.output
+        assert "Test Track Two -- Other Artist" in result.output
+
+    def test_add_happy_path_calls_writer(self, runner: CliRunner, track: Track):
+        dest = _mock_playlist(playlist_id=99, name="Dest")
+        source = _mock_playlist(playlist_id=1, name="Source")
+
+        def _find(name):
+            return dest if name == "Dest" else source
+
+        with patch("djcues.cli.find_playlist", side_effect=_find), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.writer.add_track_to_playlist") as mock_add:
+            result = runner.invoke(cli, ["playlist", "add", "Source", "Test Track", "Dest"])
+        assert result.exit_code == 0
+        assert "Added 'Test Track' to 'Dest'." in result.output
+        mock_add.assert_called_once_with(99, 1)
+
+    def test_remove_happy_path_calls_writer_with_position(self, runner: CliRunner, track: Track):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist(name="Source")), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.writer.remove_track_from_playlist") as mock_remove:
+            result = runner.invoke(cli, ["playlist", "remove", "Source", "Test Track", "--position", "2"])
+        assert result.exit_code == 0
+        assert "Removed 'Test Track' from 'Source'." in result.output
+        mock_remove.assert_called_once_with(1, 1, position=2)
+
+    def test_remove_writer_track_not_in_playlist_error(self, runner: CliRunner, track: Track):
+        from djcues.writer import TrackNotInPlaylistError
+
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch(
+                 "djcues.writer.remove_track_from_playlist",
+                 side_effect=TrackNotInPlaylistError("track 1 is not in playlist 1"),
+             ):
+            result = runner.invoke(cli, ["playlist", "remove", "Source", "Test Track"])
+        assert result.exit_code == 1
+        assert "track 1 is not in playlist 1" in result.output
+
+    def test_remove_writer_ambiguous_entry_error_lists_candidates(self, runner: CliRunner, track: Track):
+        from djcues.writer import AmbiguousTrackEntryError
+
+        err = AmbiguousTrackEntryError(
+            "track 1 appears 2 times in playlist 1", candidates=[(1, "entry-1"), (3, "entry-3")]
+        )
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.writer.remove_track_from_playlist", side_effect=err):
+            result = runner.invoke(cli, ["playlist", "remove", "Source", "Test Track"])
+        assert result.exit_code == 1
+        assert "appears 2 times" in result.output
+        assert "1: entry-1" in result.output
+        assert "3: entry-3" in result.output
+
+    def test_remove_writer_rekordbox_running_error(self, runner: CliRunner, track: Track):
+        from djcues.writer import RekordboxRunningError
+
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch(
+                 "djcues.writer.remove_track_from_playlist",
+                 side_effect=RekordboxRunningError("Rekordbox is running. Close it before moving/adding/removing playlist tracks."),
+             ):
+            result = runner.invoke(cli, ["playlist", "remove", "Source", "Test Track"])
+        assert result.exit_code == 1
+        assert "Rekordbox is running" in result.output
+
+    def test_move_dest_playlist_not_found(self, runner: CliRunner, track: Track):
+        def _find(name):
+            return _mock_playlist(name=name) if name == "Source" else None
+
+        with patch("djcues.cli.find_playlist", side_effect=_find), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.writer.move_track_between_playlists") as mock_move:
+            result = runner.invoke(cli, ["playlist", "move", "Source", "Test Track", "NopeDest"])
+        assert result.exit_code == 1
+        assert "'NopeDest' not found" in result.output
+        mock_move.assert_not_called()
+
+    def test_move_happy_path_calls_writer(self, runner: CliRunner, track: Track):
+        dest = _mock_playlist(playlist_id=99, name="Dest")
+        source = _mock_playlist(playlist_id=1, name="Source")
+
+        def _find(name):
+            return dest if name == "Dest" else source
+
+        with patch("djcues.cli.find_playlist", side_effect=_find), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch("djcues.writer.move_track_between_playlists") as mock_move:
+            result = runner.invoke(cli, ["playlist", "move", "Source", "Test Track", "Dest", "--position", "3"])
+        assert result.exit_code == 0
+        assert "Moved 'Test Track' from 'Source' to 'Dest'." in result.output
+        mock_move.assert_called_once_with(1, 99, 1, position=3)
+
+    def test_move_source_equals_dest_error_from_writer_surfaces(self, runner: CliRunner, track: Track):
+        # writer.move_track_between_playlists is the actual source of this
+        # rejection (see test_writer.py) -- this just confirms the CLI
+        # surfaces it as a normal Error/exit 1, not an unhandled traceback.
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist(name="Same")), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track]), \
+             patch(
+                 "djcues.writer.move_track_between_playlists",
+                 side_effect=ValueError("source and destination playlists are the same"),
+             ):
+            result = runner.invoke(cli, ["playlist", "move", "Same", "Test Track", "Same"])
+        assert result.exit_code == 1
+        assert "source and destination playlists are the same" in result.output

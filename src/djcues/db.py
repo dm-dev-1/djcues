@@ -144,6 +144,27 @@ def list_playlist_tracks(playlist_id: str, db: Rekordbox6Database | None = None)
     return summaries
 
 
+def find_playlist_song_entries(
+    playlist_id: str, content_id: str, db: Rekordbox6Database | None = None
+) -> list[Any]:
+    """Every DjmdSongPlaylist entry for this track in this playlist,
+    sorted by TrackNo. Normally 0 or 1 -- >1 is legal (if unusual) if the
+    same track was added to the playlist more than once. Used by
+    writer.py's playlist-write functions to resolve exactly which
+    playlist-entry a remove/move targets, since pyrekordbox's own
+    remove_from_playlist() needs the entry ID, not the track/content ID.
+
+    Filters on both PlaylistID and ContentID server-side in one call --
+    the same db.get_playlist_songs(...) list_playlist_tracks() already
+    uses above, just with an extra kwarg (a first-class, already-
+    supported filter_by() call shape, not a new query pattern).
+    """
+    db = db if db is not None else get_db()
+    entries = list(db.get_playlist_songs(PlaylistID=playlist_id, ContentID=content_id))
+    entries.sort(key=lambda e: (e.TrackNo or 0))
+    return entries
+
+
 def _extract_beat_grid(track_content: Any, db: Rekordbox6Database | None = None) -> BeatGrid:
     """Extract BPM and first beat position from a track's analysis files."""
     db = db if db is not None else get_db()

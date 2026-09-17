@@ -1585,3 +1585,126 @@ def auth_web():
 
         config = load_config()
         click.echo(f"\nSaved. Provider: {config.get('provider')}, model: {config.get('model')}.")
+
+
+def _resolve_single_track(playlist_name, track_name):
+    """Shared by playlist add/remove/move: playlist_name -> find_playlist()
+    -> track_name -> substring match against that playlist's tracks,
+    hard-erroring on 0 or >1 matches. Unlike propose/compare/review
+    (which act on every match) or viz (which silently takes the first),
+    a mutating command must never guess which track the user meant.
+    """
+    playlist = find_playlist(playlist_name)
+    if playlist is None:
+        click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    tracks = load_playlist_tracks(playlist.ID)
+    matches = [t for t in tracks if track_name.lower() in t.title.lower()]
+    if not matches:
+        click.echo(f"Error: no track matching '{track_name}' in playlist '{playlist_name}'.", err=True)
+        raise SystemExit(1)
+    if len(matches) > 1:
+        click.echo(
+            f"Error: {len(matches)} tracks match '{track_name}' in playlist "
+            f"'{playlist_name}' -- be more specific:",
+            err=True,
+        )
+        for t in matches:
+            click.echo(f"  {t.title} -- {t.artist}", err=True)
+        raise SystemExit(1)
+
+    return playlist, matches[0]
+
+
+def _exit_on_playlist_write_error(e) -> None:
+    from djcues.writer import AmbiguousTrackEntryError
+
+    click.echo(f"Error: {e}", err=True)
+    if isinstance(e, AmbiguousTrackEntryError):
+        click.echo("Candidates (position, entry_id):", err=True)
+        for pos, entry_id in e.candidates:
+            click.echo(f"  {pos}: {entry_id}", err=True)
+    raise SystemExit(1)
+
+
+@cli.group()
+def playlist():
+    """Move/add/remove tracks between existing rekordbox playlists.
+
+    Writes directly to master.db -- rekordbox must be closed (checked
+    upfront, before any backup or write). A timestamped backup of
+    master.db is made before each change. Cannot create, delete, or
+    rename playlists -- only existing ones.
+    """
+
+
+@playlist.command("add")
+@click.argument("playlist_name")
+@click.argument("track_name")
+@click.argument("dest_playlist")
+def playlist_add(playlist_name, track_name, dest_playlist):
+    """Add the track in PLAYLIST_NAME matching TRACK_NAME to DEST_PLAYLIST."""
+    from djcues.writer import PlaylistWriteError, add_track_to_playlist
+
+    _source_playlist, track = _resolve_single_track(playlist_name, track_name)
+
+    dest = find_playlist(dest_playlist)
+    if dest is None:
+        click.echo(f"Error: playlist '{dest_playlist}' not found.", err=True)
+        raise SystemExit(1)
+
+    try:
+        add_track_to_playlist(dest.ID, track.id)
+    except (PlaylistWriteError, ValueError) as e:
+        _exit_on_playlist_write_error(e)
+
+    click.echo(f"Added '{track.title}' to '{dest_playlist}'.")
+
+
+@playlist.command("remove")
+@click.argument("playlist_name")
+@click.argument("track_name")
+@click.option(
+    "--position", type=int, default=None,
+    help="1-based position (TrackNo) to disambiguate if the track appears more than once in the playlist.",
+)
+def playlist_remove(playlist_name, track_name, position):
+    """Remove the track in PLAYLIST_NAME matching TRACK_NAME."""
+    from djcues.writer import PlaylistWriteError, remove_track_from_playlist
+
+    source, track = _resolve_single_track(playlist_name, track_name)
+
+    try:
+        remove_track_from_playlist(source.ID, track.id, position=position)
+    except (PlaylistWriteError, ValueError) as e:
+        _exit_on_playlist_write_error(e)
+
+    click.echo(f"Removed '{track.title}' from '{playlist_name}'.")
+
+
+@playlist.command("move")
+@click.argument("source_playlist")
+@click.argument("track_name")
+@click.argument("dest_playlist")
+@click.option(
+    "--position", type=int, default=None,
+    help="1-based position (TrackNo) in SOURCE_PLAYLIST to disambiguate if the track appears more than once there.",
+)
+def playlist_move(source_playlist, track_name, dest_playlist, position):
+    """Move the track in SOURCE_PLAYLIST matching TRACK_NAME to DEST_PLAYLIST."""
+    from djcues.writer import PlaylistWriteError, move_track_between_playlists
+
+    source, track = _resolve_single_track(source_playlist, track_name)
+
+    dest = find_playlist(dest_playlist)
+    if dest is None:
+        click.echo(f"Error: playlist '{dest_playlist}' not found.", err=True)
+        raise SystemExit(1)
+
+    try:
+        move_track_between_playlists(source.ID, dest.ID, track.id, position=position)
+    except (PlaylistWriteError, ValueError) as e:
+        _exit_on_playlist_write_error(e)
+
+    click.echo(f"Moved '{track.title}' from '{source_playlist}' to '{dest_playlist}'.")

@@ -2,6 +2,7 @@ import os
 import pathlib
 import pytest
 from pyrekordbox import get_config
+from pyrekordbox.utils import get_rekordbox_pid
 
 from djcues.models import BeatGrid, Phrase
 
@@ -20,6 +21,18 @@ REKORDBOX_DB_EXISTS = _rekordbox_db_exists()
 
 requires_rekordbox = pytest.mark.skipif(
     not REKORDBOX_DB_EXISTS, reason="Rekordbox database not found"
+)
+
+# For the small number of real, destructive playlist-write integration
+# tests (see test_writer.py's TestPlaylistWriteIntegration) -- pyrekordbox
+# itself refuses to commit while Rekordbox is running (writer.py's
+# ensure_rekordbox_closed()/commit()'s own check), so a test that tries
+# anyway would just fail with a confusing RekordboxRunningError instead
+# of skipping cleanly. Computed once at collection time, same as
+# REKORDBOX_DB_EXISTS above -- if Rekordbox is opened mid-run, already-
+# collected tests won't re-check, matching that same tradeoff.
+requires_rekordbox_closed = pytest.mark.skipif(
+    bool(get_rekordbox_pid()), reason="Rekordbox is running"
 )
 
 # For tests that need a real provider API key (live model list, real

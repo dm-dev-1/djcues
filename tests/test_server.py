@@ -21,7 +21,7 @@ import time
 import urllib.error
 import urllib.request
 from http.client import HTTPResponse
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1550,6 +1550,148 @@ class TestDashboardDevicesEndpoint:
         assert status == 400
         assert "device must be one of" in data["error"]
         assert not config_path.exists()
+
+
+class TestDashboardPlaylistWrites:
+    """POST /api/playlists/<id>/tracks (add), .../tracks/<content_id>/remove,
+    .../tracks/<content_id>/move -- djcues's first dashboard routes that
+    write to the database. djcues.writer's actual write functions have
+    their own real-logic tests in test_writer.py; these only cover
+    server.py's own routing/validation/status-code-mapping layer.
+
+    Not @requires_rekordbox-gated: patch.object(_DbWorker, "run", ...)
+    replaces the worker's own dispatch entirely (same technique
+    test_launch_db_worker_failure_returns_500_not_a_crash already uses
+    below), so the fn a route builds is called against a MagicMock
+    instead of ever reaching a real Rekordbox6Database -- no real
+    library needed for this route/validation/status-code coverage.
+    """
+
+    @staticmethod
+    def _worker_calls_fn_with(fake_db):
+        # patch.object(Class, "method", side_effect=...) does not bind
+        # `self` (MagicMock isn't a descriptor) -- the real caller shape
+        # is self._db_worker.run(fn), seen here as just (fn).
+        return lambda fn, timeout=30.0: fn(fake_db)
+
+    def test_add_missing_content_id_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _post(base_url + "/api/playlists/dest1/tracks", {})
+        assert status == 400
+        assert "content_id is required" in data["error"]
+
+    def test_add_happy_path(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.writer.add_track_to_playlist") as mock_add:
+            status, data = _post(base_url + "/api/playlists/dest1/tracks", {"content_id": "c1"})
+        assert status == 200
+        assert data == {"ok": True}
+        mock_add.assert_called_once_with("dest1", "c1", db=fake_db)
+
+    def test_add_rekordbox_running_is_409(self, dashboard_server):
+        from djcues.writer import RekordboxRunningError
+
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch(
+                 "djcues.writer.add_track_to_playlist",
+                 side_effect=RekordboxRunningError("Rekordbox is running."),
+             ):
+            status, data = _post(base_url + "/api/playlists/dest1/tracks", {"content_id": "c1"})
+        assert status == 409
+        assert "Rekordbox is running" in data["error"]
+
+    def test_add_value_error_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch(
+                 "djcues.writer.add_track_to_playlist",
+                 side_effect=ValueError("playlist dest1 not found"),
+             ):
+            status, data = _post(base_url + "/api/playlists/dest1/tracks", {"content_id": "c1"})
+        assert status == 400
+        assert "playlist dest1 not found" in data["error"]
+
+    def test_add_unexpected_error_is_500(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.writer.add_track_to_playlist", side_effect=RuntimeError("unexpected")):
+            status, data = _post(base_url + "/api/playlists/dest1/tracks", {"content_id": "c1"})
+        assert status == 500
+
+    def test_remove_happy_path_with_position(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.writer.remove_track_from_playlist") as mock_remove:
+            status, data = _post(base_url + "/api/playlists/pl1/tracks/c1/remove", {"position": 2})
+        assert status == 200
+        assert data == {"ok": True}
+        mock_remove.assert_called_once_with("pl1", "c1", position=2, db=fake_db)
+
+    def test_remove_track_not_in_playlist_is_404(self, dashboard_server):
+        from djcues.writer import TrackNotInPlaylistError
+
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch(
+                 "djcues.writer.remove_track_from_playlist",
+                 side_effect=TrackNotInPlaylistError("not there"),
+             ):
+            status, data = _post(base_url + "/api/playlists/pl1/tracks/c1/remove", {})
+        assert status == 404
+
+    def test_remove_ambiguous_entry_is_400_with_candidates(self, dashboard_server):
+        from djcues.writer import AmbiguousTrackEntryError
+
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        err = AmbiguousTrackEntryError("appears twice", candidates=[(1, "e1"), (3, "e3")])
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.writer.remove_track_from_playlist", side_effect=err):
+            status, data = _post(base_url + "/api/playlists/pl1/tracks/c1/remove", {})
+        assert status == 400
+        assert data["candidates"] == [[1, "e1"], [3, "e3"]]  # JSON round-trips tuples as lists
+
+    def test_move_missing_dest_playlist_id_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _post(base_url + "/api/playlists/pl1/tracks/c1/move", {})
+        assert status == 400
+        assert "dest_playlist_id is required" in data["error"]
+
+    def test_move_happy_path(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.writer.move_track_between_playlists") as mock_move:
+            status, data = _post(
+                base_url + "/api/playlists/pl1/tracks/c1/move",
+                {"dest_playlist_id": "pl2", "position": 5},
+            )
+        assert status == 200
+        assert data == {"ok": True}
+        mock_move.assert_called_once_with("pl1", "pl2", "c1", position=5, db=fake_db)
+
+    def test_move_rekordbox_running_is_409(self, dashboard_server):
+        from djcues.writer import RekordboxRunningError
+
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch(
+                 "djcues.writer.move_track_between_playlists",
+                 side_effect=RekordboxRunningError("closed please"),
+             ):
+            status, data = _post(
+                base_url + "/api/playlists/pl1/tracks/c1/move", {"dest_playlist_id": "pl2"}
+            )
+        assert status == 409
 
 
 @requires_rekordbox

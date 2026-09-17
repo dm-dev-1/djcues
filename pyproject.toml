@@ -119,3 +119,16 @@ packages = ["src/djcues"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# "destructive" tests write to the REAL rekordbox database (playlist
+# add/remove/move integration tests -- see test_writer.py's
+# TestPlaylistWriteIntegration). Opt-in only: excluded from a normal
+# `pytest` run by default via addopts below, matching @requires_rekordbox/
+# @requires_rekordbox_closed's own real-hardware-required gating, but
+# stronger -- those skip cleanly when the precondition isn't met, this
+# marker is excluded unconditionally unless explicitly asked for
+# (`pytest -m destructive`), since the risk here isn't "can't run", it's
+# "runs and touches real, live DJ library data."
+markers = [
+    "destructive: writes to the real rekordbox database -- opt-in only, run explicitly with -m destructive",
+]
+addopts = "-m 'not destructive'"

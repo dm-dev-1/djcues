@@ -161,6 +161,21 @@ def render_dashboard_html(
         </div>
       </div>
 
+      <div class="playlist-actions-section">
+        <p class="meta small">Move, add, or remove this track from a playlist (writes directly to rekordbox -- it must be closed):</p>
+        <div class="flags-row">
+          <label>Destination
+            <select id="playlist-dest-select"></select>
+          </label>
+          <button id="playlist-move-btn" class="btn btn-secondary" type="button">Move here</button>
+          <button id="playlist-add-btn" class="btn btn-secondary" type="button">Add (copy)</button>
+        </div>
+        <div class="playlist-remove-row">
+          <button id="playlist-remove-btn" class="btn btn-danger" type="button">Remove from this playlist</button>
+        </div>
+        <div id="playlist-action-status" class="job-status"></div>
+      </div>
+
       <div id="results-panel" class="results-panel hidden">
         <div id="job-status" class="job-status"></div>
         <div id="job-output-wrap" class="hidden">
@@ -263,6 +278,7 @@ _DASHBOARD_CSS = """
   .btn:disabled { opacity: 0.5; cursor: default; }
   .btn-primary { background: #17a2b8; color: #fff; }
   .btn-secondary { background: #2a2a3e; color: #eee; }
+  .btn-danger { background: #dc3545; color: #fff; }
   .btn-ghost { background: transparent; color: #aaa; padding: 4px 8px; }
   .hidden { display: none !important; }
 
@@ -310,6 +326,17 @@ _DASHBOARD_CSS = """
   .launch-section { margin-top: 16px; padding: 16px; border-top: 1px solid #2a2a3e; }
   .launch-buttons { display: flex; gap: 8px; margin-top: 8px; }
 
+  .playlist-actions-section { margin-top: 16px; padding: 16px; border-top: 1px solid #2a2a3e; }
+  .playlist-remove-row { margin-top: 10px; }
+  #playlist-dest-select {
+    background: #1e1e3a;
+    color: #eee;
+    border: 1px solid #2a2a3e;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font-size: 0.82rem;
+  }
+
   .results-panel { margin-top: 18px; padding: 16px; background: #12122a; border: 1px solid #2a2a3e; border-radius: 6px; }
   .job-status { font-size: 0.9rem; margin-bottom: 8px; }
   .job-status.info { color: #17a2b8; }
@@ -356,11 +383,23 @@ const jobHtmlFragmentEl = document.getElementById('job-html-fragment');
 const estimateDisplayEl = document.getElementById('estimate-display');
 const flagDeviceEl = document.getElementById('flag-device');
 const deviceStatusEl = document.getElementById('device-status');
+const playlistDestSelectEl = document.getElementById('playlist-dest-select');
+const playlistMoveBtn = document.getElementById('playlist-move-btn');
+const playlistAddBtn = document.getElementById('playlist-add-btn');
+const playlistRemoveBtn = document.getElementById('playlist-remove-btn');
+const playlistActionStatusEl = document.getElementById('playlist-action-status');
 
 let currentPlaylistId = null;
 let currentTracks = [];
 let currentTrackId = null;
 let currentAction = 'propose';
+// Flattened from /api/playlists' tree (real playlists only -- folders/
+// smart-playlists excluded here, client-side, which also sidesteps the
+// common case of pyrekordbox's stricter Attribute check rejecting a
+// playlist djcues itself otherwise treats as ordinary). Populated once
+// by loadPlaylists(), not re-fetched per track -- the destination
+// dropdown doesn't need to be any fresher than the tree already is.
+let allPlaylistsFlat = [];
 let pollTimer = null;
 let jobStartedAt = null;
 // Declared here, not inline near refreshEstimate() below, so it's
@@ -512,11 +551,20 @@ function renderPlaylistNode(node, depth) {{
   return el;
 }}
 
+function flattenPlaylists(nodes, out) {{
+  nodes.forEach(node => {{
+    if (node.kind === 'playlist') out.push({{ id: node.id, name: node.name }});
+    if (node.children && node.children.length) flattenPlaylists(node.children, out);
+  }});
+  return out;
+}}
+
 async function loadPlaylists() {{
   try {{
     const data = await fetchJson('/api/playlists');
     playlistTreeEl.innerHTML = '';
     data.tree.forEach(node => playlistTreeEl.appendChild(renderPlaylistNode(node, 0)));
+    allPlaylistsFlat = flattenPlaylists(data.tree, []);
   }} catch (err) {{
     playlistTreeEl.textContent = 'Error: ' + friendlyErrorMessage(err);
   }}
@@ -638,6 +686,16 @@ async function renderTrackDetail(playlistId, playlistName, trackId, trackTitle) 
       currentTracks = data.tracks;
     }} catch (err) {{ /* non-fatal */ }}
   }}
+
+  // Move/Remove need a known source playlist (reached directly, e.g. via
+  // a bookmark with no playlist_id, currentPlaylistId can be null --
+  // same edge case handled above). Add only needs a destination, so it
+  // stays enabled either way.
+  populatePlaylistDestSelect();
+  playlistMoveBtn.disabled = !currentPlaylistId;
+  playlistRemoveBtn.disabled = !currentPlaylistId;
+  playlistActionStatusEl.textContent = '';
+  playlistActionStatusEl.className = 'job-status';
 
   try {{
     const track = await fetchJson('/api/tracks/' + encodeURIComponent(trackId));
@@ -933,6 +991,98 @@ async function launchTool(tool) {{
     setTimeout(() => {{ btn.textContent = orig; btn.disabled = false; }}, 1500);
   }}
 }}
+
+// --- Playlist membership (move/add/remove) ---------------------------
+//
+// djcues's first dashboard controls that write to the database rather
+// than just reading it. All three routes go through the same
+// rekordbox-must-be-closed / auto-backup safety rules as the CLI's
+// `djcues playlist` commands -- see writer.py. position is threaded
+// through from the track's own track_no (already present in
+// /api/playlists/<id>/tracks responses) rather than adding a new field
+// -- the same disambiguation mechanism the CLI's --position uses, not
+// a second one, for the rare case of the same track appearing more
+// than once in one playlist.
+
+function populatePlaylistDestSelect() {{
+  playlistDestSelectEl.innerHTML = '';
+  allPlaylistsFlat
+    .filter(p => p.id !== currentPlaylistId)
+    .forEach(p => {{
+      const opt = document.createElement('option');
+      opt.value = p.id;
+      opt.textContent = p.name;
+      playlistDestSelectEl.appendChild(opt);
+    }});
+}}
+
+function currentTrackNo() {{
+  const t = currentTracks.find(t => t.id === currentTrackId);
+  return t ? t.track_no : null;
+}}
+
+async function runPlaylistAction(url, body, confirmMessage, successMessage) {{
+  if (confirmMessage && !window.confirm(confirmMessage)) return false;
+  playlistActionStatusEl.textContent = 'Working\\u2026';
+  playlistActionStatusEl.className = 'job-status info';
+  playlistMoveBtn.disabled = true;
+  playlistAddBtn.disabled = true;
+  playlistRemoveBtn.disabled = true;
+  try {{
+    await fetchJson(url, {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    playlistActionStatusEl.textContent = successMessage;
+    playlistActionStatusEl.className = 'job-status success';
+    return true;
+  }} catch (err) {{
+    playlistActionStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+    playlistActionStatusEl.className = 'job-status error';
+    return false;
+  }} finally {{
+    playlistAddBtn.disabled = false;
+    playlistMoveBtn.disabled = !currentPlaylistId;
+    playlistRemoveBtn.disabled = !currentPlaylistId;
+  }}
+}}
+
+playlistMoveBtn.addEventListener('click', async () => {{
+  if (!currentTrackId || !currentPlaylistId || !playlistDestSelectEl.value) return;
+  const destId = playlistDestSelectEl.value;
+  const destName = playlistDestSelectEl.options[playlistDestSelectEl.selectedIndex].textContent;
+  const ok = await runPlaylistAction(
+    '/api/playlists/' + encodeURIComponent(currentPlaylistId) + '/tracks/' + encodeURIComponent(currentTrackId) + '/move',
+    {{ dest_playlist_id: destId, position: currentTrackNo() }},
+    'Move this track to "' + destName + '"?',
+    'Moved.',
+  );
+  if (ok) history.back();
+}});
+
+playlistAddBtn.addEventListener('click', async () => {{
+  if (!currentTrackId || !playlistDestSelectEl.value) return;
+  const destId = playlistDestSelectEl.value;
+  const destName = playlistDestSelectEl.options[playlistDestSelectEl.selectedIndex].textContent;
+  await runPlaylistAction(
+    '/api/playlists/' + encodeURIComponent(destId) + '/tracks',
+    {{ content_id: currentTrackId }},
+    null,
+    'Added to "' + destName + '".',
+  );
+}});
+
+playlistRemoveBtn.addEventListener('click', async () => {{
+  if (!currentTrackId || !currentPlaylistId) return;
+  const ok = await runPlaylistAction(
+    '/api/playlists/' + encodeURIComponent(currentPlaylistId) + '/tracks/' + encodeURIComponent(currentTrackId) + '/remove',
+    {{ position: currentTrackNo() }},
+    'Remove this track from "' + currentPlaylistNameEl.textContent + '"?',
+    'Removed.',
+  );
+  if (ok) history.back();
+}});
 
 // Called after INITIAL_PLAYLIST (server-embedded, from a
 // `djcues dashboard "Playlist Name"` argument) is defined -- see the

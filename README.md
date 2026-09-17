@@ -81,6 +81,24 @@ In the review UI:
 - Press Delete to skip an individual cue
 - Memory cues auto-recalculate when you adjust their hot cue
 
+### Move/add/remove tracks between playlists
+
+```bash
+# Move a track from one playlist to another
+djcues playlist move "Source Playlist" "Track Name" "Dest Playlist"
+
+# Add a track to a playlist (leaves it in its current playlist(s) too)
+djcues playlist add "Source Playlist" "Track Name" "Dest Playlist"
+
+# Remove a track from a playlist
+djcues playlist remove "Playlist Name" "Track Name"
+
+# If the same track appears more than once in a playlist, disambiguate by position
+djcues playlist remove "Playlist Name" "Track Name" --position 2
+```
+
+Requires rekordbox to be closed (same rule as `apply`) and only works between playlists that already exist — it won't create, delete, or rename one. If more than one track in the playlist matches the name you gave, the command lists every match instead of guessing which one you meant. The same three actions are also available from the dashboard's track detail view.
+
 ### Analysis dashboard
 
 ```bash
@@ -91,7 +109,7 @@ djcues dashboard
 djcues dashboard "Playlist Name"
 ```
 
-Browse your real rekordbox playlists (including folders) and tracks without already knowing exact names to type as CLI arguments. Select a track to see its metadata, then run `propose`, `compare`, or `beatgrid` against it with the same flags the CLI exposes (`--agentic`, `--refine-drops`, `--deep`, offset/loop-bars, etc.) — results, including a real waveform/timeline for propose/compare, render inline as the job completes. A `--deep` or `--agentic` run genuinely takes as long as it does from the CLI (minutes for Demucs, real API latency for agentic) without blocking the rest of the page — browse a different track while one runs. Every dashboard-triggered run shares the same [analysis cache](#analysis-cache) as the CLI, so a track already analyzed either way shows up instantly the second time. "Open in Viz" / "Open in Review" launch the existing, unmodified commands for the selected track in their own tab. Fully read-only, same guarantee as `propose`/`compare`/`viz`/`review`/`beatgrid`.
+Browse your real rekordbox playlists (including folders) and tracks without already knowing exact names to type as CLI arguments. Select a track to see its metadata, then run `propose`, `compare`, or `beatgrid` against it with the same flags the CLI exposes (`--agentic`, `--refine-drops`, `--deep`, offset/loop-bars, etc.) — results, including a real waveform/timeline for propose/compare, render inline as the job completes. A `--deep` or `--agentic` run genuinely takes as long as it does from the CLI (minutes for Demucs, real API latency for agentic) without blocking the rest of the page — browse a different track while one runs. Every dashboard-triggered run shares the same [analysis cache](#analysis-cache) as the CLI, so a track already analyzed either way shows up instantly the second time. "Open in Viz" / "Open in Review" launch the existing, unmodified commands for the selected track in their own tab. Read-only for analysis, same guarantee as `propose`/`compare`/`viz`/`review`/`beatgrid` — the track detail view's own Move/Add/Remove playlist controls are the one exception, following the same backup/Rekordbox-closed rules as `djcues playlist` on the CLI (see [above](#moveaddremove-tracks-between-playlists)).
 
 ### Compare accuracy against curated tracks
 
@@ -215,10 +233,10 @@ Run `djcues auth device --device <choice>` any time to see what's actually detec
 
 ## Safety
 
-- **Auto-backup**: `djcues apply` automatically backs up `master.db` before writing
+- **Auto-backup**: `djcues apply` and `djcues playlist add/remove/move` automatically back up `master.db` before writing
 - **Overwrite protection**: Tracks with existing cues require explicit confirmation
-- **Rekordbox must be closed**: The apply command will not write while rekordbox is running
-- **Read-only by default**: `propose`, `compare`, `viz`, `review`, `beatgrid`, and `dashboard` never modify the database
+- **Rekordbox must be closed**: `apply` and `playlist add/remove/move` (CLI and dashboard alike) will not write while rekordbox is running
+- **Read-only by default**: `propose`, `compare`, `viz`, `review`, and `beatgrid` never modify the database. The dashboard is read-only except for its playlist move/add/remove controls, which follow the same backup/Rekordbox-closed rules as the CLI.
 - **DB-only writes**: Cues are written to `master.db` only (not ANLZ files). rekordbox handles ANLZ sync on USB export.
 - **Analysis cache**: `propose`/`compare`/`review`/`beatgrid` cache results locally at `~/.djcues/analysis_cache.db` to avoid redundant recomputation — never touches the rekordbox database; use `--no-cache` to force a fresh run.
 

@@ -110,6 +110,16 @@ class TestExplicitDbParam:
             list_playlist_tracks("123", db=fake_db)
         mock_get_db.assert_not_called()
 
+    def test_find_playlist_song_entries_skips_shared_db_when_given(self):
+        from djcues.db import find_playlist_song_entries
+
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = []
+        with patch("djcues.db.get_db") as mock_get_db:
+            find_playlist_song_entries("pl1", "c1", db=fake_db)
+        mock_get_db.assert_not_called()
+        fake_db.get_playlist_songs.assert_called_once_with(PlaylistID="pl1", ContentID="c1")
+
 
 # ---------------------------------------------------------------------------
 # build_playlist_tree / list_playlist_tracks -- the cheap, ANLZ-free
@@ -242,6 +252,40 @@ class TestListPlaylistTracks:
         tracks = list_playlist_tracks("playlist1", db=fake_db)
 
         assert tracks[0].artist == ""
+
+
+class TestFindPlaylistSongEntries:
+    def test_sorts_by_track_no(self):
+        from djcues.db import find_playlist_song_entries
+
+        e1, e2 = MagicMock(TrackNo=5), MagicMock(TrackNo=2)
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = [e1, e2]
+
+        entries = find_playlist_song_entries("pl1", "c1", db=fake_db)
+
+        assert entries == [e2, e1]
+        fake_db.get_playlist_songs.assert_called_once_with(PlaylistID="pl1", ContentID="c1")
+
+    def test_no_match_returns_empty_list(self):
+        from djcues.db import find_playlist_song_entries
+
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = []
+
+        assert find_playlist_song_entries("pl1", "c1", db=fake_db) == []
+
+    def test_more_than_one_match_is_legal_and_returns_all(self):
+        # The same track added to one playlist twice -- unusual but real,
+        # and the reason writer.py's resolve_playlist_entry() needs a
+        # --position to disambiguate rather than this function picking one.
+        from djcues.db import find_playlist_song_entries
+
+        e1, e2 = MagicMock(TrackNo=1), MagicMock(TrackNo=3)
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = [e1, e2]
+
+        assert find_playlist_song_entries("pl1", "c1", db=fake_db) == [e1, e2]
 
 
 @requires_rekordbox

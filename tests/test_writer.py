@@ -9,6 +9,7 @@ import click
 import pytest
 
 from djcues.constants import CUE_SYSTEM, CUE_SYSTEM_BY_PAD
+from tests.conftest import requires_rekordbox, requires_rekordbox_closed
 
 
 # ---------------------------------------------------------------------------
@@ -494,3 +495,394 @@ def test_apply_session_force_skips_confirmation_even_with_existing_cues(tmp_path
     # force=True skips the *prompt*, but overwrite itself must still
     # happen -- same reasoning as the confirmed-prompt test above.
     db.delete.assert_called_once_with(existing_cue)
+
+
+# ---------------------------------------------------------------------------
+# Playlist membership (move/add/remove) -- djcues's first write path that
+# isn't cue data. db is always a MagicMock; djcues.db.find_playlist_song
+# _entries and pyrekordbox.utils.get_rekordbox_pid are patched at their
+# real origin (both are imported locally inside writer.py's functions, the
+# same reason djcues.db.get_db is patched at its origin above, not as
+# djcues.writer.get_db). backup_database is NOT mocked, same reasoning as
+# apply_session's tests -- a real shutil.copy2 against a real (fake,
+# tmp_path-only) master.db, for genuine coverage with no risk to real data.
+# ---------------------------------------------------------------------------
+
+
+def _entry(track_no: int, entry_id: str = None) -> MagicMock:
+    return MagicMock(TrackNo=track_no, ID=entry_id or f"entry-{track_no}")
+
+
+def test_ensure_rekordbox_closed_raises_when_running():
+    from djcues.writer import RekordboxRunningError, ensure_rekordbox_closed
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=12345):
+        with pytest.raises(RekordboxRunningError, match="Rekordbox is running"):
+            ensure_rekordbox_closed()
+
+
+def test_ensure_rekordbox_closed_no_error_when_not_running():
+    from djcues.writer import ensure_rekordbox_closed
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        ensure_rekordbox_closed()  # must not raise
+
+
+def test_resolve_playlist_entry_no_match_raises_not_in_playlist():
+    from djcues.writer import TrackNotInPlaylistError, resolve_playlist_entry
+
+    with patch("djcues.db.find_playlist_song_entries", return_value=[]):
+        with pytest.raises(TrackNotInPlaylistError):
+            resolve_playlist_entry("pl1", "c1")
+
+
+def test_resolve_playlist_entry_single_match_no_position_returns_it():
+    from djcues.writer import resolve_playlist_entry
+
+    entry = _entry(3)
+    with patch("djcues.db.find_playlist_song_entries", return_value=[entry]):
+        result = resolve_playlist_entry("pl1", "c1")
+
+    assert result is entry
+
+
+def test_resolve_playlist_entry_single_match_wrong_position_still_raises():
+    # A stale/wrong --position must be caught, not silently ignored just
+    # because there was only one entry to begin with.
+    from djcues.writer import TrackNotInPlaylistError, resolve_playlist_entry
+
+    entry = _entry(3)
+    with patch("djcues.db.find_playlist_song_entries", return_value=[entry]):
+        with pytest.raises(TrackNotInPlaylistError):
+            resolve_playlist_entry("pl1", "c1", position=5)
+
+
+def test_resolve_playlist_entry_multiple_matches_no_position_raises_ambiguous():
+    from djcues.writer import AmbiguousTrackEntryError, resolve_playlist_entry
+
+    e1, e2 = _entry(1), _entry(4)
+    with patch("djcues.db.find_playlist_song_entries", return_value=[e1, e2]):
+        with pytest.raises(AmbiguousTrackEntryError) as exc_info:
+            resolve_playlist_entry("pl1", "c1")
+
+    assert set(exc_info.value.candidates) == {(1, "entry-1"), (4, "entry-4")}
+
+
+def test_resolve_playlist_entry_multiple_matches_position_picks_one():
+    from djcues.writer import resolve_playlist_entry
+
+    e1, e2 = _entry(1), _entry(4)
+    with patch("djcues.db.find_playlist_song_entries", return_value=[e1, e2]):
+        result = resolve_playlist_entry("pl1", "c1", position=4)
+
+    assert result is e2
+
+
+def _fake_playlist_db(tmp_path, *, source=None, dest=None, content=None) -> MagicMock:
+    (tmp_path / "master.db").write_bytes(b"fake-sqlite-content")
+    db = MagicMock()
+    db.db_directory = tmp_path
+
+    playlists = {}
+    if source is not None:
+        playlists[source.ID] = source
+    if dest is not None:
+        playlists[dest.ID] = dest
+    db.get_playlist.side_effect = lambda ID: playlists.get(ID)
+    db.get_content.return_value = content if content is not None else MagicMock(ID="c1")
+    return db
+
+
+def test_add_track_to_playlist_happy_path(tmp_path):
+    from djcues.writer import add_track_to_playlist
+
+    dest = MagicMock(ID="dest1")
+    db = _fake_playlist_db(tmp_path, dest=dest)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        add_track_to_playlist("dest1", "c1", db=db)
+
+    db.add_to_playlist.assert_called_once_with(dest, db.get_content.return_value, track_no=None)
+    db.commit.assert_called_once()
+    assert list(tmp_path.glob("master-backup-*.db"))
+
+
+def test_add_track_to_playlist_unknown_playlist_raises_before_backup(tmp_path):
+    from djcues.writer import add_track_to_playlist
+
+    db = _fake_playlist_db(tmp_path)  # no playlists registered
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(ValueError, match="not found"):
+            add_track_to_playlist("dest1", "c1", db=db)
+
+    assert not list(tmp_path.glob("master-backup-*.db"))
+    db.add_to_playlist.assert_not_called()
+
+
+def test_add_track_to_playlist_rekordbox_running_raises_before_backup(tmp_path):
+    from djcues.writer import RekordboxRunningError, add_track_to_playlist
+
+    dest = MagicMock(ID="dest1")
+    db = _fake_playlist_db(tmp_path, dest=dest)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=99999):
+        with pytest.raises(RekordboxRunningError):
+            add_track_to_playlist("dest1", "c1", db=db)
+
+    assert not list(tmp_path.glob("master-backup-*.db"))
+    db.add_to_playlist.assert_not_called()
+
+
+def test_add_track_to_playlist_commit_runtime_error_rolls_back_and_reraises(tmp_path):
+    from djcues.writer import RekordboxRunningError, add_track_to_playlist
+
+    dest = MagicMock(ID="dest1")
+    db = _fake_playlist_db(tmp_path, dest=dest)
+    db.commit.side_effect = RuntimeError("Rekordbox is running.")
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(RekordboxRunningError):
+            add_track_to_playlist("dest1", "c1", db=db)
+
+    db.rollback.assert_called_once()
+
+
+def test_add_track_to_playlist_unexpected_error_rolls_back_and_reraises(tmp_path):
+    from djcues.writer import add_track_to_playlist
+
+    dest = MagicMock(ID="dest1")
+    db = _fake_playlist_db(tmp_path, dest=dest)
+    db.add_to_playlist.side_effect = ValueError("Playlist must be a normal playlist")
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(ValueError, match="normal playlist"):
+            add_track_to_playlist("dest1", "c1", db=db)
+
+    db.rollback.assert_called_once()
+
+
+def test_remove_track_from_playlist_happy_path(tmp_path):
+    from djcues.writer import remove_track_from_playlist
+
+    source = MagicMock(ID="src1")
+    db = _fake_playlist_db(tmp_path, source=source)
+    entry = _entry(1)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None), \
+         patch("djcues.db.find_playlist_song_entries", return_value=[entry]):
+        remove_track_from_playlist("src1", "c1", db=db)
+
+    # Passed the already-resolved entry object, not a raw ID -- pyrekordbox's
+    # own internal re-lookup (a possible NoResultFound source) never runs.
+    db.remove_from_playlist.assert_called_once_with(source, entry)
+    db.commit.assert_called_once()  # flushes the trailing TrackNo renumbering
+    assert list(tmp_path.glob("master-backup-*.db"))
+
+
+def test_remove_track_from_playlist_not_in_playlist_raises_before_backup(tmp_path):
+    from djcues.writer import TrackNotInPlaylistError, remove_track_from_playlist
+
+    source = MagicMock(ID="src1")
+    db = _fake_playlist_db(tmp_path, source=source)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None), \
+         patch("djcues.db.find_playlist_song_entries", return_value=[]):
+        with pytest.raises(TrackNotInPlaylistError):
+            remove_track_from_playlist("src1", "c1", db=db)
+
+    assert not list(tmp_path.glob("master-backup-*.db"))
+    db.remove_from_playlist.assert_not_called()
+
+
+def test_remove_track_from_playlist_unexpected_error_rolls_back_and_reraises(tmp_path):
+    from djcues.writer import remove_track_from_playlist
+
+    source = MagicMock(ID="src1")
+    db = _fake_playlist_db(tmp_path, source=source)
+    entry = _entry(1)
+    db.remove_from_playlist.side_effect = RuntimeError("boom")
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None), \
+         patch("djcues.db.find_playlist_song_entries", return_value=[entry]):
+        # A generic RuntimeError not from commit() itself would be an odd
+        # real-world case (remove_from_playlist has no other RuntimeError
+        # source today), but the handler can't tell the difference --
+        # confirm it's still mapped to RekordboxRunningError, matching
+        # add's handling exactly, and that rollback still happens.
+        from djcues.writer import RekordboxRunningError
+        with pytest.raises(RekordboxRunningError):
+            remove_track_from_playlist("src1", "c1", db=db)
+
+    db.rollback.assert_called_once()
+
+
+def test_move_track_between_playlists_same_playlist_raises():
+    from djcues.writer import move_track_between_playlists
+
+    db = MagicMock()
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(ValueError, match="same"):
+            move_track_between_playlists("pl1", "pl1", "c1", db=db)
+
+    db.get_playlist.assert_not_called()  # rejected before any lookup
+
+
+def test_move_track_between_playlists_calls_add_before_remove_with_no_commit_between(tmp_path):
+    """The single most important test in this feature: move's atomicity
+    guarantee (see writer.py's own comment on move_track_between_playlists)
+    depends entirely on add_to_playlist (stage only) being called before
+    remove_from_playlist (which commits immediately, flushing both halves
+    together) -- with nothing committing in between. If a future change
+    reorders these, or routes through the add_track_to_playlist/
+    remove_track_from_playlist wrappers instead (each of which commits on
+    its own), this test must fail.
+    """
+    from djcues.writer import move_track_between_playlists
+
+    source = MagicMock(ID="src1")
+    dest = MagicMock(ID="dest1")
+    content = MagicMock(ID="c1")
+    db = _fake_playlist_db(tmp_path, source=source, dest=dest, content=content)
+    entry = _entry(1)
+
+    calls: list[str] = []
+    db.add_to_playlist.side_effect = lambda *a, **k: calls.append("add_to_playlist")
+    db.remove_from_playlist.side_effect = lambda *a, **k: calls.append("remove_from_playlist")
+    db.commit.side_effect = lambda: calls.append("commit")
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None), \
+         patch("djcues.db.find_playlist_song_entries", return_value=[entry]):
+        move_track_between_playlists("src1", "dest1", "c1", db=db)
+
+    # add, then remove (which internally commits both), then exactly one
+    # more explicit commit for the trailing renumbering -- never a commit
+    # between add and remove.
+    assert calls == ["add_to_playlist", "remove_from_playlist", "commit"]
+    db.add_to_playlist.assert_called_once_with(dest, content)
+    db.remove_from_playlist.assert_called_once_with(source, entry)
+
+
+def test_move_track_between_playlists_rekordbox_running_raises_before_backup(tmp_path):
+    from djcues.writer import RekordboxRunningError, move_track_between_playlists
+
+    source = MagicMock(ID="src1")
+    dest = MagicMock(ID="dest1")
+    db = _fake_playlist_db(tmp_path, source=source, dest=dest)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=99999):
+        with pytest.raises(RekordboxRunningError):
+            move_track_between_playlists("src1", "dest1", "c1", db=db)
+
+    assert not list(tmp_path.glob("master-backup-*.db"))
+    db.add_to_playlist.assert_not_called()
+
+
+def test_move_track_between_playlists_failure_rolls_back_and_reraises(tmp_path):
+    from djcues.writer import move_track_between_playlists
+
+    source = MagicMock(ID="src1")
+    dest = MagicMock(ID="dest1")
+    db = _fake_playlist_db(tmp_path, source=source, dest=dest)
+    entry = _entry(1)
+    db.remove_from_playlist.side_effect = ValueError("something went wrong")
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None), \
+         patch("djcues.db.find_playlist_song_entries", return_value=[entry]):
+        with pytest.raises(ValueError, match="something went wrong"):
+            move_track_between_playlists("src1", "dest1", "c1", db=db)
+
+    db.rollback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Real, opt-in integration tests -- genuinely write to the real rekordbox
+# database (`pytest -m destructive` to run; excluded from a normal
+# `pytest` run by pyproject.toml's addopts). Everything above this line
+# uses a MagicMock db and never touches real data.
+#
+# Confined entirely to "CUE Analysis Playlist" -- a real, currently-empty
+# (0 tracks) playlist in this library, confirmed live immediately before
+# writing this test (not assumed from an old session note -- see
+# writer.py's plan file for why that distinction matters here). Every
+# test below re-confirms it's still empty at the start, for the same
+# reason: a stale assumption about real, live data is exactly the kind
+# of mistake this project's own discipline exists to catch. Only ever
+# adds to / removes from this one playlist -- a real track from Tech
+# House is used as the content being added, but Tech House itself is
+# never written to (adding a track to one playlist doesn't remove it
+# from any other), so it's never at risk. move_track_between_playlists
+# is deliberately NOT exercised live against two real curated playlists
+# here -- its exact ordering/atomicity/rollback behavior is already
+# covered exhaustively above with mocks (more precisely than a live test
+# could observe from end-state alone), and it internally calls the same
+# two pyrekordbox primitives add/remove's own live tests below already
+# exercise for real, so a live move test would add materially more real-
+# data risk for comparatively little additional real-API coverage.
+# ---------------------------------------------------------------------------
+
+
+SCRATCH_PLAYLIST_NAME = "CUE Analysis Playlist"
+
+
+def _real_scratch_playlist_and_source_track():
+    from djcues.db import find_playlist, list_playlist_tracks
+
+    scratch = find_playlist(SCRATCH_PLAYLIST_NAME)
+    assert scratch is not None, f"expected a real '{SCRATCH_PLAYLIST_NAME}' playlist in this library"
+    assert list_playlist_tracks(scratch.ID) == [], (
+        f"'{SCRATCH_PLAYLIST_NAME}' is expected to stay empty between test runs -- "
+        "it has tracks in it right now, so this test won't touch it (don't assume "
+        "it's still safe to use without checking; see this file's own comment above)"
+    )
+
+    source = find_playlist("Tech House")
+    assert source is not None, "expected a real 'Tech House' playlist in this library"
+    tech_house_tracks = list_playlist_tracks(source.ID)
+    assert tech_house_tracks, "expected 'Tech House' to have at least one real track"
+    return scratch, tech_house_tracks[0]
+
+
+@requires_rekordbox
+@requires_rekordbox_closed
+@pytest.mark.destructive
+def test_add_and_remove_real_track_roundtrip_against_scratch_playlist():
+    """The one real, live confirmation this feature's whole write path
+    (backup -> pyrekordbox add/remove -> commit) works end to end against
+    the real installed pyrekordbox package and this real library -- not
+    just against mocks. Backup verification is folded into this same
+    test rather than a separate one: backup_database()'s timestamp has
+    only second-level granularity, so two separate real writes from two
+    separate destructive tests running less than a second apart can
+    legitimately produce the *same* backup filename (confirmed live
+    while writing this) -- not a bug in backup_database (apply_session
+    has relied on this exact behavior for a while), just a reason to
+    keep this to one real write instead of two.
+    """
+    from djcues.db import get_db, list_playlist_tracks
+    from djcues.writer import add_track_to_playlist, remove_track_from_playlist
+
+    scratch, track = _real_scratch_playlist_and_source_track()
+    db = get_db()
+    master_db_path = db.db_directory / "master.db"
+    backups_before = set(master_db_path.parent.glob("master-backup-*.db"))
+
+    try:
+        add_track_to_playlist(scratch.ID, track.id)
+
+        after_add = list_playlist_tracks(scratch.ID)
+        assert len(after_add) == 1
+        assert after_add[0].id == track.id
+
+        backups_after = set(master_db_path.parent.glob("master-backup-*.db"))
+        assert backups_after >= backups_before  # never fewer; a real backup should exist either way
+        assert backups_after, "expected at least one real master-backup-*.db file to exist after a real write"
+    finally:
+        # Runs even if the assertions above failed, so a real assertion
+        # failure can't leave the scratch playlist non-empty for the
+        # next run of this same test.
+        remaining = list_playlist_tracks(scratch.ID)
+        for t in remaining:
+            remove_track_from_playlist(scratch.ID, t.id)
+
+    assert list_playlist_tracks(scratch.ID) == []
