@@ -1795,6 +1795,71 @@ class TestDashboardSuggestionsEndpoint:
         assert "no usable Camelot key" in data["error"]
 
 
+class TestDashboardAuditEndpoint:
+    """GET /api/audit -- read-only, same technique as
+    TestDashboardSuggestionsEndpoint (patch.object(_DbWorker, "run", ...)),
+    so no real Rekordbox database is needed. djcues.audit's own logic
+    has its own exhaustive tests in test_audit.py.
+    """
+
+    @staticmethod
+    def _worker_calls_fn_with(fake_db):
+        return lambda fn, timeout=30.0: fn(fake_db)
+
+    def test_missing_scope_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _get(base_url + "/api/audit")
+        assert status == 400
+        assert "playlist_id or library is required" in data["error"]
+
+    def test_invalid_bpm_tolerance_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, _data = _get(base_url + "/api/audit?playlist_id=pl1&bpm_tolerance=not-a-number")
+        assert status == 400
+
+    def test_playlist_scoped_happy_path(self, dashboard_server):
+        from djcues.models import TrackSummary
+
+        base_url, _server = dashboard_server
+        dreamin = TrackSummary(
+            id="1", track_no=1, title="Dreamin'", artist="Jimi Jules", bpm=146.92,
+            duration_ms=1.0, key="2A", comment="2A - 118",
+        )
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_playlist_tracks", return_value=[dreamin]) as mock_playlist:
+            status, data = _get(base_url + "/api/audit?playlist_id=pl1")
+        assert status == 200
+        mock_playlist.assert_called_once()
+        assert data["scanned"] == 1
+        assert data["comment_hint_count"] == 1
+        assert len(data["findings"]) == 1
+        assert data["findings"][0]["comment"] == "2A - 118"
+        assert data["findings"][0]["bpm_mismatch"] is True
+
+    def test_library_true_uses_list_all_tracks(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_all_tracks", return_value=[]) as mock_all, \
+             patch("djcues.db.list_playlist_tracks") as mock_playlist:
+            status, data = _get(base_url + "/api/audit?library=true")
+        assert status == 200
+        mock_all.assert_called_once()
+        mock_playlist.assert_not_called()
+        assert data["scanned"] == 0
+
+    def test_library_absent_never_calls_list_all_tracks(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.db.list_playlist_tracks", return_value=[]), \
+             patch("djcues.db.list_all_tracks") as mock_all:
+            status, _data = _get(base_url + "/api/audit?playlist_id=pl1")
+        assert status == 200
+        mock_all.assert_not_called()
+
+
 @requires_rekordbox
 class TestDashboardHandlerLaunch:
     @staticmethod

@@ -132,12 +132,13 @@ def _track_summary_from_content(content: Any, track_no: int | None) -> TrackSumm
         bpm=(content.BPM or 0) / 100,
         duration_ms=float(content.Length or 0) * 1000,
         key=key,
+        comment=content.Commnt or None,
     )
 
 
 def list_playlist_tracks(playlist_id: str, db: Rekordbox6Database | None = None) -> list[TrackSummary]:
-    """Cheap track listing for one playlist -- title/artist/bpm/duration/key
-    straight from DjmdContent via the DjmdSongPlaylist relationship, zero
+    """Cheap track listing for one playlist -- title/artist/bpm/duration/key/
+    comment straight from DjmdContent via the DjmdSongPlaylist relationship, zero
     ANLZ I/O (unlike load_playlist_tracks() below, which is what makes a
     full-library enumeration take ~90-100s in practice). Use this for
     browsing; only call load_track()/load_playlist_tracks() once the user
@@ -161,7 +162,8 @@ def list_all_tracks(db: Rekordbox6Database | None = None) -> list[TrackSummary]:
     directly instead of one playlist's DjmdSongPlaylist rows. track_no is
     always None (TrackNo is playlist-membership metadata, meaningless
     outside of one). Powers whole-library scoped features (e.g. harmony.py's
-    --library search) where a single curated playlist is too narrow.
+    and audit.py's --library options) where a single curated playlist is
+    too narrow.
     """
     db = db if db is not None else get_db()
     return [_track_summary_from_content(content, track_no=None) for content in db.get_content()]

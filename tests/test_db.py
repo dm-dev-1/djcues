@@ -289,12 +289,53 @@ class TestListPlaylistTracks:
 
         assert tracks[0].key is None
 
+    def test_commnt_flows_into_comment_field(self):
+        from djcues.db import list_playlist_tracks
+
+        song = MagicMock()
+        song.TrackNo = 1
+        song.Content.ID = "c1"
+        song.Content.Title = "Track"
+        song.Content.Artist = None
+        song.Content.BPM = 12800
+        song.Content.Length = 100
+        song.Content.Key = None
+        song.Content.Commnt = "2A - 118"
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = [song]
+
+        tracks = list_playlist_tracks("playlist1", db=fake_db)
+
+        assert tracks[0].comment == "2A - 118"
+
+    def test_missing_or_empty_commnt_is_none(self):
+        from djcues.db import list_playlist_tracks
+
+        def _song(commnt):
+            song = MagicMock()
+            song.TrackNo = 1
+            song.Content.ID = "c1"
+            song.Content.Title = "Track"
+            song.Content.Artist = None
+            song.Content.BPM = 12800
+            song.Content.Length = 100
+            song.Content.Key = None
+            song.Content.Commnt = commnt
+            return song
+
+        fake_db = MagicMock()
+        fake_db.get_playlist_songs.return_value = [_song(None)]
+        assert list_playlist_tracks("playlist1", db=fake_db)[0].comment is None
+
+        fake_db.get_playlist_songs.return_value = [_song("")]
+        assert list_playlist_tracks("playlist1", db=fake_db)[0].comment is None
+
 
 class TestListAllTracks:
     def test_maps_content_rows_to_track_summaries_with_track_no_always_none(self):
         from djcues.db import list_all_tracks
 
-        def _mock_content(id_, title, bpm, key_scale):
+        def _mock_content(id_, title, bpm, key_scale, comment=None):
             content = MagicMock()
             content.ID = id_
             content.Title = title
@@ -302,9 +343,13 @@ class TestListAllTracks:
             content.BPM = bpm
             content.Length = 200
             content.Key.ScaleName = key_scale
+            content.Commnt = comment
             return content
 
-        rows = [_mock_content("1", "Track A", 12800, "9A"), _mock_content("2", "Track B", 17400, "8B")]
+        rows = [
+            _mock_content("1", "Track A", 12800, "9A", comment="9A - 128"),
+            _mock_content("2", "Track B", 17400, "8B"),
+        ]
         fake_db = MagicMock()
         fake_db.get_content.return_value = rows
 
@@ -312,6 +357,7 @@ class TestListAllTracks:
 
         assert [t.title for t in tracks] == ["Track A", "Track B"]
         assert [t.key for t in tracks] == ["9A", "8B"]
+        assert [t.comment for t in tracks] == ["9A - 128", None]
         assert all(t.track_no is None for t in tracks)
         fake_db.get_content.assert_called_once_with()
 
@@ -417,3 +463,4 @@ def test_list_all_tracks_real_library_has_camelot_parseable_keys():
     assert len(tracks) > 0
     assert all(t.track_no is None for t in tracks)
     assert any(parse_camelot_key(t.key) is not None for t in tracks)
+    assert any(t.comment for t in tracks)

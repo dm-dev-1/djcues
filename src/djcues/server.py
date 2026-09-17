@@ -1008,6 +1008,8 @@ class DashboardHandler(_LocalJsonHandler):
             self._handle_estimate_get()
         elif path == "/api/devices":
             self._handle_devices_get()
+        elif path == "/api/audit":
+            self._handle_audit_get()
         else:
             parts = [p for p in path.split("/") if p]
             if len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks":
@@ -1225,6 +1227,85 @@ class DashboardHandler(_LocalJsonHandler):
                 for s in result.suggestions
             ],
             "excluded_summary": excluded_summary,
+        })
+
+    def _handle_audit_get(self) -> None:
+        """GET /api/audit?playlist_id=&library=&bpm_tolerance=&half_double=
+
+        Read-only, same shape as _handle_track_suggestions_get -- the
+        cheap list_playlist_tracks()/list_all_tracks() call happens
+        inside the _db_worker closure, audit.audit_tracks() itself needs
+        no DB access and runs outside it. No path parameter (everything
+        is query-string), so this is routed from do_GET's flat path==
+        branch section, not the parameterized-route section.
+        """
+        from urllib.parse import parse_qs, urlsplit
+
+        from djcues import audit as audit_module
+        from djcues import harmony
+        from djcues.db import list_all_tracks, list_playlist_tracks
+
+        query = parse_qs(urlsplit(self.path).query)
+        playlist_id = query.get("playlist_id", [None])[0]
+        library = query.get("library", ["false"])[0] == "true"
+        if not library and not playlist_id:
+            self._send_json({"error": "playlist_id or library is required"}, status=400)
+            return
+
+        half_double = query.get("half_double", ["true"])[0] != "false"
+        try:
+            bpm_tolerance = float(query.get("bpm_tolerance", [str(harmony.DEFAULT_BPM_TOLERANCE_PCT)])[0])
+        except ValueError:
+            self._send_json({"error": "bpm_tolerance must be a number"}, status=400)
+            return
+
+        try:
+            if library:
+                tracks = self._db_worker.run(lambda db: list_all_tracks(db=db))
+            else:
+                tracks = self._db_worker.run(lambda db: list_playlist_tracks(playlist_id, db=db))
+        except Exception as e:
+            self._send_json({"error": str(e)}, status=500)
+            return
+
+        result = audit_module.audit_tracks(tracks, bpm_tolerance_pct=bpm_tolerance, allow_half_double=half_double)
+
+        def _track_json(t):
+            return {"id": t.id, "title": t.title, "artist": t.artist, "bpm": t.bpm, "key": t.key}
+
+        unusable_keys_summary = {"no_key": 0, "non_camelot_key": 0, "encrypted_metadata": 0}
+        for u in result.unusable_keys:
+            unusable_keys_summary[u.reason] = unusable_keys_summary.get(u.reason, 0) + 1
+
+        self._send_json({
+            "scanned": result.scanned,
+            "comment_hint_count": result.comment_hint_count,
+            "findings": [
+                {
+                    "track": _track_json(f.track),
+                    "comment": f.comment,
+                    "comment_key": str(f.comment_key),
+                    "comment_bpm": f.comment_bpm,
+                    "actual_key": f.actual_key,
+                    "actual_bpm": f.actual_bpm,
+                    "bpm_mismatch": f.bpm_mismatch,
+                    "key_mismatch": f.key_mismatch,
+                    "bpm_relation": (
+                        {
+                            "kind": f.bpm_relation.kind,
+                            "label": harmony.BPM_RELATION_LABELS[f.bpm_relation.kind],
+                            "target_bpm": f.bpm_relation.target_bpm,
+                            "pitch_shift_pct": f.bpm_relation.pitch_shift_pct,
+                        }
+                        if f.bpm_relation is not None else None
+                    ),
+                }
+                for f in result.findings
+            ],
+            "unusable_keys_summary": unusable_keys_summary,
+            "unusable_keys": [
+                {"track": _track_json(u.track), "reason": u.reason} for u in result.unusable_keys
+            ],
         })
 
     def _handle_track_detail_get(self, track_id: str) -> None:

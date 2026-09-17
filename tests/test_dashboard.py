@@ -73,6 +73,18 @@ class TestRenderDashboardHtml:
         assert "function loadSuggestions" in result
         assert "/suggestions?" in result
 
+    def test_audit_panel_is_present(self):
+        """BPM/Key data-quality report -- GET /api/audit, see
+        djcues.audit/server.py's _handle_audit_get. A library/playlist-
+        wide report, its own fourth client-side view, not part of the
+        per-track detail panel."""
+        result = render_dashboard_html()
+        assert 'id="audit-panel"' in result
+        assert 'id="audit-library-btn"' in result
+        assert 'id="audit-playlist-btn"' in result
+        assert "function renderAudit" in result
+        assert "'/api/audit?'" in result
+
     def test_never_embeds_a_server_url(self):
         # Same-origin like auth_web.py's page (served BY the local server
         # it talks to), unlike review.py's file://-opened page, which

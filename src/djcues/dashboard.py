@@ -58,6 +58,7 @@ def render_dashboard_html(
     <div class="sidebar-header">
       <h1 id="logo-home" title="Back to all playlists">djcues</h1>
       <input id="playlist-search" type="text" placeholder="Filter playlists&hellip;">
+      <button id="audit-library-btn" class="btn btn-ghost audit-library-btn" type="button">Audit Library</button>
     </div>
     <div id="playlist-tree" class="playlist-tree">Loading&hellip;</div>
   </div>
@@ -67,10 +68,26 @@ def render_dashboard_html(
       <div class="panel-header">
         <h2 id="current-playlist-name">Select a playlist</h2>
         <input id="track-search" type="text" placeholder="Filter tracks&hellip;" class="hidden">
+        <button id="audit-playlist-btn" class="btn btn-ghost hidden" type="button">Audit this playlist</button>
       </div>
       <div id="track-list" class="track-list">
         <p class="meta">Pick a playlist on the left to see its tracks.</p>
       </div>
+    </div>
+
+    <div id="audit-panel" class="panel hidden">
+      <div class="panel-header">
+        <button id="audit-back" class="btn btn-ghost" type="button">&larr; Back</button>
+        <h2 id="audit-scope-title"></h2>
+      </div>
+      <p id="audit-summary" class="meta"></p>
+      <div class="flags-row">
+        <label><input type="checkbox" id="audit-library"> Whole library instead</label>
+        <label><input type="checkbox" id="audit-half-double" checked> Include half/double-time</label>
+        <label>BPM tolerance % <input type="number" id="audit-bpm-tolerance" value="6" step="0.5" min="0" class="flag-num"></label>
+      </div>
+      <div id="audit-findings-list" class="suggestions-list"></div>
+      <div id="audit-unusable-keys-list" class="suggestions-list"></div>
     </div>
 
     <div id="track-detail-panel" class="panel hidden">
@@ -235,6 +252,7 @@ _DASHBOARD_CSS = """
     padding: 6px 8px;
     font-size: 0.85rem;
   }
+  .audit-library-btn { margin-top: 8px; width: 100%; }
   .flag-num { width: 70px; }
   .playlist-tree { flex: 1; overflow-y: auto; padding: 8px 0; }
   .tree-row {
@@ -420,6 +438,17 @@ const suggestLibraryEl = document.getElementById('suggest-library');
 const suggestHalfDoubleEl = document.getElementById('suggest-half-double');
 const suggestBpmToleranceEl = document.getElementById('suggest-bpm-tolerance');
 const suggestionsListEl = document.getElementById('suggestions-list');
+const auditLibraryBtn = document.getElementById('audit-library-btn');
+const auditPlaylistBtn = document.getElementById('audit-playlist-btn');
+const auditPanelEl = document.getElementById('audit-panel');
+const auditBackBtn = document.getElementById('audit-back');
+const auditScopeTitleEl = document.getElementById('audit-scope-title');
+const auditSummaryEl = document.getElementById('audit-summary');
+const auditLibraryEl = document.getElementById('audit-library');
+const auditHalfDoubleEl = document.getElementById('audit-half-double');
+const auditBpmToleranceEl = document.getElementById('audit-bpm-tolerance');
+const auditFindingsListEl = document.getElementById('audit-findings-list');
+const auditUnusableKeysListEl = document.getElementById('audit-unusable-keys-list');
 
 let currentPlaylistId = null;
 let currentTracks = [];
@@ -432,6 +461,13 @@ let currentAction = 'propose';
 // by loadPlaylists(), not re-fetched per track -- the destination
 // dropdown doesn't need to be any fresher than the tree already is.
 let allPlaylistsFlat = [];
+// The audit view's own scope -- independent of currentPlaylistId/
+// currentPlaylistNameEl (the track-list/track-detail views' state),
+// since audit can be library-scoped with no playlist at all, or
+// playlist-scoped while the user later toggles "whole library instead"
+// without leaving the view.
+let auditPlaylistId = null;
+let auditPlaylistName = null;
 let pollTimer = null;
 let jobStartedAt = null;
 // Declared here, not inline near refreshEstimate() below, so it's
@@ -454,6 +490,21 @@ let estimateRequestId = 0;
 
 function stateToUrl(state) {{
   const params = new URLSearchParams();
+  // Explicit view=audit marker -- audit shares playlist_id with plain
+  // playlist browsing (a playlist-scoped audit and just browsing that
+  // playlist have the same playlist_id), so presence-based inference
+  // alone can't tell the two views apart the way it can for track vs
+  // playlist vs landing below.
+  if (state.view === 'audit') {{
+    params.set('view', 'audit');
+    if (state.playlistId) {{
+      params.set('playlist_id', state.playlistId);
+      params.set('playlist_name', state.playlistName || '');
+    }}
+    if (state.library) params.set('library', 'true');
+    const qs = params.toString();
+    return qs ? ('?' + qs) : window.location.pathname;
+  }}
   if (state.playlistId) {{
     params.set('playlist_id', state.playlistId);
     params.set('playlist_name', state.playlistName || '');
@@ -468,6 +519,12 @@ function stateToUrl(state) {{
 
 function urlToState() {{
   const params = new URLSearchParams(window.location.search);
+  if (params.get('view') === 'audit') {{
+    return {{
+      view: 'audit', playlistId: params.get('playlist_id'), playlistName: params.get('playlist_name'),
+      library: params.get('library') === 'true',
+    }};
+  }}
   const playlistId = params.get('playlist_id');
   const trackId = params.get('track_id');
   if (trackId) {{
@@ -487,6 +544,8 @@ async function renderState(state) {{
     await renderTrackDetail(state.playlistId, state.playlistName, state.trackId, state.trackTitle);
   }} else if (state.view === 'playlist') {{
     await renderPlaylistTracks(state.playlistId, state.playlistName);
+  }} else if (state.view === 'audit') {{
+    renderAudit(state.playlistId, state.playlistName, state.library);
   }} else {{
     renderLanding();
   }}
@@ -620,9 +679,11 @@ function renderLanding() {{
   currentPlaylistNameEl.textContent = 'Select a playlist';
   trackSearchEl.value = '';
   trackSearchEl.classList.add('hidden');
+  auditPlaylistBtn.classList.add('hidden');
   trackListEl.innerHTML = '<p class="meta">Pick a playlist on the left to see its tracks.</p>';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
+  auditPanelEl.classList.add('hidden');
   stopPolling();
   document.title = 'djcues \\u2014 Analysis dashboard';
 }}
@@ -633,9 +694,11 @@ async function renderPlaylistTracks(playlistId, playlistName) {{
   currentPlaylistNameEl.textContent = playlistName;
   trackSearchEl.value = '';
   trackSearchEl.classList.remove('hidden');
+  auditPlaylistBtn.classList.remove('hidden');
   trackListEl.innerHTML = 'Loading&hellip;';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
+  auditPanelEl.classList.add('hidden');
   stopPolling();
   document.title = 'djcues \\u2014 ' + playlistName;
 
@@ -701,6 +764,7 @@ async function renderTrackDetail(playlistId, playlistName, trackId, trackTitle) 
   trackMetaEl.textContent = 'Loading&hellip;';
   trackListPanelEl.classList.add('hidden');
   trackDetailPanelEl.classList.remove('hidden');
+  auditPanelEl.classList.add('hidden');
   resultsPanelEl.classList.add('hidden');
   jobOutputWrapEl.classList.add('hidden');
   jobHtmlFragmentEl.innerHTML = '';
@@ -1217,6 +1281,137 @@ function renderSuggestions(data, isLibrary) {{
 suggestLibraryEl.addEventListener('change', loadSuggestions);
 suggestHalfDoubleEl.addEventListener('change', loadSuggestions);
 suggestBpmToleranceEl.addEventListener('change', loadSuggestions);
+
+// --- BPM/Key data-quality audit ---------------------------------------
+//
+// A library/playlist-wide report, not a per-track view -- a fourth
+// client-side view (sibling to landing/playlist/track), not part of the
+// track-detail panel. Same fast, synchronous, change-triggered-refresh
+// pattern as harmonic suggestions above (no job-queue/polling needed).
+
+function renderAudit(playlistId, playlistName, library) {{
+  auditPlaylistId = playlistId;
+  auditPlaylistName = playlistName;
+  trackListPanelEl.classList.add('hidden');
+  trackDetailPanelEl.classList.add('hidden');
+  auditPanelEl.classList.remove('hidden');
+  if (!playlistId) {{
+    // Reached via the library-only entry point -- nothing else to
+    // scope to, so force it and don't let the user uncheck it.
+    auditLibraryEl.checked = true;
+    auditLibraryEl.disabled = true;
+  }} else {{
+    auditLibraryEl.checked = !!library;
+    auditLibraryEl.disabled = false;
+  }}
+  updateAuditScopeTitle();
+  stopPolling();
+  document.title = 'djcues \\u2014 Audit';
+  loadAuditFindings();
+}}
+
+function updateAuditScopeTitle() {{
+  auditScopeTitleEl.textContent = auditLibraryEl.checked
+    ? 'Audit: whole library'
+    : 'Audit: ' + (auditPlaylistName || auditPlaylistId);
+}}
+
+async function loadAuditFindings() {{
+  const isLibrary = auditLibraryEl.checked;
+  const params = new URLSearchParams({{
+    library: isLibrary ? 'true' : 'false',
+    half_double: auditHalfDoubleEl.checked ? 'true' : 'false',
+    bpm_tolerance: auditBpmToleranceEl.value || '6',
+  }});
+  if (!isLibrary && auditPlaylistId) params.set('playlist_id', auditPlaylistId);
+  auditSummaryEl.textContent = '';
+  auditFindingsListEl.innerHTML = '<p class="meta small">Loading&hellip;</p>';
+  auditUnusableKeysListEl.innerHTML = '';
+  try {{
+    const data = await fetchJson('/api/audit?' + params.toString());
+    renderAuditFindings(data, isLibrary);
+  }} catch (err) {{
+    auditFindingsListEl.innerHTML = '';
+    const p = document.createElement('p');
+    p.className = 'meta small';
+    p.textContent = 'Error: ' + friendlyErrorMessage(err);
+    auditFindingsListEl.appendChild(p);
+  }}
+}}
+
+function renderAuditFindings(data, isLibrary) {{
+  auditSummaryEl.textContent = data.scanned + ' scanned, ' + data.comment_hint_count + ' had a comment hint';
+  auditFindingsListEl.innerHTML = '';
+  auditUnusableKeysListEl.innerHTML = '';
+
+  if (data.findings.length === 0) {{
+    auditFindingsListEl.innerHTML = '<p class="meta small">No comment-hint disagreements found.</p>';
+  }}
+  data.findings.forEach(f => {{
+    const row = document.createElement('div');
+    row.className = 'suggestion-row';
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'suggestion-title';
+    titleSpan.textContent = f.track.title;
+
+    const artistSpan = document.createElement('span');
+    artistSpan.className = 'suggestion-artist';
+    artistSpan.textContent = f.track.artist;
+
+    const detailSpan = document.createElement('span');
+    detailSpan.className = 'suggestion-relation';
+    const parts = [];
+    if (f.bpm_mismatch) {{
+      parts.push('BPM: tag ' + f.actual_bpm.toFixed(1) + ' vs comment ' + f.comment_bpm.toFixed(1));
+    }}
+    if (f.key_mismatch) {{
+      parts.push('Key: tag ' + (f.actual_key || '(none)') + ' vs comment ' + f.comment_key);
+    }}
+    detailSpan.textContent = parts.join(' \\u00b7 ');
+
+    row.appendChild(titleSpan);
+    row.appendChild(artistSpan);
+    row.appendChild(detailSpan);
+
+    // A --library finding may not belong to auditPlaylistId -- navigate
+    // with playlistId: null in that case, same handling harmonic
+    // suggestions' own library-scoped rows already use.
+    row.addEventListener('click', () => navigateTo({{
+      view: 'track',
+      playlistId: isLibrary ? null : auditPlaylistId,
+      playlistName: isLibrary ? null : auditPlaylistName,
+      trackId: f.track.id,
+      trackTitle: f.track.title,
+    }}, 'push'));
+
+    auditFindingsListEl.appendChild(row);
+  }});
+
+  const u = data.unusable_keys_summary;
+  const uTotal = u.no_key + u.non_camelot_key + u.encrypted_metadata;
+  if (uTotal > 0) {{
+    const note = document.createElement('p');
+    note.className = 'meta small';
+    const parts = [u.no_key + ' no-key', u.non_camelot_key + ' non-Camelot key'];
+    if (u.encrypted_metadata) parts.push(u.encrypted_metadata + ' streaming-linked');
+    note.textContent = '(unusable keys: ' + parts.join(', ') + ')';
+    auditUnusableKeysListEl.appendChild(note);
+  }}
+}}
+
+auditLibraryEl.addEventListener('change', () => {{ updateAuditScopeTitle(); loadAuditFindings(); }});
+auditHalfDoubleEl.addEventListener('change', loadAuditFindings);
+auditBpmToleranceEl.addEventListener('change', loadAuditFindings);
+
+// Entry points into the audit view.
+auditLibraryBtn.addEventListener('click', () => navigateTo({{ view: 'audit', playlistId: null, library: true }}, 'push'));
+auditPlaylistBtn.addEventListener('click', () => navigateTo(
+  {{ view: 'audit', playlistId: currentPlaylistId, playlistName: currentPlaylistNameEl.textContent, library: false }}, 'push'
+));
+// Same idiom as #back-to-list -- history.back() so Back/Forward and this
+// button can never disagree about where "back" goes.
+auditBackBtn.addEventListener('click', () => history.back());
 
 // Called after INITIAL_PLAYLIST (server-embedded, from a
 // `djcues dashboard "Playlist Name"` argument) is defined -- see the

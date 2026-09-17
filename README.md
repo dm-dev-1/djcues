@@ -114,6 +114,21 @@ djcues suggest "Drum & Bass" "Darkest Hour" --bpm-tolerance 10 --no-half-double 
 
 Ranks other tracks by Camelot Wheel key compatibility (same key, energy boost/drop, relative major/minor — diagonal moves are deliberately not treated as compatible, per the standard Camelot rules) and BPM closeness, including half/double-time matches (e.g. a 174 BPM track mixing cleanly with an 87 BPM one). The default 6% BPM tolerance matches Rekordbox's own default pitch fader range. Defaults to searching just the given playlist — a DJ building a Drum & Bass set wants D&B suggestions, not something from an unrelated playlist; `--library` widens the search to the whole collection. A track with no Key data, a non-Camelot Key, or Rekordbox's own encrypted metadata (streaming-linked tracks, e.g. Spotify) is excluded from results with a reason shown in the summary line, never guessed at or shown as raw text. Read-only — never writes to the database. Also available from the dashboard's track detail view, updating live as you adjust its BPM-tolerance/half-double/library controls.
 
+### BPM/Key data-quality audit
+
+```bash
+# Scan one playlist for BPM/Key tags that disagree with a curator's own note
+djcues audit "Nu Disco - Disco House"
+
+# Scan the whole collection instead
+djcues audit --library
+
+# Adjust matching
+djcues audit "Nu Disco - Disco House" --bpm-tolerance 10 --no-half-double
+```
+
+Some tracks carry a curator's own "`<key> - <bpm>`" note in Rekordbox's Comment field (e.g. `"2A - 118"`) — this cross-checks that note against the track's actual stored BPM/Key tag and reports any real disagreement, using the same half/double-time-aware tolerance as `suggest` so a legitimate tempo relationship is never mistaken for an error. Separately reports every track whose Key tag is missing, non-Camelot, or unreadable (streaming-linked metadata) — the same three categories `suggest` already excludes from its own results. Read-only diagnostic report only — djcues has no way to write a corrected BPM/Key tag back to Rekordbox. Also available from the dashboard, as its own "Audit Library" / "Audit this playlist" view rather than part of the single-track detail panel.
+
 ### Analysis dashboard
 
 ```bash
@@ -282,12 +297,13 @@ src/djcues/
     analysis_cache.py # Persistent cache of completed analysis runs (propose/compare/review/beatgrid)
     metrics.py      # Precision/recall/F1 for compare
     harmony.py      # Camelot Wheel key compatibility + BPM closeness (djcues suggest)
+    audit.py        # BPM/Key comment-hint cross-checking + unusable-key detection (djcues audit)
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
     dashboard.py    # Analysis dashboard HTML/CSS/JS (browse playlists/tracks, run propose/compare/beatgrid)
     server.py       # Local HTTP server for review sessions, the BYOK setup wizard, and the dashboard
     writer.py       # DB backup, cue writes, and playlist add/remove/move
-    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, auth, history, cache)
+    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, audit, auth, history, cache)
 ```
 
 ## License

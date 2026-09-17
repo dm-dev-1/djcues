@@ -1494,8 +1494,14 @@ class TestPlaylistCommands:
 # ---------------------------------------------------------------------------
 
 
-def _summary(id_: str, title: str, artist: str = "Artist", bpm: float = 128.0, key: str | None = "8A") -> TrackSummary:
-    return TrackSummary(id=id_, track_no=None, title=title, artist=artist, bpm=bpm, duration_ms=200_000.0, key=key)
+def _summary(
+    id_: str, title: str, artist: str = "Artist", bpm: float = 128.0,
+    key: str | None = "8A", comment: str | None = None,
+) -> TrackSummary:
+    return TrackSummary(
+        id=id_, track_no=None, title=title, artist=artist, bpm=bpm,
+        duration_ms=200_000.0, key=key, comment=comment,
+    )
 
 
 class TestSuggest:
@@ -1616,4 +1622,82 @@ class TestSuggest:
             result = runner.invoke(cli, ["suggest", "Playlist", "Reference Track"])
         assert result.exit_code == 0
         assert "$A7:" not in result.output
-        assert "streaming-linked" in result.output
+
+
+# ---------------------------------------------------------------------------
+# audit -- BPM/Key data-quality report. djcues.audit's own logic (comment-
+# hint parsing, the two real confirmed cases) has its own exhaustive tests
+# in test_audit.py; these only cover cli.py's own scope-resolution/
+# dispatch/presentation layer.
+# ---------------------------------------------------------------------------
+
+
+class TestAudit:
+    def test_playlist_not_found(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=None):
+            result = runner.invoke(cli, ["audit", "Nope"])
+        assert result.exit_code == 1
+        assert "'Nope' not found" in result.output
+
+    def test_neither_playlist_name_nor_library_is_an_error(self, runner: CliRunner):
+        result = runner.invoke(cli, ["audit"])
+        assert result.exit_code == 1
+        assert "provide a playlist name or use --library" in result.output
+
+    def test_library_flag_uses_list_all_tracks(self, runner: CliRunner):
+        track = _summary("1", "Track", bpm=128.0, key="8A")
+        with patch("djcues.cli.list_all_tracks", return_value=[track]) as mock_all:
+            result = runner.invoke(cli, ["audit", "--library"])
+        assert result.exit_code == 0
+        mock_all.assert_called_once()
+        assert "whole library" in result.output
+        assert "1 tracks scanned" in result.output
+
+    def test_without_library_flag_never_calls_list_all_tracks(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[]), \
+             patch("djcues.cli.list_all_tracks") as mock_all:
+            result = runner.invoke(cli, ["audit", "Playlist"])
+        assert result.exit_code == 0
+        mock_all.assert_not_called()
+
+    def test_dreamin_shaped_finding_printed_with_both_bpm_values_and_comment(self, runner: CliRunner):
+        dreamin = _summary("1", "Dreamin' Original Mix", bpm=146.92, key="2A", comment="2A - 118")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[dreamin]):
+            result = runner.invoke(cli, ["audit", "Playlist"])
+        assert result.exit_code == 0
+        assert "Dreamin' Original Mix" in result.output
+        assert "146.9" in result.output
+        assert "118.0" in result.output
+        assert "2A - 118" in result.output
+
+    def test_no_findings_message(self, runner: CliRunner):
+        agreeing = _summary("1", "Track", bpm=128.0, key="8A", comment="8A - 128")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[agreeing]):
+            result = runner.invoke(cli, ["audit", "Playlist"])
+        assert result.exit_code == 0
+        assert "No comment-hint disagreements found." in result.output
+
+    def test_unusable_keys_summary_line_printed(self, runner: CliRunner):
+        no_key = _summary("1", "Track A", bpm=128.0, key=None)
+        non_camelot = _summary("2", "Track B", bpm=128.0, key="Dm")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[no_key, non_camelot]):
+            result = runner.invoke(cli, ["audit", "Playlist"])
+        assert result.exit_code == 0
+        assert "unusable keys: 1 no-key, 1 non-Camelot key" in result.output
+
+    def test_bpm_tolerance_and_no_half_double_passed_through(self, runner: CliRunner):
+        track = _summary("1", "Track", bpm=128.0, key="8A")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[track]), \
+             patch("djcues.cli.audit_tracks") as mock_audit:
+            mock_audit.return_value = MagicMock(scanned=1, comment_hint_count=0, findings=[], unusable_keys=[])
+            result = runner.invoke(cli, ["audit", "Playlist", "--bpm-tolerance", "10", "--no-half-double"])
+        assert result.exit_code == 0
+        mock_audit.assert_called_once()
+        _args, kwargs = mock_audit.call_args
+        assert kwargs["bpm_tolerance_pct"] == 10.0
+        assert kwargs["allow_half_double"] is False

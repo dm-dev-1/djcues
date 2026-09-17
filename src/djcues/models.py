@@ -283,3 +283,7 @@ class TrackSummary:
     # Key at all (None). See harmony.parse_camelot_key for turning this
     # into something usable.
     key: str | None = None
+    # Raw DjmdContent.Commnt -- sometimes a curator's own "<key> - <bpm>"
+    # note (e.g. "2A - 118"), which can disagree with the actual bpm/key
+    # above. See audit.parse_comment_hint.
+    comment: str | None = None

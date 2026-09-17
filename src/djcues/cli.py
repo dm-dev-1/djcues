@@ -15,6 +15,7 @@ for _name in ("pyrekordbox", "pyrekordbox.db6", "pyrekordbox.anlz"):
 warnings.filterwarnings("ignore", module="pyrekordbox")
 
 from djcues import analysis_cache
+from djcues.audit import audit_tracks
 from djcues.constants import CUE_SYSTEM_BY_PAD, KIND_TO_PAD
 from djcues.db import find_playlist, list_all_tracks, list_playlist_tracks, load_playlist_tracks
 from djcues.harmony import (
@@ -1815,3 +1816,65 @@ def suggest(playlist_name, track_name, library, bpm_tolerance, no_half_double, l
 
     scope = "whole library" if library else playlist_name
     _print_suggestions(result, scope)
+
+
+def _print_audit_report(result, scope: str) -> None:
+    click.echo(f"\n{'=' * 60}")
+    click.echo(f"  Audit: {scope}")
+    click.echo(f"  {result.scanned} tracks scanned, {result.comment_hint_count} had a comment hint")
+    click.echo(f"{'=' * 60}")
+
+    if not result.findings:
+        click.echo("\n  No comment-hint disagreements found.")
+    else:
+        click.echo(f"\n  {len(result.findings)} finding(s):")
+        for f in result.findings:
+            click.echo(f"    {f.track.title} — {f.track.artist}")
+            if f.bpm_mismatch:
+                click.echo(f"      BPM: tag {f.actual_bpm:.1f} vs comment {f.comment_bpm:.1f} ('{f.comment}')")
+            if f.key_mismatch:
+                click.echo(f"      Key: tag {f.actual_key or '(none)'} vs comment {f.comment_key}")
+
+    if result.unusable_keys:
+        no_key = sum(1 for u in result.unusable_keys if u.reason == "no_key")
+        non_camelot = sum(1 for u in result.unusable_keys if u.reason == "non_camelot_key")
+        encrypted = sum(1 for u in result.unusable_keys if u.reason == "encrypted_metadata")
+        parts = [f"{no_key} no-key", f"{non_camelot} non-Camelot key"]
+        if encrypted:
+            parts.append(f"{encrypted} streaming-linked (unreadable metadata)")
+        click.echo(f"\n  (unusable keys: {', '.join(parts)})")
+
+
+@cli.command()
+@click.argument("playlist_name", required=False)
+@click.option("--library", is_flag=True, help="Audit the whole collection instead of one playlist.")
+@click.option(
+    "--bpm-tolerance", default=DEFAULT_BPM_TOLERANCE_PCT, show_default=True,
+    help="Max BPM difference from a comment hint to still count as agreeing (including half/double-time), as a percent.",
+)
+@click.option("--no-half-double", is_flag=True, help="Only treat same-tempo comment hints as agreeing, not half/double-time.")
+def audit(playlist_name, library, bpm_tolerance, no_half_double):
+    """Scan tracks' BPM/Key tags for data-quality problems (read-only, no writes).
+
+    Cross-checks each track's stored BPM/Key against a curator's own
+    "<key> - <bpm>" hint left in the Comment field, when present, and
+    separately flags any track whose Key tag is missing, non-Camelot,
+    or unreadable. Defaults to PLAYLIST_NAME; --library scans the whole
+    collection instead.
+    """
+    if library:
+        candidates = list_all_tracks()
+        scope = "whole library"
+    elif playlist_name:
+        playlist = find_playlist(playlist_name)
+        if playlist is None:
+            click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+            raise SystemExit(1)
+        candidates = list_playlist_tracks(playlist.ID)
+        scope = playlist_name
+    else:
+        click.echo("Error: provide a playlist name or use --library.", err=True)
+        raise SystemExit(1)
+
+    result = audit_tracks(candidates, bpm_tolerance_pct=bpm_tolerance, allow_half_double=not no_half_double)
+    _print_audit_report(result, scope)
