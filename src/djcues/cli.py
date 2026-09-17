@@ -18,6 +18,7 @@ from djcues import analysis_cache
 from djcues.audit import audit_tracks
 from djcues.constants import CUE_SYSTEM_BY_PAD, KIND_TO_PAD
 from djcues.db import find_playlist, list_all_tracks, list_playlist_tracks, load_playlist_tracks
+from djcues.flow import DEFAULT_COOLDOWN_FRACTION, suggest_energy_flow
 from djcues.harmony import (
     BPM_RELATION_LABELS,
     DEFAULT_BPM_TOLERANCE_PCT,
@@ -1878,3 +1879,75 @@ def audit(playlist_name, library, bpm_tolerance, no_half_double):
 
     result = audit_tracks(candidates, bpm_tolerance_pct=bpm_tolerance, allow_half_double=not no_half_double)
     _print_audit_report(result, scope)
+
+
+def _print_flow_report(result, playlist_name: str, position_map: dict) -> None:
+    click.echo(f"\n{'=' * 60}")
+    click.echo(f"  Energy Flow: {playlist_name}")
+    click.echo(f"  {len(result.ordered_tracks)} track(s) ordered, {len(result.unscored)} skipped")
+    click.echo(f"{'=' * 60}")
+
+    if not result.ordered_tracks:
+        click.echo("\n  No scorable tracks to order.")
+    else:
+        click.echo(f"\n  {'#':<4s}{'Was':<5s}{'Title':<40s}{'Artist':<20s}{'Mean':>6s}{'Peak':>6s}")
+        for i, te in enumerate(result.ordered_tracks, start=1):
+            if i == result.cooldown_start_index + 1:
+                click.echo(f"  {'-- cooldown begins --':^75s}")
+            was = position_map.get(str(te.track.id))
+            was_str = str(was) if was is not None else "?"
+            click.echo(
+                f"  {i:<4d}{was_str:<5s}{te.track.title:<40.40s}{te.track.artist:<20.20s}"
+                f"{te.mean_energy:>6.2f}{te.peak_energy:>6.2f}"
+            )
+
+    if result.unscored:
+        no_phrase = sum(1 for u in result.unscored if u.reason == "no_phrase_data")
+        no_waveform = sum(1 for u in result.unscored if u.reason == "no_waveform_data")
+        click.echo(f"\n  (skipped: {no_phrase} no phrase data, {no_waveform} no waveform data)")
+
+
+@cli.command()
+@click.argument("playlist_name")
+@click.option(
+    "--cooldown-fraction", default=DEFAULT_COOLDOWN_FRACTION, show_default=True,
+    help="Fraction of the lowest-energy tracks (excluding the opener) reserved for the cooldown close.",
+)
+def flow(playlist_name, cooldown_fraction):
+    """Suggest a track play order for one playlist: build energy toward a peak, then cool down for the finale.
+
+    Read-only -- never writes to the database. Scoped to PLAYLIST_NAME
+    only, with no --library option (unlike suggest/audit): ordering
+    needs real per-track phrase/waveform data, which costs far more to
+    load than the metadata suggest/audit use (measured live at
+    ~266ms/track) and is infeasible across the whole library in one
+    synchronous run.
+    """
+    playlist = find_playlist(playlist_name)
+    if playlist is None:
+        click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    # Cheap pass first (list_playlist_tracks, no ANLZ I/O): gives an
+    # accurate count for the progress message below, doubles as the
+    # id -> track_no "current position" map (load_playlist_tracks's
+    # Track objects carry no position of their own), and lets an empty
+    # playlist fail fast before paying for any ANLZ I/O at all.
+    summaries = list_playlist_tracks(playlist.ID)
+    if not summaries:
+        click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
+        raise SystemExit(1)
+    position_map = {str(s.id): s.track_no for s in summaries}
+
+    click.echo(
+        f"Loading {len(summaries)} track(s) from '{playlist_name}'... "
+        "(this may take a while for large playlists)"
+    )
+    tracks = load_playlist_tracks(playlist.ID)
+
+    result = suggest_energy_flow(tracks, cooldown_fraction=cooldown_fraction)
+    for u in result.unscored:
+        reason_label = "no phrase data" if u.reason == "no_phrase_data" else "no waveform data"
+        click.echo(f"  Skipping {u.track.title} ({reason_label})", err=True)
+
+    _print_flow_report(result, playlist_name, position_map)

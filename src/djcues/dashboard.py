@@ -69,6 +69,7 @@ def render_dashboard_html(
         <h2 id="current-playlist-name">Select a playlist</h2>
         <input id="track-search" type="text" placeholder="Filter tracks&hellip;" class="hidden">
         <button id="audit-playlist-btn" class="btn btn-ghost hidden" type="button">Audit this playlist</button>
+        <button id="flow-playlist-btn" class="btn btn-ghost hidden" type="button">Suggest set order</button>
       </div>
       <div id="track-list" class="track-list">
         <p class="meta">Pick a playlist on the left to see its tracks.</p>
@@ -88,6 +89,20 @@ def render_dashboard_html(
       </div>
       <div id="audit-findings-list" class="suggestions-list"></div>
       <div id="audit-unusable-keys-list" class="suggestions-list"></div>
+    </div>
+
+    <div id="flow-panel" class="panel hidden">
+      <div class="panel-header">
+        <button id="flow-back" class="btn btn-ghost" type="button">&larr; Back</button>
+        <h2 id="flow-scope-title"></h2>
+      </div>
+      <div class="flags-row">
+        <label>Cooldown fraction <input type="number" id="flow-cooldown-fraction" value="0.15" step="0.05" min="0" max="1" class="flag-num"></label>
+        <button id="flow-run-btn" class="btn btn-primary" type="button">Suggest order</button>
+      </div>
+      <div id="flow-status" class="job-status"></div>
+      <div id="flow-results-list" class="suggestions-list"></div>
+      <p id="flow-unscored-summary" class="meta small"></p>
     </div>
 
     <div id="track-detail-panel" class="panel hidden">
@@ -449,6 +464,15 @@ const auditHalfDoubleEl = document.getElementById('audit-half-double');
 const auditBpmToleranceEl = document.getElementById('audit-bpm-tolerance');
 const auditFindingsListEl = document.getElementById('audit-findings-list');
 const auditUnusableKeysListEl = document.getElementById('audit-unusable-keys-list');
+const flowPlaylistBtn = document.getElementById('flow-playlist-btn');
+const flowPanelEl = document.getElementById('flow-panel');
+const flowBackBtn = document.getElementById('flow-back');
+const flowScopeTitleEl = document.getElementById('flow-scope-title');
+const flowCooldownFractionEl = document.getElementById('flow-cooldown-fraction');
+const flowRunBtn = document.getElementById('flow-run-btn');
+const flowStatusEl = document.getElementById('flow-status');
+const flowResultsListEl = document.getElementById('flow-results-list');
+const flowUnscoredSummaryEl = document.getElementById('flow-unscored-summary');
 
 let currentPlaylistId = null;
 let currentTracks = [];
@@ -470,6 +494,14 @@ let auditPlaylistId = null;
 let auditPlaylistName = null;
 let pollTimer = null;
 let jobStartedAt = null;
+// The flow view's own scope -- always playlist-scoped (unlike audit,
+// there's no whole-library mode; see flow's own CLI/server docstrings
+// for why), tracked separately so navigating audit<->flow<->track
+// doesn't clobber each other's "which playlist" state.
+let flowPlaylistId = null;
+let flowPlaylistName = null;
+let flowPollTimer = null;
+let flowJobStartedAt = null;
 // Declared here, not inline near refreshEstimate() below, so it's
 // already initialized by the time updateActionFlags()'s own initial
 // call (which runs before this file's later `let` statements would
@@ -505,6 +537,16 @@ function stateToUrl(state) {{
     const qs = params.toString();
     return qs ? ('?' + qs) : window.location.pathname;
   }}
+  // Explicit view=flow marker for the same reason as audit above --
+  // flow shares playlist_id with plain playlist browsing. Simpler than
+  // audit's own branch: flow has no library-wide mode, so playlist_id
+  // is always present here.
+  if (state.view === 'flow') {{
+    params.set('view', 'flow');
+    params.set('playlist_id', state.playlistId);
+    params.set('playlist_name', state.playlistName || '');
+    return '?' + params.toString();
+  }}
   if (state.playlistId) {{
     params.set('playlist_id', state.playlistId);
     params.set('playlist_name', state.playlistName || '');
@@ -524,6 +566,9 @@ function urlToState() {{
       view: 'audit', playlistId: params.get('playlist_id'), playlistName: params.get('playlist_name'),
       library: params.get('library') === 'true',
     }};
+  }}
+  if (params.get('view') === 'flow') {{
+    return {{ view: 'flow', playlistId: params.get('playlist_id'), playlistName: params.get('playlist_name') }};
   }}
   const playlistId = params.get('playlist_id');
   const trackId = params.get('track_id');
@@ -546,6 +591,8 @@ async function renderState(state) {{
     await renderPlaylistTracks(state.playlistId, state.playlistName);
   }} else if (state.view === 'audit') {{
     renderAudit(state.playlistId, state.playlistName, state.library);
+  }} else if (state.view === 'flow') {{
+    renderFlow(state.playlistId, state.playlistName);
   }} else {{
     renderLanding();
   }}
@@ -680,11 +727,14 @@ function renderLanding() {{
   trackSearchEl.value = '';
   trackSearchEl.classList.add('hidden');
   auditPlaylistBtn.classList.add('hidden');
+  flowPlaylistBtn.classList.add('hidden');
   trackListEl.innerHTML = '<p class="meta">Pick a playlist on the left to see its tracks.</p>';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.add('hidden');
+  flowPanelEl.classList.add('hidden');
   stopPolling();
+  stopFlowPolling();
   document.title = 'djcues \\u2014 Analysis dashboard';
 }}
 
@@ -695,11 +745,14 @@ async function renderPlaylistTracks(playlistId, playlistName) {{
   trackSearchEl.value = '';
   trackSearchEl.classList.remove('hidden');
   auditPlaylistBtn.classList.remove('hidden');
+  flowPlaylistBtn.classList.remove('hidden');
   trackListEl.innerHTML = 'Loading&hellip;';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.add('hidden');
+  flowPanelEl.classList.add('hidden');
   stopPolling();
+  stopFlowPolling();
   document.title = 'djcues \\u2014 ' + playlistName;
 
   try {{
@@ -765,10 +818,12 @@ async function renderTrackDetail(playlistId, playlistName, trackId, trackTitle) 
   trackListPanelEl.classList.add('hidden');
   trackDetailPanelEl.classList.remove('hidden');
   auditPanelEl.classList.add('hidden');
+  flowPanelEl.classList.add('hidden');
   resultsPanelEl.classList.add('hidden');
   jobOutputWrapEl.classList.add('hidden');
   jobHtmlFragmentEl.innerHTML = '';
   stopPolling();
+  stopFlowPolling();
   document.title = 'djcues \\u2014 ' + trackTitle;
 
   // Reached directly (a bookmark, a refresh, or Back/Forward hopping
@@ -1295,6 +1350,7 @@ function renderAudit(playlistId, playlistName, library) {{
   trackListPanelEl.classList.add('hidden');
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.remove('hidden');
+  flowPanelEl.classList.add('hidden');
   if (!playlistId) {{
     // Reached via the library-only entry point -- nothing else to
     // scope to, so force it and don't let the user uncheck it.
@@ -1306,6 +1362,7 @@ function renderAudit(playlistId, playlistName, library) {{
   }}
   updateAuditScopeTitle();
   stopPolling();
+  stopFlowPolling();
   document.title = 'djcues \\u2014 Audit';
   loadAuditFindings();
 }}
@@ -1412,6 +1469,148 @@ auditPlaylistBtn.addEventListener('click', () => navigateTo(
 // Same idiom as #back-to-list -- history.back() so Back/Forward and this
 // button can never disagree about where "back" goes.
 auditBackBtn.addEventListener('click', () => history.back());
+
+// --- Energy flow (set ordering) ------------------------------------
+//
+// Its own top-level view, like audit -- covers a whole playlist, not
+// one reference track. Unlike suggest/audit's synchronous GETs, this
+// runs as a background job (POST to start, poll GET /api/jobs/<id>):
+// ordering needs real per-track phrase/waveform data, too slow to
+// load synchronously through the dashboard's shared browsing
+// connection (see _run_flow_job's docstring in server.py). Can't
+// reuse pollJob/stopPolling directly -- those manipulate track-detail-
+// panel-specific elements -- so this is a sibling with the same
+// semantics (2s poll interval, running/error/done) targeting
+// #flow-panel's own elements instead.
+
+function renderFlow(playlistId, playlistName) {{
+  flowPlaylistId = playlistId;
+  flowPlaylistName = playlistName;
+  trackListPanelEl.classList.add('hidden');
+  trackDetailPanelEl.classList.add('hidden');
+  auditPanelEl.classList.add('hidden');
+  flowPanelEl.classList.remove('hidden');
+  flowScopeTitleEl.textContent = 'Energy Flow: ' + (playlistName || playlistId);
+  flowStatusEl.textContent = '';
+  flowStatusEl.className = 'job-status';
+  flowResultsListEl.innerHTML = '';
+  flowUnscoredSummaryEl.textContent = '';
+  stopPolling();
+  stopFlowPolling();
+  document.title = 'djcues \\u2014 Energy Flow';
+}}
+
+flowRunBtn.addEventListener('click', async () => {{
+  if (!flowPlaylistId) return;
+  const body = {{ cooldown_fraction: parseFloat(flowCooldownFractionEl.value) || 0.15 }};
+  flowRunBtn.disabled = true;
+  flowStatusEl.textContent = 'Starting&hellip;';
+  flowStatusEl.className = 'job-status info';
+  flowResultsListEl.innerHTML = '';
+  flowUnscoredSummaryEl.textContent = '';
+  try {{
+    const data = await fetchJson('/api/playlists/' + encodeURIComponent(flowPlaylistId) + '/flow-jobs', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    pollFlowJob(data.job_id);
+  }} catch (err) {{
+    flowStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+    flowStatusEl.className = 'job-status error';
+    flowRunBtn.disabled = false;
+  }}
+}});
+
+function stopFlowPolling() {{
+  if (flowPollTimer) {{ clearTimeout(flowPollTimer); flowPollTimer = null; }}
+}}
+
+function pollFlowJob(jobId) {{
+  stopFlowPolling();
+  flowJobStartedAt = Date.now();
+  const tick = async () => {{
+    try {{
+      const job = await fetchJson('/api/jobs/' + jobId);
+      if (job.status === 'running') {{
+        const elapsed = Math.round((Date.now() - flowJobStartedAt) / 1000);
+        flowStatusEl.textContent = 'Running&hellip; (' + elapsed + 's)';
+        flowStatusEl.className = 'job-status info';
+        flowPollTimer = setTimeout(tick, 2000);
+        return;
+      }}
+      flowRunBtn.disabled = false;
+      if (job.status === 'error') {{
+        flowStatusEl.textContent = 'Error: ' + job.error;
+        flowStatusEl.className = 'job-status error';
+      }} else {{
+        flowStatusEl.textContent = 'Done \\u00b7 computed in ' + job.elapsed_seconds + 's';
+        flowStatusEl.className = 'job-status success';
+        renderFlowResult(job.result);
+      }}
+    }} catch (err) {{
+      flowStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+      flowStatusEl.className = 'job-status error';
+      flowRunBtn.disabled = false;
+    }}
+  }};
+  tick();
+}}
+
+function renderFlowResult(result) {{
+  flowResultsListEl.innerHTML = '';
+  result.ordered_tracks.forEach((t, i) => {{
+    if (i === result.cooldown_start_index) {{
+      const divider = document.createElement('p');
+      divider.className = 'meta small';
+      divider.textContent = '\\u2193 cooldown begins \\u2193';
+      flowResultsListEl.appendChild(divider);
+    }}
+    const row = document.createElement('div');
+    row.className = 'suggestion-row';
+
+    const posSpan = document.createElement('span');
+    posSpan.className = 'suggestion-bpm';
+    posSpan.textContent = (t.current_position != null ? t.current_position : '?') + ' \\u2192 ' + (i + 1);
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'suggestion-title';
+    titleSpan.textContent = t.title;
+
+    const artistSpan = document.createElement('span');
+    artistSpan.className = 'suggestion-artist';
+    artistSpan.textContent = t.artist;
+
+    const energySpan = document.createElement('span');
+    energySpan.className = 'suggestion-relation';
+    energySpan.textContent = 'mean ' + t.mean_energy.toFixed(2) + ' \\u00b7 peak ' + t.peak_energy.toFixed(2);
+
+    row.appendChild(posSpan);
+    row.appendChild(titleSpan);
+    row.appendChild(artistSpan);
+    row.appendChild(energySpan);
+
+    row.addEventListener('click', () => navigateTo({{
+      view: 'track', playlistId: flowPlaylistId, playlistName: flowPlaylistName,
+      trackId: t.id, trackTitle: t.title,
+    }}, 'push'));
+
+    flowResultsListEl.appendChild(row);
+  }});
+
+  const u = result.unscored_summary;
+  if (u.no_phrase_data || u.no_waveform_data) {{
+    flowUnscoredSummaryEl.textContent =
+      '(skipped: ' + u.no_phrase_data + ' no phrase data, ' + u.no_waveform_data + ' no waveform data)';
+  }}
+}}
+
+// Entry point into the flow view -- always from a selected playlist
+// (unlike audit, there's no library-wide entry point for this feature).
+flowPlaylistBtn.addEventListener('click', () => navigateTo(
+  {{ view: 'flow', playlistId: currentPlaylistId, playlistName: currentPlaylistNameEl.textContent }}, 'push'
+));
+flowBackBtn.addEventListener('click', () => history.back());
 
 // Called after INITIAL_PLAYLIST (server-embedded, from a
 // `djcues dashboard "Playlist Name"` argument) is defined -- see the

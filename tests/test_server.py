@@ -1861,6 +1861,107 @@ class TestDashboardAuditEndpoint:
 
 
 @requires_rekordbox
+class TestDashboardFlowJobs:
+    """POST /api/playlists/<id>/flow-jobs -- unlike suggest/audit, this
+    runs on its own dedicated connection/thread (_run_flow_job), not
+    _DbWorker (see its docstring for why), so it can't be
+    _DbWorker.run-mocked the way TestDashboardAuditEndpoint is -- gated
+    on @requires_rekordbox instead, matching TestDashboardHandlerJobs's
+    own precedent for the same reason. djcues.flow's own logic has its
+    own exhaustive tests in test_flow.py.
+    """
+
+    @staticmethod
+    def _tech_house_playlist_id(base_url: str) -> str:
+        _, tree = _get(base_url + "/api/playlists")
+        tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
+        return tech_house["id"]
+
+    def _run_flow_job_to_completion(
+        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = 20.0
+    ) -> dict:
+        status, data = _post(base_url + f"/api/playlists/{playlist_id}/flow-jobs", body or {})
+        assert status == 202, data
+        job_id = data["job_id"]
+
+        deadline = time.monotonic() + timeout
+        job: dict = {}
+        while time.monotonic() < deadline:
+            status, job = _get(base_url + f"/api/jobs/{job_id}")
+            assert status == 200
+            if job["status"] != "running":
+                return job
+            time.sleep(0.2)
+        raise AssertionError(f"flow job {job_id} did not finish within {timeout}s: {job}")
+
+    def test_invalid_cooldown_fraction_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, _data = _post(
+            base_url + "/api/playlists/pl1/flow-jobs", {"cooldown_fraction": "not-a-number"}
+        )
+        assert status == 400
+
+    def test_unknown_playlist_id_produces_error_job(self, dashboard_server):
+        base_url, _server = dashboard_server
+        job = self._run_flow_job_to_completion(base_url, "not-a-real-playlist-id")
+        assert job["status"] == "error"
+        assert job["error"]
+
+    def test_flow_job_completes_for_real(self, dashboard_server):
+        # No mocking needed -- suggest_energy_flow is pure, cheap
+        # arithmetic over data load_playlist_tracks already reads for
+        # real; this runs genuinely end to end, same spirit as
+        # TestDashboardHandlerJobs's own beatgrid test.
+        base_url, _server = dashboard_server
+        playlist_id = self._tech_house_playlist_id(base_url)
+
+        job = self._run_flow_job_to_completion(base_url, playlist_id)
+
+        assert job["status"] == "done"
+        assert job["error"] is None
+        result = job["result"]
+        assert len(result["ordered_tracks"]) > 0
+        assert 0 <= result["cooldown_start_index"] <= len(result["ordered_tracks"])
+        assert all(t["current_position"] is not None for t in result["ordered_tracks"])
+        assert all("mean_energy" in t and "peak_energy" in t for t in result["ordered_tracks"])
+
+    def test_browsing_stays_responsive_while_a_flow_job_is_running(self, dashboard_server):
+        """Same proof as TestDashboardHandlerJobs's own analogous test,
+        for this feature's separate dedicated-connection job path."""
+        base_url, _server = dashboard_server
+        playlist_id = self._tech_house_playlist_id(base_url)
+
+        def slow_suggest_energy_flow(tracks, *, cooldown_fraction=0.15):
+            time.sleep(1.5)
+            from djcues.flow import FlowResult
+            return FlowResult(ordered_tracks=[], cooldown_start_index=0, unscored=[])
+
+        with patch("djcues.flow.suggest_energy_flow", side_effect=slow_suggest_energy_flow):
+            status, data = _post(base_url + f"/api/playlists/{playlist_id}/flow-jobs", {})
+            assert status == 202
+            job_id = data["job_id"]
+
+            # The job is now running (sleeping) on its own thread. A
+            # browsing request must return promptly, not queue up behind it.
+            start = time.monotonic()
+            status, _tree = _get(base_url + "/api/playlists")
+            elapsed = time.monotonic() - start
+
+            assert status == 200
+            assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running flow job"
+
+            # Drain the job so the test doesn't leave a stray thread mid-sleep.
+            deadline = time.monotonic() + 10
+            job = {}
+            while time.monotonic() < deadline:
+                status, job = _get(base_url + f"/api/jobs/{job_id}")
+                if job["status"] != "running":
+                    break
+                time.sleep(0.2)
+            assert job["status"] == "done"
+
+
+@requires_rekordbox
 class TestDashboardHandlerLaunch:
     @staticmethod
     def _tech_house_playlist_and_track(base_url: str) -> tuple[str, str]:

@@ -19,7 +19,7 @@ import pytest
 from click.testing import CliRunner
 
 from djcues.cli import cli
-from djcues.models import BeatGrid, CueProposal, Phrase, Track, TrackSummary
+from djcues.models import BeatGrid, CueProposal, Phrase, Track, TrackSummary, WaveformPoint
 from djcues.strategy import CueStrategy
 
 
@@ -1701,3 +1701,111 @@ class TestAudit:
         _args, kwargs = mock_audit.call_args
         assert kwargs["bpm_tolerance_pct"] == 10.0
         assert kwargs["allow_half_double"] is False
+
+
+# ---------------------------------------------------------------------------
+# flow -- energy-flow set ordering. djcues.flow's own logic (the
+# peak-then-cooldown algorithm, the worked example) has its own exhaustive
+# tests in test_flow.py; these only cover cli.py's own resolution/loading/
+# dispatch/presentation layer.
+# ---------------------------------------------------------------------------
+
+
+def _flow_track(id_: int, title: str, energy: float, duration_ms: float = 200_000.0) -> Track:
+    """A Track with a single phrase spanning its whole duration at a
+    uniform waveform height -- mirrors test_flow.py's own _uniform_track
+    helper, so mean_energy == peak_energy == energy exactly."""
+    phrase = Phrase(beat_start=1, beat_end=2, kind=1, label="Intro", position_ms=0.0, duration_ms=duration_ms)
+    waveform = [WaveformPoint(height=energy, red=4, green=4, blue=4) for _ in range(10)]
+    return Track(
+        id=id_, title=title, artist="Artist", bpm=128.0, duration_ms=duration_ms,
+        analysis_path="", cues=[], phrases=[phrase], beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+        waveform=waveform,
+    )
+
+
+class TestFlow:
+    def test_playlist_not_found(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=None):
+            result = runner.invoke(cli, ["flow", "Nope"])
+        assert result.exit_code == 1
+        assert "'Nope' not found" in result.output
+
+    def test_empty_playlist_errors_before_expensive_load(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[]), \
+             patch("djcues.cli.load_playlist_tracks") as mock_load:
+            result = runner.invoke(cli, ["flow", "Playlist"])
+        assert result.exit_code == 1
+        assert "no tracks found" in result.output
+        mock_load.assert_not_called()
+
+    def test_loading_message_shows_track_count(self, runner: CliRunner):
+        summaries = [_summary("1", "A"), _summary("2", "B")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[]):
+            result = runner.invoke(cli, ["flow", "Playlist"])
+        assert result.exit_code == 0
+        assert "Loading 2 track(s) from 'Playlist'" in result.output
+
+    def test_happy_path_shows_order_and_positions(self, runner: CliRunner):
+        summaries = [
+            TrackSummary(id="1", track_no=3, title="Calm", artist="Artist", bpm=128.0, duration_ms=200_000.0),
+            TrackSummary(id="2", track_no=1, title="Loud", artist="Artist", bpm=128.0, duration_ms=200_000.0),
+        ]
+        tracks = [_flow_track(1, "Calm", 0.2), _flow_track(2, "Loud", 0.9)]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks):
+            result = runner.invoke(cli, ["flow", "Playlist"])
+        assert result.exit_code == 0
+        assert "Calm" in result.output
+        assert "Loud" in result.output
+        # Calm (lower energy) is the opener at new position 1, was position 3;
+        # Loud was position 1, now ordered second.
+        calm_line = next(line for line in result.output.splitlines() if "Calm" in line)
+        loud_line = next(line for line in result.output.splitlines() if "Loud" in line)
+        assert calm_line.strip().startswith("1")
+        assert "3" in calm_line
+        assert loud_line.strip().startswith("2")
+        assert "1" in loud_line
+
+    def test_cooldown_fraction_passed_through(self, runner: CliRunner):
+        summaries = [_summary("1", "A")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[]), \
+             patch("djcues.cli.suggest_energy_flow") as mock_flow:
+            mock_flow.return_value = MagicMock(ordered_tracks=[], cooldown_start_index=0, unscored=[])
+            result = runner.invoke(cli, ["flow", "Playlist", "--cooldown-fraction", "0.3"])
+        assert result.exit_code == 0
+        mock_flow.assert_called_once()
+        _args, kwargs = mock_flow.call_args
+        assert kwargs["cooldown_fraction"] == 0.3
+
+    def test_skipped_tracks_printed_with_reason(self, runner: CliRunner):
+        no_phrases = Track(
+            id=1, title="No Phrases Track", artist="Artist", bpm=128.0, duration_ms=200_000.0,
+            analysis_path="", cues=[], phrases=[], beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+        )
+        summaries = [_summary("1", "No Phrases Track")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[no_phrases]):
+            result = runner.invoke(cli, ["flow", "Playlist"])
+        assert result.exit_code == 0
+        assert "Skipping No Phrases Track (no phrase data)" in result.output
+
+    def test_no_scorable_tracks_message(self, runner: CliRunner):
+        no_phrases = Track(
+            id=1, title="No Phrases Track", artist="Artist", bpm=128.0, duration_ms=200_000.0,
+            analysis_path="", cues=[], phrases=[], beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+        )
+        summaries = [_summary("1", "No Phrases Track")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[no_phrases]):
+            result = runner.invoke(cli, ["flow", "Playlist"])
+        assert result.exit_code == 0
+        assert "No scorable tracks to order." in result.output

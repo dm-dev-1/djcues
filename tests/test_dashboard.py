@@ -85,6 +85,19 @@ class TestRenderDashboardHtml:
         assert "function renderAudit" in result
         assert "'/api/audit?'" in result
 
+    def test_flow_panel_is_present(self):
+        """Energy-flow set ordering -- POST /api/playlists/<id>/flow-jobs
+        + GET /api/jobs/<id> polling, see djcues.flow/server.py's
+        _run_flow_job. A playlist-wide, background-job-backed view (its
+        own fifth client-side view), not part of the per-track detail
+        panel and with no library-wide mode (see flow's own docstrings
+        for why)."""
+        result = render_dashboard_html()
+        assert 'id="flow-panel"' in result
+        assert 'id="flow-playlist-btn"' in result
+        assert "function renderFlow" in result
+        assert "/flow-jobs" in result
+
     def test_never_embeds_a_server_url(self):
         # Same-origin like auth_web.py's page (served BY the local server
         # it talks to), unlike review.py's file://-opened page, which

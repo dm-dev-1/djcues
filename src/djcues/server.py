@@ -973,6 +973,88 @@ def _run_analysis_job(
             jobs[job_id].update(result)
 
 
+def _run_flow_job(
+    job_id: str, playlist_id: str, params: dict, jobs: dict, jobs_lock: threading.Lock
+) -> None:
+    """Runs suggest_energy_flow() for one playlist on its own thread,
+    with its own short-lived, dedicated Rekordbox6Database connection --
+    mirrors _run_analysis_job's shape and rationale exactly (see its
+    docstring, and _DbWorker's, for why neither the shared djcues.db
+    singleton nor _DbWorker is used here: load_playlist_tracks() does
+    real per-track ANLZ file I/O, measured at ~266ms/track live against
+    this project's real library, and routing that through the one
+    shared browsing connection would block every other dashboard
+    request for however long it takes on a large playlist).
+
+    Unlike _run_analysis_job, the database is touched twice, both up
+    front: the cheap list_playlist_tracks() (for the id -> track_no
+    "current position" map -- load_playlist_tracks()'s Track objects
+    carry no position of their own) and load_playlist_tracks() itself
+    (the real per-track phrase/waveform data flow.py needs). The actual
+    ordering (flow.suggest_energy_flow()) is pure and in-memory, so it
+    runs entirely after the connection's work is done and never holds
+    it open any longer than necessary.
+    """
+    import time as time_module
+
+    from pyrekordbox import Rekordbox6Database
+
+    from djcues import db as db_module
+    from djcues import flow as flow_module
+
+    started = time_module.monotonic()
+    dedicated_db = Rekordbox6Database()
+    result: dict
+
+    try:
+        position_map = {
+            str(t.id): t.track_no
+            for t in db_module.list_playlist_tracks(playlist_id, db=dedicated_db)
+        }
+        tracks = db_module.load_playlist_tracks(playlist_id, db=dedicated_db)
+        if not tracks:
+            raise ValueError(f"playlist {playlist_id!r} has no tracks")
+
+        flow_result = flow_module.suggest_energy_flow(
+            tracks, cooldown_fraction=params["cooldown_fraction"]
+        )
+
+        def _track_json(te):
+            return {
+                "id": te.track.id, "title": te.track.title, "artist": te.track.artist,
+                "mean_energy": te.mean_energy, "peak_energy": te.peak_energy,
+                "current_position": position_map.get(str(te.track.id)),
+            }
+
+        unscored_summary = {"no_phrase_data": 0, "no_waveform_data": 0}
+        for u in flow_result.unscored:
+            unscored_summary[u.reason] = unscored_summary.get(u.reason, 0) + 1
+
+        result = {
+            "status": "done",
+            "result": {
+                "ordered_tracks": [_track_json(te) for te in flow_result.ordered_tracks],
+                "cooldown_start_index": flow_result.cooldown_start_index,
+                "unscored": [
+                    {"id": u.track.id, "title": u.track.title, "artist": u.track.artist, "reason": u.reason}
+                    for u in flow_result.unscored
+                ],
+                "unscored_summary": unscored_summary,
+            },
+            "error": None,
+        }
+    except Exception as e:  # noqa: BLE001 -- surfaced to the dashboard UI, not swallowed
+        result = {"status": "error", "result": None, "error": str(e)}
+    finally:
+        dedicated_db.close()
+
+    result["finished_at"] = datetime.now().replace(microsecond=0).isoformat()
+    result["elapsed_seconds"] = round(time_module.monotonic() - started, 1)
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(result)
+
+
 class DashboardHandler(_LocalJsonHandler):
     """Serves the analysis dashboard: browse rekordbox playlists/tracks
     and run propose/compare/beatgrid against a selected track, or launch
@@ -1352,6 +1434,8 @@ class DashboardHandler(_LocalJsonHandler):
         parts = [p for p in path.split("/") if p]
         if len(parts) == 4 and parts[0:2] == ["api", "tracks"] and parts[3] == "jobs":
             self._handle_job_post(parts[2])
+        elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "flow-jobs":
+            self._handle_flow_job_post(parts[2])
         elif len(parts) == 5 and parts[0:2] == ["api", "tracks"] and parts[3] == "launch":
             self._handle_launch_post(parts[2], parts[4])
         elif path == "/api/devices":
@@ -1594,6 +1678,40 @@ class DashboardHandler(_LocalJsonHandler):
         if ok is None:
             return
         self._send_json({"ok": True})
+
+    def _handle_flow_job_post(self, playlist_id: str) -> None:
+        """POST /api/playlists/<playlist_id>/flow-jobs -- start an
+        energy-flow ordering job for one playlist. Body:
+        {"cooldown_fraction": float}. Runs on its own thread/connection
+        (_run_flow_job, not _db_worker -- see its docstring for why);
+        poll GET /api/jobs/<job_id> for the result. _handle_job_get is
+        fully generic and needs no changes to serve this job kind too."""
+        from djcues.flow import DEFAULT_COOLDOWN_FRACTION
+
+        body = self._read_body()
+        try:
+            cooldown_fraction = float(body.get("cooldown_fraction", DEFAULT_COOLDOWN_FRACTION))
+        except (TypeError, ValueError):
+            self._send_json({"error": "cooldown_fraction must be a number"}, status=400)
+            return
+
+        params = {"cooldown_fraction": cooldown_fraction}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id, "playlist_id": playlist_id, "kind": "flow", "status": "running",
+            "started_at": datetime.now().replace(microsecond=0).isoformat(), "finished_at": None,
+            "elapsed_seconds": None, "result": None, "error": None,
+        }
+        with self._jobs_lock:
+            self._jobs[job_id] = job
+
+        thread = threading.Thread(
+            target=_run_flow_job,
+            args=(job_id, playlist_id, params, self._jobs, self._jobs_lock),
+            daemon=True,
+        )
+        thread.start()
+        self._send_json({"job_id": job_id, "status": "running"}, status=202)
 
 
 def start_dashboard_server(

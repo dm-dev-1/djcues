@@ -129,6 +129,18 @@ djcues audit "Nu Disco - Disco House" --bpm-tolerance 10 --no-half-double
 
 Some tracks carry a curator's own "`<key> - <bpm>`" note in Rekordbox's Comment field (e.g. `"2A - 118"`) — this cross-checks that note against the track's actual stored BPM/Key tag and reports any real disagreement, using the same half/double-time-aware tolerance as `suggest` so a legitimate tempo relationship is never mistaken for an error. Separately reports every track whose Key tag is missing, non-Camelot, or unreadable (streaming-linked metadata) — the same three categories `suggest` already excludes from its own results. Read-only diagnostic report only — djcues has no way to write a corrected BPM/Key tag back to Rekordbox. Also available from the dashboard, as its own "Audit Library" / "Audit this playlist" view rather than part of the single-track detail panel.
 
+### Suggest a track order (energy flow)
+
+```bash
+# Suggest a play order for one playlist: build energy toward a peak, then cool down for the finale
+djcues flow "Tech House"
+
+# Reserve a bigger (or smaller) cooldown close
+djcues flow "Tech House" --cooldown-fraction 0.3
+```
+
+Scores each track by its real Rekordbox phrase structure and color-waveform energy (already read from the same ANLZ data `viz`/`review` use — no separate analysis pass), then orders the set from calmest opener, building up to the single highest-energy track, before winding down through a cooldown close reserved from the set's lower-energy tracks. Shows each track's old playlist position next to its new suggested one. Playlist-scoped only, with no `--library` option — loading real phrase/waveform data for the whole collection in one run isn't practical, and "order my entire collection as one set" isn't a coherent DJ concept anyway. Read-only — never writes to the database. Also available from the dashboard as its own "Suggest set order" view, which runs as a background job (like propose/compare/beatgrid) rather than a synchronous request, since it can take longer than a quick lookup for a large playlist.
+
 ### Analysis dashboard
 
 ```bash
@@ -266,7 +278,7 @@ Run `djcues auth device --device <choice>` any time to see what's actually detec
 - **Auto-backup**: `djcues apply` and `djcues playlist add/remove/move` automatically back up `master.db` before writing
 - **Overwrite protection**: Tracks with existing cues require explicit confirmation
 - **Rekordbox must be closed**: `apply` and `playlist add/remove/move` (CLI and dashboard alike) will not write while rekordbox is running
-- **Read-only by default**: `propose`, `compare`, `viz`, `review`, and `beatgrid` never modify the database. The dashboard is read-only except for its playlist move/add/remove controls, which follow the same backup/Rekordbox-closed rules as the CLI.
+- **Read-only by default**: `propose`, `compare`, `viz`, `review`, `beatgrid`, `suggest`, `audit`, and `flow` never modify the database. The dashboard is read-only except for its playlist move/add/remove controls, which follow the same backup/Rekordbox-closed rules as the CLI.
 - **DB-only writes**: Cues are written to `master.db` only (not ANLZ files). rekordbox handles ANLZ sync on USB export.
 - **Analysis cache**: `propose`/`compare`/`review`/`beatgrid` cache results locally at `~/.djcues/analysis_cache.db` to avoid redundant recomputation — never touches the rekordbox database; use `--no-cache` to force a fresh run.
 
@@ -298,12 +310,13 @@ src/djcues/
     metrics.py      # Precision/recall/F1 for compare
     harmony.py      # Camelot Wheel key compatibility + BPM closeness (djcues suggest)
     audit.py        # BPM/Key comment-hint cross-checking + unusable-key detection (djcues audit)
+    flow.py         # Energy-flow set ordering -- peak-then-cooldown track sequencing (djcues flow)
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
     dashboard.py    # Analysis dashboard HTML/CSS/JS (browse playlists/tracks, run propose/compare/beatgrid)
     server.py       # Local HTTP server for review sessions, the BYOK setup wizard, and the dashboard
     writer.py       # DB backup, cue writes, and playlist add/remove/move
-    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, audit, auth, history, cache)
+    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, audit, flow, auth, history, cache)
 ```
 
 ## License
