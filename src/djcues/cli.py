@@ -16,6 +16,7 @@ warnings.filterwarnings("ignore", module="pyrekordbox")
 
 from djcues import analysis_cache
 from djcues.audit import audit_tracks
+from djcues.clash import find_vocal_clashes
 from djcues.constants import CUE_SYSTEM_BY_PAD, KIND_TO_PAD
 from djcues.db import find_playlist, list_all_tracks, list_playlist_tracks, load_playlist_tracks
 from djcues.flow import DEFAULT_COOLDOWN_FRACTION, suggest_energy_flow
@@ -27,7 +28,7 @@ from djcues.harmony import (
 )
 from djcues.metrics import compare_cues, merge_pad_stats, overall_stats
 from djcues.models import CueProposal
-from djcues.strategy import CueStrategy, build_cue_points
+from djcues.strategy import CueStrategy, DEFAULT_MIN_VOCAL_REGION_MS, build_cue_points
 
 
 def _format_time(ms: float) -> str:
@@ -1638,7 +1639,7 @@ def _exit_on_playlist_write_error(e) -> None:
 
 @cli.group()
 def playlist():
-    """Move/add/remove tracks between existing rekordbox playlists.
+    """Move/add/remove/reorder tracks in existing rekordbox playlists.
 
     Writes directly to master.db -- rekordbox must be closed (checked
     upfront, before any backup or write). A timestamped backup of
@@ -1716,6 +1717,77 @@ def playlist_move(source_playlist, track_name, dest_playlist, position):
         _exit_on_playlist_write_error(e)
 
     click.echo(f"Moved '{track.title}' from '{source_playlist}' to '{dest_playlist}'.")
+
+
+@playlist.command("reorder")
+@click.argument("playlist_name")
+@click.option(
+    "--cooldown-fraction", default=DEFAULT_COOLDOWN_FRACTION, show_default=True,
+    help="Fraction of the lowest-energy tracks (excluding the opener) reserved for the cooldown close -- same meaning as flow's own option.",
+)
+@click.option("--force", is_flag=True, help="Skip confirmation.")
+def playlist_reorder(playlist_name, cooldown_fraction, force):
+    """Compute the energy-flow order for PLAYLIST_NAME (like `djcues flow`)
+    and WRITE it into the real playlist, reordering its tracks in Rekordbox.
+
+    Unlike `djcues flow` (read-only), this writes directly to master.db --
+    rekordbox must be closed. Any track flow couldn't score (no phrase/
+    waveform data) is appended at the end, in its original relative
+    order, so every track in the playlist always ends up somewhere in
+    the new order.
+    """
+    from djcues.writer import PlaylistWriteError, reorder_playlist
+
+    playlist_obj = find_playlist(playlist_name)
+    if playlist_obj is None:
+        click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    # Cheap pass first, same reasoning as `flow`'s own: an accurate
+    # count/position/key map before paying for any ANLZ I/O, and an
+    # empty playlist fails fast.
+    summaries = list_playlist_tracks(playlist_obj.ID)
+    if not summaries:
+        click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
+        raise SystemExit(1)
+    position_map = {str(s.id): s.track_no for s in summaries}
+    key_map = {str(s.id): s.key for s in summaries}
+
+    click.echo(
+        f"Loading {len(summaries)} track(s) from '{playlist_name}'... "
+        "(this may take a while for large playlists)"
+    )
+    tracks = load_playlist_tracks(playlist_obj.ID)
+
+    result = suggest_energy_flow(tracks, cooldown_fraction=cooldown_fraction)
+    for u in result.unscored:
+        reason_label = "no phrase data" if u.reason == "no_phrase_data" else "no waveform data"
+        click.echo(f"  Skipping {u.track.title} ({reason_label})", err=True)
+
+    _print_flow_report(result, playlist_name, position_map, key_map)
+
+    target_order = [te.track.id for te in result.ordered_tracks] + [u.track.id for u in result.unscored]
+
+    if result.unscored:
+        start = len(result.ordered_tracks) + 1
+        click.echo(f"\n  {len(result.unscored)} unscored track(s) appended at the end:")
+        for i, u in enumerate(result.unscored, start=start):
+            was = position_map.get(str(u.track.id))
+            was_str = str(was) if was is not None else "?"
+            click.echo(f"  {i:<4d}{was_str:<5s}{u.track.title:<38.38s}{u.track.artist:<20.20s}")
+
+    if not force and not click.confirm(
+        f"\nWrite this order to '{playlist_name}' in Rekordbox? This rewrites the real playlist."
+    ):
+        click.echo("Aborted.")
+        return
+
+    try:
+        reorder_playlist(playlist_obj.ID, target_order, db=None)
+    except (PlaylistWriteError, ValueError) as e:
+        _exit_on_playlist_write_error(e)
+
+    click.echo(f"\nWrote new order to '{playlist_name}'.")
 
 
 def _resolve_reference_track(playlist_name, track_name):
@@ -1881,7 +1953,7 @@ def audit(playlist_name, library, bpm_tolerance, no_half_double):
     _print_audit_report(result, scope)
 
 
-def _print_flow_report(result, playlist_name: str, position_map: dict) -> None:
+def _print_flow_report(result, playlist_name: str, position_map: dict, key_map: dict) -> None:
     click.echo(f"\n{'=' * 60}")
     click.echo(f"  Energy Flow: {playlist_name}")
     click.echo(f"  {len(result.ordered_tracks)} track(s) ordered, {len(result.unscored)} skipped")
@@ -1890,14 +1962,15 @@ def _print_flow_report(result, playlist_name: str, position_map: dict) -> None:
     if not result.ordered_tracks:
         click.echo("\n  No scorable tracks to order.")
     else:
-        click.echo(f"\n  {'#':<4s}{'Was':<5s}{'Title':<40s}{'Artist':<20s}{'Mean':>6s}{'Peak':>6s}")
+        click.echo(f"\n  {'#':<4s}{'Was':<5s}{'Title':<38s}{'Artist':<20s}{'Key':<5s}{'Mean':>6s}{'Peak':>6s}")
         for i, te in enumerate(result.ordered_tracks, start=1):
             if i == result.cooldown_start_index + 1:
-                click.echo(f"  {'-- cooldown begins --':^75s}")
+                click.echo(f"  {'-- cooldown begins --':^76s}")
             was = position_map.get(str(te.track.id))
             was_str = str(was) if was is not None else "?"
+            key_str = key_map.get(str(te.track.id)) or ""
             click.echo(
-                f"  {i:<4d}{was_str:<5s}{te.track.title:<40.40s}{te.track.artist:<20.20s}"
+                f"  {i:<4d}{was_str:<5s}{te.track.title:<38.38s}{te.track.artist:<20.20s}{key_str:<5s}"
                 f"{te.mean_energy:>6.2f}{te.peak_energy:>6.2f}"
             )
 
@@ -1922,6 +1995,9 @@ def flow(playlist_name, cooldown_fraction):
     load than the metadata suggest/audit use (measured live at
     ~266ms/track) and is infeasible across the whole library in one
     synchronous run.
+
+    See `djcues playlist reorder` to actually write this order into the
+    real playlist -- this command never does.
     """
     playlist = find_playlist(playlist_name)
     if playlist is None:
@@ -1930,14 +2006,15 @@ def flow(playlist_name, cooldown_fraction):
 
     # Cheap pass first (list_playlist_tracks, no ANLZ I/O): gives an
     # accurate count for the progress message below, doubles as the
-    # id -> track_no "current position" map (load_playlist_tracks's
-    # Track objects carry no position of their own), and lets an empty
-    # playlist fail fast before paying for any ANLZ I/O at all.
+    # id -> track_no "current position" / id -> Key maps (load_playlist_
+    # tracks's Track objects carry neither of their own), and lets an
+    # empty playlist fail fast before paying for any ANLZ I/O at all.
     summaries = list_playlist_tracks(playlist.ID)
     if not summaries:
         click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
         raise SystemExit(1)
     position_map = {str(s.id): s.track_no for s in summaries}
+    key_map = {str(s.id): s.key for s in summaries}
 
     click.echo(
         f"Loading {len(summaries)} track(s) from '{playlist_name}'... "
@@ -1950,4 +2027,84 @@ def flow(playlist_name, cooldown_fraction):
         reason_label = "no phrase data" if u.reason == "no_phrase_data" else "no waveform data"
         click.echo(f"  Skipping {u.track.title} ({reason_label})", err=True)
 
-    _print_flow_report(result, playlist_name, position_map)
+    _print_flow_report(result, playlist_name, position_map, key_map)
+
+
+_UNSCORABLE_LABELS = {
+    "no_phrase_data": "no phrase data",
+    "no_vocal_data": "no vocal data",
+    "no_intro_phrase": "no Intro phrase",
+    "no_outro_phrase": "no Outro phrase",
+}
+
+
+def _print_clash_report(result, playlist_name: str) -> None:
+    click.echo(f"\n{'=' * 60}")
+    click.echo(f"  Vocal Clash: {playlist_name}")
+    click.echo(f"  {result.scanned_pairs} pair(s) scanned, {len(result.unscorable)} track(s) unscorable")
+    click.echo(f"{'=' * 60}")
+
+    if not result.findings:
+        click.echo("\n  No vocal clashes found.")
+    else:
+        click.echo(f"\n  {len(result.findings)} finding(s):")
+        for f in result.findings:
+            click.echo(f"    [{f.position_a}] {f.track_a.title} → [{f.position_b}] {f.track_b.title}")
+            a_regions = ", ".join(f"{_format_time(r.start_ms)}-{_format_time(r.end_ms)}" for r in f.regions_a)
+            b_regions = ", ".join(f"{_format_time(r.start_ms)}-{_format_time(r.end_ms)}" for r in f.regions_b)
+            click.echo(f"      A tail vocals ({f.track_a.title}): {a_regions}")
+            click.echo(f"      B head vocals ({f.track_b.title}): {b_regions}")
+
+    if result.unscorable:
+        counts = {reason: sum(1 for u in result.unscorable if u.reason == reason) for reason in _UNSCORABLE_LABELS}
+        parts = [f"{counts[reason]} {label}" for reason, label in _UNSCORABLE_LABELS.items() if counts[reason]]
+        click.echo(f"\n  (unscorable: {', '.join(parts)})")
+
+
+@cli.command()
+@click.argument("playlist_name")
+@click.option(
+    "--min-vocal-region-ms", default=DEFAULT_MIN_VOCAL_REGION_MS, show_default=True,
+    help="Minimum sustained vocal-confidence duration (ms) to count as a real vocal region.",
+)
+def clash(playlist_name, min_vocal_region_ms):
+    """Flag adjacent track pairs in one playlist at risk of a vocal clash.
+
+    Scans every pair of adjacent tracks in PLAYLIST_NAME's current order
+    and flags pairs where track A still has vocals overlapping its
+    Outro-anchored tail zone AND track B already has vocals overlapping
+    its Intro-anchored head zone. Read-only diagnostic report, same
+    category as `audit` -- flags problems, never suggests a new order,
+    never writes to the database. Scoped to PLAYLIST_NAME only, with no
+    --library option: needs real per-track phrase/vocal data (same cost
+    as `flow`, ~266ms/track measured live), and "adjacent" is only a
+    meaningful concept within one ordered playlist.
+    """
+    playlist = find_playlist(playlist_name)
+    if playlist is None:
+        click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    summaries = list_playlist_tracks(playlist.ID)
+    if not summaries:
+        click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
+        raise SystemExit(1)
+
+    click.echo(
+        f"Loading {len(summaries)} track(s) from '{playlist_name}'... "
+        "(this may take a while for large playlists)"
+    )
+    loaded = load_playlist_tracks(playlist.ID)
+    # load_playlist_tracks() does not guarantee TrackNo order (confirmed:
+    # db.get_playlist_songs() has no ORDER BY, unlike list_playlist_
+    # tracks()'s own explicit .sort() above) -- reorder to match
+    # summaries' real playlist order, which this command's whole
+    # "adjacent tracks" premise depends on.
+    tracks_by_id = {str(t.id): t for t in loaded}
+    tracks = [tracks_by_id[str(s.id)] for s in summaries if str(s.id) in tracks_by_id]
+
+    result = find_vocal_clashes(tracks, min_vocal_region_ms=min_vocal_region_ms)
+    for u in result.unscorable:
+        click.echo(f"  Skipping {u.track.title} ({_UNSCORABLE_LABELS[u.reason]})", err=True)
+
+    _print_clash_report(result, playlist_name)

@@ -1698,6 +1698,63 @@ class TestDashboardPlaylistWrites:
             )
         assert status == 409
 
+    def test_reorder_missing_ordered_content_ids_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, data = _post(base_url + "/api/playlists/pl1/reorder", {})
+        assert status == 400
+        assert "ordered_content_ids is required" in data["error"]
+
+    def test_reorder_happy_path(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.writer.reorder_playlist") as mock_reorder:
+            status, data = _post(
+                base_url + "/api/playlists/pl1/reorder", {"ordered_content_ids": ["c2", "c1"]}
+            )
+        assert status == 200
+        assert data == {"ok": True}
+        mock_reorder.assert_called_once_with("pl1", ["c2", "c1"], db=fake_db)
+
+    def test_reorder_rekordbox_running_is_409(self, dashboard_server):
+        from djcues.writer import RekordboxRunningError
+
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch(
+                 "djcues.writer.reorder_playlist",
+                 side_effect=RekordboxRunningError("Rekordbox is running."),
+             ):
+            status, data = _post(
+                base_url + "/api/playlists/pl1/reorder", {"ordered_content_ids": ["c1"]}
+            )
+        assert status == 409
+
+    def test_reorder_permutation_mismatch_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch(
+                 "djcues.writer.reorder_playlist",
+                 side_effect=ValueError("does not match playlist pl1's current tracks exactly"),
+             ):
+            status, data = _post(
+                base_url + "/api/playlists/pl1/reorder", {"ordered_content_ids": ["c1"]}
+            )
+        assert status == 400
+        assert "does not match" in data["error"]
+
+    def test_reorder_unexpected_error_is_500(self, dashboard_server):
+        base_url, _server = dashboard_server
+        fake_db = MagicMock()
+        with patch.object(_DbWorker, "run", side_effect=self._worker_calls_fn_with(fake_db)), \
+             patch("djcues.writer.reorder_playlist", side_effect=RuntimeError("unexpected")):
+            status, data = _post(
+                base_url + "/api/playlists/pl1/reorder", {"ordered_content_ids": ["c1"]}
+            )
+        assert status == 500
+
 
 class TestDashboardSuggestionsEndpoint:
     """GET /api/tracks/<id>/suggestions -- read-only, so unlike
@@ -1923,6 +1980,7 @@ class TestDashboardFlowJobs:
         assert len(result["ordered_tracks"]) > 0
         assert 0 <= result["cooldown_start_index"] <= len(result["ordered_tracks"])
         assert all(t["current_position"] is not None for t in result["ordered_tracks"])
+        assert all("key" in t for t in result["ordered_tracks"])
         assert all("mean_energy" in t and "peak_energy" in t for t in result["ordered_tracks"])
 
     def test_browsing_stays_responsive_while_a_flow_job_is_running(self, dashboard_server):
@@ -1951,6 +2009,118 @@ class TestDashboardFlowJobs:
             assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running flow job"
 
             # Drain the job so the test doesn't leave a stray thread mid-sleep.
+            deadline = time.monotonic() + 10
+            job = {}
+            while time.monotonic() < deadline:
+                status, job = _get(base_url + f"/api/jobs/{job_id}")
+                if job["status"] != "running":
+                    break
+                time.sleep(0.2)
+            assert job["status"] == "done"
+
+
+@requires_rekordbox
+class TestDashboardClashJobs:
+    """POST /api/playlists/<id>/clash-jobs -- unlike suggest/audit, this
+    runs on its own dedicated connection/thread (_run_clash_job), not
+    _DbWorker (see its docstring for why), so it can't be
+    _DbWorker.run-mocked the way TestDashboardAuditEndpoint is -- gated
+    on @requires_rekordbox instead, matching TestDashboardFlowJobs's own
+    precedent for the same reason. djcues.clash's own logic has its own
+    exhaustive tests in test_clash.py.
+    """
+
+    @staticmethod
+    def _tech_house_playlist_id(base_url: str) -> str:
+        _, tree = _get(base_url + "/api/playlists")
+        tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
+        return tech_house["id"]
+
+    def _run_clash_job_to_completion(
+        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = 20.0
+    ) -> dict:
+        status, data = _post(base_url + f"/api/playlists/{playlist_id}/clash-jobs", body or {})
+        assert status == 202, data
+        job_id = data["job_id"]
+
+        deadline = time.monotonic() + timeout
+        job: dict = {}
+        while time.monotonic() < deadline:
+            status, job = _get(base_url + f"/api/jobs/{job_id}")
+            assert status == 200
+            if job["status"] != "running":
+                return job
+            time.sleep(0.2)
+        raise AssertionError(f"clash job {job_id} did not finish within {timeout}s: {job}")
+
+    def test_invalid_min_vocal_region_ms_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, _data = _post(
+            base_url + "/api/playlists/pl1/clash-jobs", {"min_vocal_region_ms": "not-a-number"}
+        )
+        assert status == 400
+
+    def test_unknown_playlist_id_produces_error_job(self, dashboard_server):
+        base_url, _server = dashboard_server
+        job = self._run_clash_job_to_completion(base_url, "not-a-real-playlist-id")
+        assert job["status"] == "error"
+        assert job["error"]
+
+    def test_clash_job_completes_for_real(self, dashboard_server):
+        # No mocking needed -- find_vocal_clashes is pure, cheap
+        # arithmetic over data load_playlist_tracks already reads for
+        # real; this runs genuinely end to end, same spirit as
+        # TestDashboardFlowJobs's own analogous test.
+        base_url, _server = dashboard_server
+        playlist_id = self._tech_house_playlist_id(base_url)
+
+        job = self._run_clash_job_to_completion(base_url, playlist_id)
+
+        assert job["status"] == "done"
+        assert job["error"] is None
+        result = job["result"]
+        assert result["scanned_pairs"] >= 0
+        for f in result["findings"]:
+            assert f["position_b"] == f["position_a"] + 1
+            assert f["regions_a"] and f["regions_b"]
+
+    def test_clash_job_flags_known_real_pairs(self, dashboard_server):
+        # Real, correctly-ordered pairs verified live in this library's
+        # Tech House playlist -- mirrors test_clash.py's own anchored
+        # regression test.
+        base_url, _server = dashboard_server
+        playlist_id = self._tech_house_playlist_id(base_url)
+
+        job = self._run_clash_job_to_completion(base_url, playlist_id)
+
+        assert job["status"] == "done"
+        found_pairs = {(f["track_a"]["title"], f["track_b"]["title"]) for f in job["result"]["findings"]}
+        assert any("Ladbroke Grove" in a and "I Go To Work" in b for a, b in found_pairs), found_pairs
+        assert any("Supersonic" in a and "Cha Cha Slide" in b for a, b in found_pairs), found_pairs
+
+    def test_browsing_stays_responsive_while_a_clash_job_is_running(self, dashboard_server):
+        """Same proof as TestDashboardFlowJobs's own analogous test, for
+        this feature's separate dedicated-connection job path."""
+        base_url, _server = dashboard_server
+        playlist_id = self._tech_house_playlist_id(base_url)
+
+        def slow_find_vocal_clashes(tracks, *, min_vocal_region_ms=2000.0):
+            time.sleep(1.5)
+            from djcues.clash import ClashResult
+            return ClashResult(scanned_pairs=0, findings=[], unscorable=[])
+
+        with patch("djcues.clash.find_vocal_clashes", side_effect=slow_find_vocal_clashes):
+            status, data = _post(base_url + f"/api/playlists/{playlist_id}/clash-jobs", {})
+            assert status == 202
+            job_id = data["job_id"]
+
+            start = time.monotonic()
+            status, _tree = _get(base_url + "/api/playlists")
+            elapsed = time.monotonic() - start
+
+            assert status == 200
+            assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running clash job"
+
             deadline = time.monotonic() + 10
             job = {}
             while time.monotonic() < deadline:

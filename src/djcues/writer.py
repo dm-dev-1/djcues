@@ -488,3 +488,104 @@ def move_track_between_playlists(
     except Exception:
         db.rollback()
         raise
+
+
+# --- Playlist order (write the energy-flow-computed track order) --------
+#
+# djcues's first write that reorders tracks WITHIN a playlist, rather
+# than membership between playlists (the three functions above). Built
+# on pyrekordbox's own Rekordbox6Database.move_song_in_playlist(), which
+# already existed but was completely unused anywhere in djcues before
+# this. Deliberately flow-agnostic -- this file has no existing
+# dependency on flow.py/harmony.py/audit.py/clash.py and shouldn't gain
+# one; callers (cli.py's `playlist reorder`, server.py's
+# _handle_playlist_reorder_post) are responsible for computing the
+# target order and handing this a plain list of content IDs.
+
+
+def reorder_playlist(playlist_id, ordered_content_ids: list, db=None) -> None:
+    """Write ordered_content_ids as playlist_id's real DjmdSongPlaylist
+    TrackNo order.
+
+    ordered_content_ids must be an exact permutation of the playlist's
+    real, current track content IDs (same multiset -- same content IDs,
+    same count, including matching any content ID that legitimately
+    appears more than once in one playlist, see resolve_playlist_entry's
+    own docstring above) -- checked against a fresh read, before
+    backup_database(), and rejected with ValueError otherwise. This is
+    the guard against writing a corrupted order if the playlist's real
+    membership changed between when the order was computed (e.g. an
+    earlier flow job in the dashboard) and when this is actually called.
+    """
+    from collections import defaultdict, deque
+
+    from djcues.db import get_db
+
+    ensure_rekordbox_closed()
+    db = db if db is not None else get_db()
+
+    playlist = db.get_playlist(ID=playlist_id)
+    if playlist is None:
+        raise ValueError(f"playlist {playlist_id} not found")
+
+    # Live DjmdSongPlaylist rows for this playlist, fetched ONCE and
+    # reused for both the permutation check below and the move loop --
+    # NOT re-queried per-iteration. `.TrackNo or 0` matches
+    # list_playlist_tracks()'s own defensive sort key in db.py (a bare
+    # `.TrackNo` sort would raise TypeError if any row's TrackNo is
+    # None, comparing None against int).
+    rows = list(db.get_playlist_songs(PlaylistID=playlist_id))
+    rows.sort(key=lambda r: r.TrackNo or 0)
+
+    # Grouped by content ID, not a flat id -> row dict: a track can
+    # legally appear more than once in one playlist (see
+    # resolve_playlist_entry above). A flat dict would silently collapse
+    # two rows sharing a content ID into one, permanently losing track
+    # of the other -- a real corrupted-order bug, not just a style
+    # choice. Each queue is consumed in original TrackNo order as that
+    # content ID's occurrences are encountered in ordered_content_ids
+    # below, so N occurrences of the same content ID map 1:1 onto that
+    # content ID's N real rows.
+    rows_by_content_id: dict = defaultdict(deque)
+    for row in rows:
+        rows_by_content_id[str(row.ContentID)].append(row)
+
+    target_ids = [str(cid) for cid in ordered_content_ids]
+    current_ids = [str(row.ContentID) for row in rows]
+    if sorted(target_ids) != sorted(current_ids):
+        raise ValueError(
+            f"ordered_content_ids does not match playlist {playlist_id}'s current tracks "
+            "exactly -- the playlist changed since this order was computed"
+        )
+
+    backup_database(db.db_directory / "master.db")
+
+    try:
+        for target_track_no, content_id in enumerate(target_ids, start=1):
+            row = rows_by_content_id[content_id].popleft()
+            # CRITICAL: never call move_song_in_playlist when the track
+            # is already at its target position. pyrekordbox's own
+            # move_song_in_playlist (db6/database.py) has a confirmed
+            # bug on exactly this no-op path: it unconditionally calls
+            # self.registry.disable_tracking(), then for
+            # new_track_no == old_track_no hits a bare `return` BEFORE
+            # its own self.registry.enable_tracking() call ever runs --
+            # and RekordboxAgentRegistry.__enabled__ is a CLASS-level
+            # attribute (db6/registry.py), not per-call or per-instance.
+            # Triggering this even once silently disables change-
+            # tracking for every subsequent write on this process's db
+            # connection (rows keep getting written, but stop getting
+            # their rb_local_usn bumped by commit()'s own
+            # autoincrement_local_update_count() step). Do not
+            # "simplify" this guard away -- it's what prevents a
+            # totally silent, hard-to-diagnose USN corruption later in
+            # this same process.
+            if row.TrackNo != target_track_no:
+                db.move_song_in_playlist(playlist, row, target_track_no)
+        db.commit()
+    except RuntimeError as e:
+        db.rollback()
+        raise RekordboxRunningError(str(e)) from e
+    except Exception:
+        db.rollback()
+        raise

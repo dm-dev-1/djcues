@@ -1,6 +1,6 @@
 import pytest
 from djcues.models import BeatGrid, CuePoint, Phrase, Track, CueProposal, WaveformPoint
-from djcues.strategy import CueStrategy
+from djcues.strategy import CueStrategy, DEFAULT_MIN_VOCAL_REGION_MS, find_vocal_regions
 
 
 @pytest.fixture
@@ -404,3 +404,107 @@ def test_loop_out_confidence_reduced_by_poor_spectral_similarity(beat_grid: Beat
     hot_h = next(c for c in proposal.hot_cues if c.kind == 9)
     assert hot_h.position_ms == 160000.0  # position stays phrase-anchored
     assert proposal.confidence["H"] == pytest.approx(0.45)  # 0.9 * (0.5 + 0.5*0.0)
+
+
+# ---------------------------------------------------------------------------
+# find_vocal_regions -- vocal-clash detection's underlying signal. phrases/
+# beat_grid are irrelevant here (only track.vocal_track matters), so the
+# helper below builds the minimum viable Track.
+# ---------------------------------------------------------------------------
+
+_FRAME_MS = 1024 / 22050 * 1000
+
+
+def _track_with_vocal(vocal_track: list[int]) -> Track:
+    return Track(
+        id=1, title="Vocal Test", artist="Test", bpm=128.0, duration_ms=200_000.0,
+        analysis_path="", cues=[], phrases=[], beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+        vocal_track=vocal_track,
+    )
+
+
+def test_find_vocal_regions_returns_empty_when_no_vocal_track():
+    track = _track_with_vocal(None)
+    assert find_vocal_regions(track) == []
+
+
+def test_find_vocal_regions_returns_empty_for_empty_vocal_track():
+    assert find_vocal_regions(_track_with_vocal([])) == []
+
+
+def test_region_just_under_min_duration_is_excluded():
+    n_frames = 43  # 43 * ~46.44ms ~= 1996.9ms, just under the 2000ms floor
+    assert n_frames * _FRAME_MS < DEFAULT_MIN_VOCAL_REGION_MS
+    track = _track_with_vocal([4] * n_frames + [0])
+    assert find_vocal_regions(track) == []
+
+
+def test_region_just_over_min_duration_is_included():
+    n_frames = 44  # 44 * ~46.44ms ~= 2043.4ms, just over the 2000ms floor
+    assert n_frames * _FRAME_MS >= DEFAULT_MIN_VOCAL_REGION_MS
+    track = _track_with_vocal([4] * n_frames + [0])
+    regions = find_vocal_regions(track)
+    assert len(regions) == 1
+    assert regions[0].start_ms == 0
+    assert regions[0].end_ms == round(n_frames * _FRAME_MS)
+
+
+def test_fading_tail_extends_the_region_past_the_onset_threshold():
+    # Confidence drops from 4 to 2 to 1 before hitting 0 -- the region
+    # must extend through the whole >0 tail, not stop where it first
+    # drops below the >=3 onset threshold.
+    vt = [4] * 30 + [2] * 20 + [1] * 10 + [0]
+    track = _track_with_vocal(vt)
+    regions = find_vocal_regions(track)
+    assert len(regions) == 1
+    assert regions[0].start_ms == 0
+    assert regions[0].end_ms == round(60 * _FRAME_MS)
+
+
+def test_two_separate_regions_both_returned_in_order():
+    vt = [4] * 50 + [0] * 10 + [3] * 50 + [0]
+    track = _track_with_vocal(vt)
+    regions = find_vocal_regions(track)
+    assert len(regions) == 2
+    assert regions[0].start_ms == 0
+    assert regions[0].end_ms == round(50 * _FRAME_MS)
+    assert regions[1].start_ms == round(60 * _FRAME_MS)
+    assert regions[1].end_ms == round(110 * _FRAME_MS)
+
+
+def test_confidence_of_exactly_2_never_starts_a_region():
+    # Sustained arbitrarily long, but never reaches the >=3 onset --
+    # a region can never be initiated by a value of 2 alone.
+    track = _track_with_vocal([2] * 1000)
+    assert find_vocal_regions(track) == []
+
+
+def test_min_region_ms_override_allows_a_short_burst():
+    vt = [4] * 10 + [0]  # 10 * ~46.44ms ~= 464.4ms
+    track = _track_with_vocal(vt)
+    assert find_vocal_regions(track) == []  # excluded at the default floor
+    regions = find_vocal_regions(track, min_region_ms=400.0)
+    assert len(regions) == 1
+
+
+def test_default_min_vocal_region_ms_is_2000():
+    assert DEFAULT_MIN_VOCAL_REGION_MS == 2000.0
+
+
+def test_matches_agentics_own_vocal_onset_detection():
+    """Cross-validation guard: this and agentic._summarize_vocal_onsets()
+    are independent copies of the same threshold logic (see find_vocal_
+    regions()'s own docstring for why there are three copies in this
+    codebase) -- this test fails loudly if they ever silently drift
+    apart, without unifying the two (agentic.py pulls in djcues.providers
+    at module level, which strategy.py must not depend on)."""
+    from djcues.agentic import _summarize_vocal_onsets
+
+    vt = [0] * 20 + [4] * 50 + [0] * 15 + [3] * 60 + [1] * 5 + [0] * 100
+    track = _track_with_vocal(vt)
+
+    regions = find_vocal_regions(track)
+    onsets = _summarize_vocal_onsets(track)
+
+    assert [(r.start_ms, r.end_ms) for r in regions] == [(o["start_ms"], o["end_ms"]) for o in onsets]
+    assert len(regions) == 2  # sanity: the fixture above is genuinely exercising two regions

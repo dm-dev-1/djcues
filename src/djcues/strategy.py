@@ -3,7 +3,21 @@
 from __future__ import annotations
 
 from djcues.constants import CUE_SYSTEM, CUE_SYSTEM_BY_PAD
-from djcues.models import CuePoint, CueProposal, Phrase, Track
+from djcues.models import CuePoint, CueProposal, Phrase, Track, VocalRegion
+
+# PVDI frame duration and the minimum sustained-region floor used to turn
+# track.vocal_track's raw per-frame confidence (0-4) into "real" vocal
+# presence. This is the THIRD copy of this exact >=3 (onset) / >0
+# (sustain) / min_region_ms (floor) threshold triple in this codebase --
+# the other two are CueStrategy.propose()'s own inline C-slot detection
+# below (local `frame_ms`/`min_frames`) and agentic.py's
+# _summarize_vocal_onsets() (_VOCAL_FRAME_MS/_MIN_VOCAL_REGION_MS).
+# Deliberately NOT unified into one shared call site (see
+# find_vocal_regions()'s own docstring) -- grep "_VOCAL_FRAME_MS" or
+# "1024 / 22050" across strategy.py/agentic.py to find all three if this
+# ever needs to change.
+_VOCAL_FRAME_MS = 1024 / 22050 * 1000  # ~46.4ms per PVDI frame, matches agentic.py's own constant
+DEFAULT_MIN_VOCAL_REGION_MS = 2000.0
 
 
 def _spectral_similarity(wf_points: list, i0: int, i_mid: int, i1: int) -> float:
@@ -138,6 +152,58 @@ def find_drop_candidates(track: Track) -> tuple[list[Phrase], str]:
         return ups_after, "up_after_early_chorus"
 
     return [choruses[-1]], "last_chorus_fallback"
+
+
+def find_vocal_regions(
+    track: Track, min_region_ms: float = DEFAULT_MIN_VOCAL_REGION_MS
+) -> list[VocalRegion]:
+    """All sustained vocal-presence regions across the WHOLE track, from
+    Rekordbox's own PVDI per-frame vocal-confidence data (track.
+    vocal_track, 0-4 scale, ~46.4ms/frame -- see db.py's
+    _extract_vocal_track()).
+
+    Generalizes the vocal-onset-detection logic CueStrategy.propose()'s
+    inline C-slot ("Vocal/Buildup") detection and agentic.py's
+    _summarize_vocal_onsets() already use (see this module's own
+    _VOCAL_FRAME_MS/DEFAULT_MIN_VOCAL_REGION_MS comment for why there
+    are three copies) to (a) scan the entire track instead of stopping
+    at the first region before the Drop, and (b) return typed
+    VocalRegion objects instead of a loose dict -- for clash.py, which
+    needs every vocal region anywhere in the track, not just the one
+    relevant to cue placement.
+
+    A region starts at a frame where confidence reaches >=3 ("strong"
+    onset), continues while confidence stays >0 (captures the fade
+    tail), and is only kept if it sustains for >= min_region_ms (filters
+    noise/blips) -- this exact threshold triple is this codebase's own
+    established judgment for "real" vocal presence. Deliberately not a
+    mean-confidence metric -- live-tested and cross-validated against
+    this region-based approach on the real library, and the region-based
+    approach is more sensitive, catching real cases a mean-confidence
+    approach missed.
+
+    Returns [] if the track has no vocal_track data at all.
+    """
+    if not track.vocal_track:
+        return []
+    vt = track.vocal_track
+    regions: list[VocalRegion] = []
+    i = 0
+    n = len(vt)
+    while i < n:
+        if vt[i] >= 3:
+            start = i
+            while i < n and vt[i] > 0:
+                i += 1
+            duration_ms = (i - start) * _VOCAL_FRAME_MS
+            if duration_ms >= min_region_ms:
+                regions.append(VocalRegion(
+                    start_ms=round(start * _VOCAL_FRAME_MS),
+                    end_ms=round(i * _VOCAL_FRAME_MS),
+                ))
+        else:
+            i += 1
+    return regions
 
 
 def build_cue_points(

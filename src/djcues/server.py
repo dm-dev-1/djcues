@@ -1007,9 +1007,12 @@ def _run_flow_job(
     result: dict
 
     try:
-        position_map = {
-            str(t.id): t.track_no
-            for t in db_module.list_playlist_tracks(playlist_id, db=dedicated_db)
+        # Track (from load_playlist_tracks()) carries no Key data of its
+        # own -- only TrackSummary does -- so key, like current_position,
+        # is cross-referenced from this same cheap summaries pass rather
+        # than adding a field to the shared Track model for one feature.
+        summaries_by_id = {
+            str(s.id): s for s in db_module.list_playlist_tracks(playlist_id, db=dedicated_db)
         }
         tracks = db_module.load_playlist_tracks(playlist_id, db=dedicated_db)
         if not tracks:
@@ -1020,10 +1023,12 @@ def _run_flow_job(
         )
 
         def _track_json(te):
+            summary = summaries_by_id.get(str(te.track.id))
             return {
                 "id": te.track.id, "title": te.track.title, "artist": te.track.artist,
+                "key": summary.key if summary else None,
                 "mean_energy": te.mean_energy, "peak_energy": te.peak_energy,
-                "current_position": position_map.get(str(te.track.id)),
+                "current_position": summary.track_no if summary else None,
             }
 
         unscored_summary = {"no_phrase_data": 0, "no_waveform_data": 0}
@@ -1040,6 +1045,92 @@ def _run_flow_job(
                     for u in flow_result.unscored
                 ],
                 "unscored_summary": unscored_summary,
+            },
+            "error": None,
+        }
+    except Exception as e:  # noqa: BLE001 -- surfaced to the dashboard UI, not swallowed
+        result = {"status": "error", "result": None, "error": str(e)}
+    finally:
+        dedicated_db.close()
+
+    result["finished_at"] = datetime.now().replace(microsecond=0).isoformat()
+    result["elapsed_seconds"] = round(time_module.monotonic() - started, 1)
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(result)
+
+
+def _run_clash_job(
+    job_id: str, playlist_id: str, params: dict, jobs: dict, jobs_lock: threading.Lock
+) -> None:
+    """Runs find_vocal_clashes() for one playlist on its own thread, with
+    its own short-lived, dedicated Rekordbox6Database connection --
+    mirrors _run_flow_job's shape and rationale exactly (see its
+    docstring, and _DbWorker's, for why neither the shared djcues.db
+    singleton nor _DbWorker is used here).
+
+    Like _run_flow_job, the database is touched twice, both up front:
+    list_playlist_tracks() and load_playlist_tracks() itself. Unlike
+    _run_flow_job, list_playlist_tracks()'s result isn't just a display
+    aid here -- it's also load_playlist_tracks()'s TrackNo-sorted id
+    order, which the loaded Track objects are reordered to match before
+    being handed to find_vocal_clashes() (load_playlist_tracks() itself
+    does not guarantee TrackNo order -- see clash.py's own module
+    docstring for why this matters here specifically, unlike for flow).
+    The actual scan is pure and in-memory, so it runs entirely after the
+    connection's work is done.
+    """
+    import time as time_module
+
+    from pyrekordbox import Rekordbox6Database
+
+    from djcues import clash as clash_module
+    from djcues import db as db_module
+
+    started = time_module.monotonic()
+    dedicated_db = Rekordbox6Database()
+    result: dict
+
+    try:
+        summaries = db_module.list_playlist_tracks(playlist_id, db=dedicated_db)
+        if not summaries:
+            raise ValueError(f"playlist {playlist_id!r} has no tracks")
+        loaded = db_module.load_playlist_tracks(playlist_id, db=dedicated_db)
+        tracks_by_id = {str(t.id): t for t in loaded}
+        tracks = [tracks_by_id[str(s.id)] for s in summaries if str(s.id) in tracks_by_id]
+
+        clash_result = clash_module.find_vocal_clashes(
+            tracks, min_vocal_region_ms=params["min_vocal_region_ms"]
+        )
+
+        def _track_json(t):
+            return {"id": t.id, "title": t.title, "artist": t.artist}
+
+        def _region_json(r):
+            return {"start_ms": r.start_ms, "end_ms": r.end_ms}
+
+        unscorable_summary = {"no_phrase_data": 0, "no_vocal_data": 0, "no_intro_phrase": 0, "no_outro_phrase": 0}
+        for u in clash_result.unscorable:
+            unscorable_summary[u.reason] = unscorable_summary.get(u.reason, 0) + 1
+
+        result = {
+            "status": "done",
+            "result": {
+                "scanned_pairs": clash_result.scanned_pairs,
+                "findings": [
+                    {
+                        "track_a": _track_json(f.track_a), "track_b": _track_json(f.track_b),
+                        "position_a": f.position_a, "position_b": f.position_b,
+                        "regions_a": [_region_json(r) for r in f.regions_a],
+                        "regions_b": [_region_json(r) for r in f.regions_b],
+                    }
+                    for f in clash_result.findings
+                ],
+                "unscorable": [
+                    {"id": u.track.id, "title": u.track.title, "artist": u.track.artist, "reason": u.reason}
+                    for u in clash_result.unscorable
+                ],
+                "unscorable_summary": unscorable_summary,
             },
             "error": None,
         }
@@ -1436,12 +1527,16 @@ class DashboardHandler(_LocalJsonHandler):
             self._handle_job_post(parts[2])
         elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "flow-jobs":
             self._handle_flow_job_post(parts[2])
+        elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "clash-jobs":
+            self._handle_clash_job_post(parts[2])
         elif len(parts) == 5 and parts[0:2] == ["api", "tracks"] and parts[3] == "launch":
             self._handle_launch_post(parts[2], parts[4])
         elif path == "/api/devices":
             self._handle_devices_post()
         elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks":
             self._handle_playlist_track_add_post(parts[2])
+        elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "reorder":
+            self._handle_playlist_reorder_post(parts[2])
         elif len(parts) == 6 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks" and parts[5] == "remove":
             self._handle_playlist_track_remove_post(parts[2], parts[4])
         elif len(parts) == 6 and parts[0:2] == ["api", "playlists"] and parts[3] == "tracks" and parts[5] == "move":
@@ -1679,6 +1774,33 @@ class DashboardHandler(_LocalJsonHandler):
             return
         self._send_json({"ok": True})
 
+    def _handle_playlist_reorder_post(self, playlist_id: str) -> None:
+        """POST /api/playlists/<playlist_id>/reorder -- write a full new
+        track order to this playlist, matching an already-computed
+        energy-flow result (see cli.py's `playlist reorder` and
+        flow.py's suggest_energy_flow -- no server-side re-computation
+        here; the dashboard already ran a flow job and is just applying
+        its result). Body: {"ordered_content_ids": [...]}. Only touches
+        DjmdSongPlaylist.TrackNo via cheap DB queries/mutations -- the
+        same cost tier as the other three playlist-write routes above,
+        not flow/clash's own per-track ANLZ I/O -- so this is routed
+        through the same synchronous _db_worker/_run_playlist_write
+        pattern, not a new background-job kind."""
+        from djcues.writer import reorder_playlist
+
+        body = self._read_body()
+        ordered_content_ids = body.get("ordered_content_ids")
+        if not ordered_content_ids:
+            self._send_json({"error": "ordered_content_ids is required"}, status=400)
+            return
+
+        ok = self._run_playlist_write(
+            lambda db: reorder_playlist(playlist_id, ordered_content_ids, db=db)
+        )
+        if ok is None:
+            return
+        self._send_json({"ok": True})
+
     def _handle_flow_job_post(self, playlist_id: str) -> None:
         """POST /api/playlists/<playlist_id>/flow-jobs -- start an
         energy-flow ordering job for one playlist. Body:
@@ -1707,6 +1829,40 @@ class DashboardHandler(_LocalJsonHandler):
 
         thread = threading.Thread(
             target=_run_flow_job,
+            args=(job_id, playlist_id, params, self._jobs, self._jobs_lock),
+            daemon=True,
+        )
+        thread.start()
+        self._send_json({"job_id": job_id, "status": "running"}, status=202)
+
+    def _handle_clash_job_post(self, playlist_id: str) -> None:
+        """POST /api/playlists/<playlist_id>/clash-jobs -- start a vocal-
+        clash detection job for one playlist. Body: {"min_vocal_region_ms":
+        float}. Runs on its own thread/connection (_run_clash_job, not
+        _db_worker); poll GET /api/jobs/<job_id> for the result.
+        _handle_job_get is fully generic and needs no changes to serve
+        this job kind too."""
+        from djcues.strategy import DEFAULT_MIN_VOCAL_REGION_MS
+
+        body = self._read_body()
+        try:
+            min_vocal_region_ms = float(body.get("min_vocal_region_ms", DEFAULT_MIN_VOCAL_REGION_MS))
+        except (TypeError, ValueError):
+            self._send_json({"error": "min_vocal_region_ms must be a number"}, status=400)
+            return
+
+        params = {"min_vocal_region_ms": min_vocal_region_ms}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id, "playlist_id": playlist_id, "kind": "clash", "status": "running",
+            "started_at": datetime.now().replace(microsecond=0).isoformat(), "finished_at": None,
+            "elapsed_seconds": None, "result": None, "error": None,
+        }
+        with self._jobs_lock:
+            self._jobs[job_id] = job
+
+        thread = threading.Thread(
+            target=_run_clash_job,
             args=(job_id, playlist_id, params, self._jobs, self._jobs_lock),
             daemon=True,
         )

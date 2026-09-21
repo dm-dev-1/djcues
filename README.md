@@ -141,6 +141,33 @@ djcues flow "Tech House" --cooldown-fraction 0.3
 
 Scores each track by its real Rekordbox phrase structure and color-waveform energy (already read from the same ANLZ data `viz`/`review` use — no separate analysis pass), then orders the set from calmest opener, building up to the single highest-energy track, before winding down through a cooldown close reserved from the set's lower-energy tracks. Shows each track's old playlist position next to its new suggested one. Playlist-scoped only, with no `--library` option — loading real phrase/waveform data for the whole collection in one run isn't practical, and "order my entire collection as one set" isn't a coherent DJ concept anyway. Read-only — never writes to the database. Also available from the dashboard as its own "Suggest set order" view, which runs as a background job (like propose/compare/beatgrid) rather than a synchronous request, since it can take longer than a quick lookup for a large playlist.
 
+### Write a track order to the real playlist
+
+```bash
+# Compute the energy-flow order for a playlist (same algorithm as `flow`) and write it into Rekordbox
+djcues playlist reorder "Tech House"
+
+# Reserve a bigger (or smaller) cooldown close, same meaning as flow's own option
+djcues playlist reorder "Tech House" --cooldown-fraction 0.3
+
+# Skip the confirmation prompt
+djcues playlist reorder "Tech House" --force
+```
+
+Computes the same energy-flow order as `djcues flow`, then writes it — reorders the tracks within the playlist to match, via rekordbox's own `TrackNo` field. Unlike `flow` (read-only), this rewrites the real playlist's running order; any track flow couldn't score is appended at the end, in its original relative order. Shows the full proposed order and asks for confirmation before writing (unless `--force`). Requires rekordbox to be closed (same rule as `playlist move/add/remove`). Also available from the dashboard's "Suggest set order" view as an "Apply this order to Rekordbox" button, shown once a scan completes.
+
+### Vocal-clash detection
+
+```bash
+# Flag adjacent track pairs at risk of a vocal clash during the mix
+djcues clash "Tech House"
+
+# Adjust how long a vocal has to sustain to count as a real clash risk
+djcues clash "Tech House" --min-vocal-region-ms 3000
+```
+
+Scans every pair of adjacent tracks in a playlist's real current order and flags pairs where track A still has vocals overlapping its Outro-anchored tail and track B already has vocals overlapping its Intro-anchored head — a real risk of two vocals clashing at once when mixed together. Reuses the same vocal-onset detection already used for cue placement (Rekordbox's own PVDI vocal-confidence data, no Demucs/`--deep` needed). Read-only diagnostic report, same category as `audit` — flags problems, never suggests a new order, never writes to the database. Playlist-scoped only, with no `--library` option: "adjacent" is only a meaningful concept within one ordered playlist. Also available from the dashboard as its own "Check vocal clashes" view.
+
 ### Analysis dashboard
 
 ```bash
@@ -275,10 +302,11 @@ Run `djcues auth device --device <choice>` any time to see what's actually detec
 
 ## Safety
 
-- **Auto-backup**: `djcues apply` and `djcues playlist add/remove/move` automatically back up `master.db` before writing
+- **Auto-backup**: `djcues apply` and `djcues playlist add/remove/move/reorder` automatically back up `master.db` before writing
 - **Overwrite protection**: Tracks with existing cues require explicit confirmation
-- **Rekordbox must be closed**: `apply` and `playlist add/remove/move` (CLI and dashboard alike) will not write while rekordbox is running
-- **Read-only by default**: `propose`, `compare`, `viz`, `review`, `beatgrid`, `suggest`, `audit`, and `flow` never modify the database. The dashboard is read-only except for its playlist move/add/remove controls, which follow the same backup/Rekordbox-closed rules as the CLI.
+- **Rekordbox must be closed**: `apply` and `playlist add/remove/move/reorder` (CLI and dashboard alike) will not write while rekordbox is running
+- **Read-only by default**: `propose`, `compare`, `viz`, `review`, `beatgrid`, `suggest`, `audit`, `flow`, and `clash` never modify the database. The dashboard is read-only except for its playlist move/add/remove/reorder controls, which follow the same backup/Rekordbox-closed rules as the CLI.
+- **Reorder confirmation**: `djcues playlist reorder` previews the full proposed order and asks for confirmation before writing (skip with `--force`) — the highest-blast-radius write this project ships, since it rewrites every track's position in one playlist at once, not just one track.
 - **DB-only writes**: Cues are written to `master.db` only (not ANLZ files). rekordbox handles ANLZ sync on USB export.
 - **Analysis cache**: `propose`/`compare`/`review`/`beatgrid` cache results locally at `~/.djcues/analysis_cache.db` to avoid redundant recomputation — never touches the rekordbox database; use `--no-cache` to force a fresh run.
 
@@ -311,12 +339,13 @@ src/djcues/
     harmony.py      # Camelot Wheel key compatibility + BPM closeness (djcues suggest)
     audit.py        # BPM/Key comment-hint cross-checking + unusable-key detection (djcues audit)
     flow.py         # Energy-flow set ordering -- peak-then-cooldown track sequencing (djcues flow)
+    clash.py        # Vocal-clash detection -- adjacent-pair vocal-overlap scan (djcues clash)
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
     dashboard.py    # Analysis dashboard HTML/CSS/JS (browse playlists/tracks, run propose/compare/beatgrid)
     server.py       # Local HTTP server for review sessions, the BYOK setup wizard, and the dashboard
-    writer.py       # DB backup, cue writes, and playlist add/remove/move
-    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, audit, flow, auth, history, cache)
+    writer.py       # DB backup, cue writes, and playlist add/remove/move/reorder
+    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, audit, flow, clash, auth, history, cache)
 ```
 
 ## License

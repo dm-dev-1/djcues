@@ -70,6 +70,7 @@ def render_dashboard_html(
         <input id="track-search" type="text" placeholder="Filter tracks&hellip;" class="hidden">
         <button id="audit-playlist-btn" class="btn btn-ghost hidden" type="button">Audit this playlist</button>
         <button id="flow-playlist-btn" class="btn btn-ghost hidden" type="button">Suggest set order</button>
+        <button id="clash-playlist-btn" class="btn btn-ghost hidden" type="button">Check vocal clashes</button>
       </div>
       <div id="track-list" class="track-list">
         <p class="meta">Pick a playlist on the left to see its tracks.</p>
@@ -101,8 +102,33 @@ def render_dashboard_html(
         <button id="flow-run-btn" class="btn btn-primary" type="button">Suggest order</button>
       </div>
       <div id="flow-status" class="job-status"></div>
+      <div id="flow-results-header" class="suggestions-header-row hidden">
+        <span class="suggestion-bpm">Was &rarr; Now</span>
+        <span class="suggestion-title">Title</span>
+        <span class="suggestion-artist">Artist</span>
+        <span class="suggestion-key">Key</span>
+        <span class="suggestion-relation">Energy (mean &middot; peak)</span>
+      </div>
       <div id="flow-results-list" class="suggestions-list"></div>
       <p id="flow-unscored-summary" class="meta small"></p>
+      <div class="flags-row">
+        <button id="flow-apply-btn" class="btn btn-secondary hidden" type="button">Apply this order to Rekordbox</button>
+      </div>
+      <div id="flow-apply-status" class="job-status"></div>
+    </div>
+
+    <div id="clash-panel" class="panel hidden">
+      <div class="panel-header">
+        <button id="clash-back" class="btn btn-ghost" type="button">&larr; Back</button>
+        <h2 id="clash-scope-title"></h2>
+      </div>
+      <div class="flags-row">
+        <label>Min vocal region (ms) <input type="number" id="clash-min-vocal-region-ms" value="2000" step="100" min="0" class="flag-num"></label>
+        <button id="clash-run-btn" class="btn btn-primary" type="button">Scan for clashes</button>
+      </div>
+      <div id="clash-status" class="job-status"></div>
+      <div id="clash-findings-list" class="suggestions-list"></div>
+      <p id="clash-unscorable-summary" class="meta small"></p>
     </div>
 
     <div id="track-detail-panel" class="panel hidden">
@@ -392,6 +418,11 @@ _DASHBOARD_CSS = """
     font-size: 0.82rem;
   }
   .suggestion-row:hover { background: #1e1e3a; }
+  .suggestions-header-row {
+    display: flex; align-items: center; gap: 10px; padding: 2px 8px 6px;
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.03em; color: #777;
+    border-bottom: 1px solid #2a2a4a; margin-bottom: 2px;
+  }
   .suggestion-title { flex: 2; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #eee; }
   .suggestion-artist { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #999; }
   .suggestion-key { color: #17a2b8; font-weight: 600; width: 2.5em; }
@@ -471,8 +502,20 @@ const flowScopeTitleEl = document.getElementById('flow-scope-title');
 const flowCooldownFractionEl = document.getElementById('flow-cooldown-fraction');
 const flowRunBtn = document.getElementById('flow-run-btn');
 const flowStatusEl = document.getElementById('flow-status');
+const flowResultsHeaderEl = document.getElementById('flow-results-header');
 const flowResultsListEl = document.getElementById('flow-results-list');
 const flowUnscoredSummaryEl = document.getElementById('flow-unscored-summary');
+const flowApplyBtn = document.getElementById('flow-apply-btn');
+const flowApplyStatusEl = document.getElementById('flow-apply-status');
+const clashPlaylistBtn = document.getElementById('clash-playlist-btn');
+const clashPanelEl = document.getElementById('clash-panel');
+const clashBackBtn = document.getElementById('clash-back');
+const clashScopeTitleEl = document.getElementById('clash-scope-title');
+const clashMinVocalRegionMsEl = document.getElementById('clash-min-vocal-region-ms');
+const clashRunBtn = document.getElementById('clash-run-btn');
+const clashStatusEl = document.getElementById('clash-status');
+const clashFindingsListEl = document.getElementById('clash-findings-list');
+const clashUnscorableSummaryEl = document.getElementById('clash-unscorable-summary');
 
 let currentPlaylistId = null;
 let currentTracks = [];
@@ -502,6 +545,26 @@ let flowPlaylistId = null;
 let flowPlaylistName = null;
 let flowPollTimer = null;
 let flowJobStartedAt = null;
+// The last successfully completed flow job's result, cached in memory so
+// re-entering this view for the SAME playlist (e.g. after clicking into
+// a track and back) restores it instead of showing a blank panel the
+// user has to re-run. Cleared implicitly by simply not matching
+// lastFlowResultPlaylistId when a different playlist is opened -- lost
+// on a real page reload, which is fine, only in-app navigation needs to
+// preserve it.
+let lastFlowResult = null;
+let lastFlowResultPlaylistId = null;
+let lastFlowElapsedSeconds = null;
+// The clash view's own scope -- always playlist-scoped, same reasoning
+// as flow's above (adjacency only means something within one playlist).
+let clashPlaylistId = null;
+let clashPlaylistName = null;
+let clashPollTimer = null;
+let clashJobStartedAt = null;
+// Same in-memory result cache as flow's above, same reason.
+let lastClashResult = null;
+let lastClashResultPlaylistId = null;
+let lastClashElapsedSeconds = null;
 // Declared here, not inline near refreshEstimate() below, so it's
 // already initialized by the time updateActionFlags()'s own initial
 // call (which runs before this file's later `let` statements would
@@ -547,6 +610,14 @@ function stateToUrl(state) {{
     params.set('playlist_name', state.playlistName || '');
     return '?' + params.toString();
   }}
+  // Same reasoning as flow's own branch above -- clash also has no
+  // library-wide mode, playlist_id is always present here.
+  if (state.view === 'clash') {{
+    params.set('view', 'clash');
+    params.set('playlist_id', state.playlistId);
+    params.set('playlist_name', state.playlistName || '');
+    return '?' + params.toString();
+  }}
   if (state.playlistId) {{
     params.set('playlist_id', state.playlistId);
     params.set('playlist_name', state.playlistName || '');
@@ -569,6 +640,9 @@ function urlToState() {{
   }}
   if (params.get('view') === 'flow') {{
     return {{ view: 'flow', playlistId: params.get('playlist_id'), playlistName: params.get('playlist_name') }};
+  }}
+  if (params.get('view') === 'clash') {{
+    return {{ view: 'clash', playlistId: params.get('playlist_id'), playlistName: params.get('playlist_name') }};
   }}
   const playlistId = params.get('playlist_id');
   const trackId = params.get('track_id');
@@ -593,6 +667,8 @@ async function renderState(state) {{
     renderAudit(state.playlistId, state.playlistName, state.library);
   }} else if (state.view === 'flow') {{
     renderFlow(state.playlistId, state.playlistName);
+  }} else if (state.view === 'clash') {{
+    renderClash(state.playlistId, state.playlistName);
   }} else {{
     renderLanding();
   }}
@@ -728,13 +804,16 @@ function renderLanding() {{
   trackSearchEl.classList.add('hidden');
   auditPlaylistBtn.classList.add('hidden');
   flowPlaylistBtn.classList.add('hidden');
+  clashPlaylistBtn.classList.add('hidden');
   trackListEl.innerHTML = '<p class="meta">Pick a playlist on the left to see its tracks.</p>';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.add('hidden');
+  clashPanelEl.classList.add('hidden');
   stopPolling();
   stopFlowPolling();
+  stopClashPolling();
   document.title = 'djcues \\u2014 Analysis dashboard';
 }}
 
@@ -746,13 +825,16 @@ async function renderPlaylistTracks(playlistId, playlistName) {{
   trackSearchEl.classList.remove('hidden');
   auditPlaylistBtn.classList.remove('hidden');
   flowPlaylistBtn.classList.remove('hidden');
+  clashPlaylistBtn.classList.remove('hidden');
   trackListEl.innerHTML = 'Loading&hellip;';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.add('hidden');
+  clashPanelEl.classList.add('hidden');
   stopPolling();
   stopFlowPolling();
+  stopClashPolling();
   document.title = 'djcues \\u2014 ' + playlistName;
 
   try {{
@@ -819,11 +901,13 @@ async function renderTrackDetail(playlistId, playlistName, trackId, trackTitle) 
   trackDetailPanelEl.classList.remove('hidden');
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.add('hidden');
+  clashPanelEl.classList.add('hidden');
   resultsPanelEl.classList.add('hidden');
   jobOutputWrapEl.classList.add('hidden');
   jobHtmlFragmentEl.innerHTML = '';
   stopPolling();
   stopFlowPolling();
+  stopClashPolling();
   document.title = 'djcues \\u2014 ' + trackTitle;
 
   // Reached directly (a bookmark, a refresh, or Back/Forward hopping
@@ -1351,6 +1435,7 @@ function renderAudit(playlistId, playlistName, library) {{
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.remove('hidden');
   flowPanelEl.classList.add('hidden');
+  clashPanelEl.classList.add('hidden');
   if (!playlistId) {{
     // Reached via the library-only entry point -- nothing else to
     // scope to, so force it and don't let the user uncheck it.
@@ -1363,6 +1448,7 @@ function renderAudit(playlistId, playlistName, library) {{
   updateAuditScopeTitle();
   stopPolling();
   stopFlowPolling();
+  stopClashPolling();
   document.title = 'djcues \\u2014 Audit';
   loadAuditFindings();
 }}
@@ -1490,14 +1576,29 @@ function renderFlow(playlistId, playlistName) {{
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.remove('hidden');
+  clashPanelEl.classList.add('hidden');
   flowScopeTitleEl.textContent = 'Energy Flow: ' + (playlistName || playlistId);
-  flowStatusEl.textContent = '';
-  flowStatusEl.className = 'job-status';
-  flowResultsListEl.innerHTML = '';
   flowUnscoredSummaryEl.textContent = '';
   stopPolling();
   stopFlowPolling();
+  stopClashPolling();
   document.title = 'djcues \\u2014 Energy Flow';
+  // Restore the last completed result for this SAME playlist instead of
+  // showing a blank panel -- e.g. after clicking into a track and back.
+  // A different playlist (or no cached result yet) starts blank as before.
+  if (lastFlowResultPlaylistId === playlistId && lastFlowResult) {{
+    flowStatusEl.textContent = 'Done \\u00b7 computed in ' + lastFlowElapsedSeconds + 's';
+    flowStatusEl.className = 'job-status success';
+    renderFlowResult(lastFlowResult);
+  }} else {{
+    flowStatusEl.textContent = '';
+    flowStatusEl.className = 'job-status';
+    flowResultsListEl.innerHTML = '';
+    flowResultsHeaderEl.classList.add('hidden');
+    flowApplyBtn.classList.add('hidden');
+    flowApplyStatusEl.textContent = '';
+    flowApplyStatusEl.className = 'job-status';
+  }}
 }}
 
 flowRunBtn.addEventListener('click', async () => {{
@@ -1508,6 +1609,9 @@ flowRunBtn.addEventListener('click', async () => {{
   flowStatusEl.className = 'job-status info';
   flowResultsListEl.innerHTML = '';
   flowUnscoredSummaryEl.textContent = '';
+  flowApplyBtn.classList.add('hidden');
+  flowApplyStatusEl.textContent = '';
+  flowApplyStatusEl.className = 'job-status';
   try {{
     const data = await fetchJson('/api/playlists/' + encodeURIComponent(flowPlaylistId) + '/flow-jobs', {{
       method: 'POST',
@@ -1547,6 +1651,9 @@ function pollFlowJob(jobId) {{
         flowStatusEl.textContent = 'Done \\u00b7 computed in ' + job.elapsed_seconds + 's';
         flowStatusEl.className = 'job-status success';
         renderFlowResult(job.result);
+        lastFlowResult = job.result;
+        lastFlowResultPlaylistId = flowPlaylistId;
+        lastFlowElapsedSeconds = job.elapsed_seconds;
       }}
     }} catch (err) {{
       flowStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
@@ -1559,6 +1666,9 @@ function pollFlowJob(jobId) {{
 
 function renderFlowResult(result) {{
   flowResultsListEl.innerHTML = '';
+  flowResultsHeaderEl.classList.toggle('hidden', result.ordered_tracks.length === 0);
+  flowApplyBtn.classList.toggle('hidden', result.ordered_tracks.length === 0);
+  flowApplyBtn.disabled = false;
   result.ordered_tracks.forEach((t, i) => {{
     if (i === result.cooldown_start_index) {{
       const divider = document.createElement('p');
@@ -1581,6 +1691,10 @@ function renderFlowResult(result) {{
     artistSpan.className = 'suggestion-artist';
     artistSpan.textContent = t.artist;
 
+    const keySpan = document.createElement('span');
+    keySpan.className = 'suggestion-key';
+    keySpan.textContent = t.key || '';
+
     const energySpan = document.createElement('span');
     energySpan.className = 'suggestion-relation';
     energySpan.textContent = 'mean ' + t.mean_energy.toFixed(2) + ' \\u00b7 peak ' + t.peak_energy.toFixed(2);
@@ -1588,6 +1702,7 @@ function renderFlowResult(result) {{
     row.appendChild(posSpan);
     row.appendChild(titleSpan);
     row.appendChild(artistSpan);
+    row.appendChild(keySpan);
     row.appendChild(energySpan);
 
     row.addEventListener('click', () => navigateTo({{
@@ -1605,12 +1720,203 @@ function renderFlowResult(result) {{
   }}
 }}
 
+// Writes the just-computed order into the real playlist. Uses the
+// already-rendered, in-memory lastFlowResult -- no server-side flow
+// re-computation, since the user already ran a scan to see this order.
+// A sibling of pollFlowJob, not a reuse of runPlaylistAction()'s own
+// machinery -- that hardcodes track-detail-panel elements/status, the
+// same reason renderFlow/pollFlowJob are already hand-written siblings
+// of pollJob rather than reusing it. This write is fast (no per-track
+// ANLZ I/O, just DjmdSongPlaylist.TrackNo updates) so it's a plain
+// synchronous POST, not a job+poll -- same tier as the existing
+// playlist add/remove/move controls, unlike flow/clash's own scans.
+flowApplyBtn.addEventListener('click', async () => {{
+  if (!flowPlaylistId || !lastFlowResult) return;
+  const orderedIds = lastFlowResult.ordered_tracks.map(t => t.id)
+    .concat(lastFlowResult.unscored.map(t => t.id));
+  const trackCount = orderedIds.length;
+  const confirmMsg = 'Apply this order to ' + trackCount + ' track(s) in "' +
+    (flowPlaylistName || flowPlaylistId) + '"? This rewrites the real playlist order in Rekordbox.';
+  if (!window.confirm(confirmMsg)) return;
+  flowApplyBtn.disabled = true;
+  flowApplyStatusEl.textContent = 'Applying\\u2026';
+  flowApplyStatusEl.className = 'job-status info';
+  try {{
+    await fetchJson('/api/playlists/' + encodeURIComponent(flowPlaylistId) + '/reorder', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify({{ ordered_content_ids: orderedIds }}),
+    }});
+    flowApplyStatusEl.textContent = 'Applied ' + trackCount + ' track(s) to Rekordbox.';
+    flowApplyStatusEl.className = 'job-status success';
+  }} catch (err) {{
+    flowApplyStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+    flowApplyStatusEl.className = 'job-status error';
+    flowApplyBtn.disabled = false;
+  }}
+}});
+
 // Entry point into the flow view -- always from a selected playlist
 // (unlike audit, there's no library-wide entry point for this feature).
 flowPlaylistBtn.addEventListener('click', () => navigateTo(
   {{ view: 'flow', playlistId: currentPlaylistId, playlistName: currentPlaylistNameEl.textContent }}, 'push'
 ));
 flowBackBtn.addEventListener('click', () => history.back());
+
+// --- Vocal clash detection --------------------------------------------
+//
+// Its own top-level view, like flow -- playlist-scoped only, no library
+// mode (adjacency only means something within one ordered playlist).
+// Same background-job reasoning as flow (see _run_clash_job's docstring
+// in server.py): can't reuse pollJob/pollFlowJob -- those target
+// different DOM elements -- so this is a third sibling with the same
+// polling semantics (2s interval, running/error/done) targeting
+// #clash-panel's own elements.
+
+function renderClash(playlistId, playlistName) {{
+  clashPlaylistId = playlistId;
+  clashPlaylistName = playlistName;
+  trackListPanelEl.classList.add('hidden');
+  trackDetailPanelEl.classList.add('hidden');
+  auditPanelEl.classList.add('hidden');
+  flowPanelEl.classList.add('hidden');
+  clashPanelEl.classList.remove('hidden');
+  clashScopeTitleEl.textContent = 'Vocal Clash: ' + (playlistName || playlistId);
+  clashUnscorableSummaryEl.textContent = '';
+  stopPolling();
+  stopFlowPolling();
+  stopClashPolling();
+  document.title = 'djcues \\u2014 Vocal Clash';
+  // Same restore-on-return behavior as renderFlow's own cache, same reason.
+  if (lastClashResultPlaylistId === playlistId && lastClashResult) {{
+    clashStatusEl.textContent = 'Done \\u00b7 computed in ' + lastClashElapsedSeconds + 's';
+    clashStatusEl.className = 'job-status success';
+    renderClashResult(lastClashResult);
+  }} else {{
+    clashStatusEl.textContent = '';
+    clashStatusEl.className = 'job-status';
+    clashFindingsListEl.innerHTML = '';
+  }}
+}}
+
+clashRunBtn.addEventListener('click', async () => {{
+  if (!clashPlaylistId) return;
+  const body = {{ min_vocal_region_ms: parseFloat(clashMinVocalRegionMsEl.value) || 2000 }};
+  clashRunBtn.disabled = true;
+  clashStatusEl.textContent = 'Starting&hellip;';
+  clashStatusEl.className = 'job-status info';
+  clashFindingsListEl.innerHTML = '';
+  clashUnscorableSummaryEl.textContent = '';
+  try {{
+    const data = await fetchJson('/api/playlists/' + encodeURIComponent(clashPlaylistId) + '/clash-jobs', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    pollClashJob(data.job_id);
+  }} catch (err) {{
+    clashStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+    clashStatusEl.className = 'job-status error';
+    clashRunBtn.disabled = false;
+  }}
+}});
+
+function stopClashPolling() {{
+  if (clashPollTimer) {{ clearTimeout(clashPollTimer); clashPollTimer = null; }}
+}}
+
+function pollClashJob(jobId) {{
+  stopClashPolling();
+  clashJobStartedAt = Date.now();
+  const tick = async () => {{
+    try {{
+      const job = await fetchJson('/api/jobs/' + jobId);
+      if (job.status === 'running') {{
+        const elapsed = Math.round((Date.now() - clashJobStartedAt) / 1000);
+        clashStatusEl.textContent = 'Running&hellip; (' + elapsed + 's)';
+        clashStatusEl.className = 'job-status info';
+        clashPollTimer = setTimeout(tick, 2000);
+        return;
+      }}
+      clashRunBtn.disabled = false;
+      if (job.status === 'error') {{
+        clashStatusEl.textContent = 'Error: ' + job.error;
+        clashStatusEl.className = 'job-status error';
+      }} else {{
+        clashStatusEl.textContent = 'Done \\u00b7 computed in ' + job.elapsed_seconds + 's';
+        clashStatusEl.className = 'job-status success';
+        renderClashResult(job.result);
+        lastClashResult = job.result;
+        lastClashResultPlaylistId = clashPlaylistId;
+        lastClashElapsedSeconds = job.elapsed_seconds;
+      }}
+    }} catch (err) {{
+      clashStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+      clashStatusEl.className = 'job-status error';
+      clashRunBtn.disabled = false;
+    }}
+  }};
+  tick();
+}}
+
+function renderClashResult(result) {{
+  clashFindingsListEl.innerHTML = '';
+  if (result.findings.length === 0) {{
+    clashFindingsListEl.innerHTML = '<p class="meta small">No vocal clashes found.</p>';
+  }}
+  result.findings.forEach(f => {{
+    const row = document.createElement('div');
+    row.className = 'suggestion-row';
+
+    const posSpan = document.createElement('span');
+    posSpan.className = 'suggestion-bpm';
+    posSpan.textContent = f.position_a + ' \\u2192 ' + f.position_b;
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'suggestion-title';
+    titleSpan.textContent = f.track_a.title + ' \\u2192 ' + f.track_b.title;
+
+    const artistSpan = document.createElement('span');
+    artistSpan.className = 'suggestion-artist';
+    artistSpan.textContent = f.track_a.artist + ' / ' + f.track_b.artist;
+
+    const detailSpan = document.createElement('span');
+    detailSpan.className = 'suggestion-relation';
+    const aRegions = f.regions_a.map(r => formatDuration(r.start_ms) + '\\u2013' + formatDuration(r.end_ms)).join(', ');
+    const bRegions = f.regions_b.map(r => formatDuration(r.start_ms) + '\\u2013' + formatDuration(r.end_ms)).join(', ');
+    detailSpan.textContent = 'A tail ' + aRegions + ' \\u00b7 B head ' + bRegions;
+
+    row.appendChild(posSpan);
+    row.appendChild(titleSpan);
+    row.appendChild(artistSpan);
+    row.appendChild(detailSpan);
+
+    row.addEventListener('click', () => navigateTo({{
+      view: 'track', playlistId: clashPlaylistId, playlistName: clashPlaylistName,
+      trackId: f.track_a.id, trackTitle: f.track_a.title,
+    }}, 'push'));
+
+    clashFindingsListEl.appendChild(row);
+  }});
+
+  const u = result.unscorable_summary;
+  const total = u.no_phrase_data + u.no_vocal_data + u.no_intro_phrase + u.no_outro_phrase;
+  if (total > 0) {{
+    const parts = [];
+    if (u.no_phrase_data) parts.push(u.no_phrase_data + ' no phrase data');
+    if (u.no_vocal_data) parts.push(u.no_vocal_data + ' no vocal data');
+    if (u.no_intro_phrase) parts.push(u.no_intro_phrase + ' no Intro phrase');
+    if (u.no_outro_phrase) parts.push(u.no_outro_phrase + ' no Outro phrase');
+    clashUnscorableSummaryEl.textContent = '(unscorable: ' + parts.join(', ') + ')';
+  }}
+}}
+
+// Entry point into the clash view -- always from a selected playlist,
+// same reasoning as flow's own entry point above.
+clashPlaylistBtn.addEventListener('click', () => navigateTo(
+  {{ view: 'clash', playlistId: currentPlaylistId, playlistName: currentPlaylistNameEl.textContent }}, 'push'
+));
+clashBackBtn.addEventListener('click', () => history.back());
 
 // Called after INITIAL_PLAYLIST (server-embedded, from a
 // `djcues dashboard "Playlist Name"` argument) is defined -- see the

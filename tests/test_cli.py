@@ -1751,8 +1751,8 @@ class TestFlow:
 
     def test_happy_path_shows_order_and_positions(self, runner: CliRunner):
         summaries = [
-            TrackSummary(id="1", track_no=3, title="Calm", artist="Artist", bpm=128.0, duration_ms=200_000.0),
-            TrackSummary(id="2", track_no=1, title="Loud", artist="Artist", bpm=128.0, duration_ms=200_000.0),
+            TrackSummary(id="1", track_no=3, title="Calm", artist="Artist", bpm=128.0, duration_ms=200_000.0, key="8A"),
+            TrackSummary(id="2", track_no=1, title="Loud", artist="Artist", bpm=128.0, duration_ms=200_000.0, key="3B"),
         ]
         tracks = [_flow_track(1, "Calm", 0.2), _flow_track(2, "Loud", 0.9)]
         with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
@@ -1762,14 +1762,17 @@ class TestFlow:
         assert result.exit_code == 0
         assert "Calm" in result.output
         assert "Loud" in result.output
+        assert "Key" in result.output  # column header
         # Calm (lower energy) is the opener at new position 1, was position 3;
         # Loud was position 1, now ordered second.
         calm_line = next(line for line in result.output.splitlines() if "Calm" in line)
         loud_line = next(line for line in result.output.splitlines() if "Loud" in line)
         assert calm_line.strip().startswith("1")
         assert "3" in calm_line
+        assert "8A" in calm_line
         assert loud_line.strip().startswith("2")
         assert "1" in loud_line
+        assert "3B" in loud_line
 
     def test_cooldown_fraction_passed_through(self, runner: CliRunner):
         summaries = [_summary("1", "A")]
@@ -1809,3 +1812,285 @@ class TestFlow:
             result = runner.invoke(cli, ["flow", "Playlist"])
         assert result.exit_code == 0
         assert "No scorable tracks to order." in result.output
+
+
+# ---------------------------------------------------------------------------
+# playlist reorder -- writes flow's computed order into the real playlist.
+# writer.reorder_playlist's own logic (the shift algorithm, the tracking-
+# bug guard, the duplicate-content-id fix) has its own exhaustive tests in
+# test_writer.py; these only cover cli.py's own loading/preview/
+# confirmation/dispatch layer.
+# ---------------------------------------------------------------------------
+
+
+class TestPlaylistReorder:
+    def test_playlist_not_found(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=None):
+            result = runner.invoke(cli, ["playlist", "reorder", "Nope"])
+        assert result.exit_code == 1
+        assert "'Nope' not found" in result.output
+
+    def test_empty_playlist_errors_before_expensive_load(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[]), \
+             patch("djcues.cli.load_playlist_tracks") as mock_load:
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist"])
+        assert result.exit_code == 1
+        assert "no tracks found" in result.output
+        mock_load.assert_not_called()
+
+    def test_preview_output_shown_before_confirmation(self, runner: CliRunner):
+        summaries = [_summary("1", "A"), _summary("2", "B")]
+        tracks = [_flow_track(1, "A", 0.2), _flow_track(2, "B", 0.9)]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks), \
+             patch("click.confirm", return_value=False):
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist"])
+        assert "Energy Flow: Playlist" in result.output
+        assert "A" in result.output and "B" in result.output
+
+    def test_confirmation_prompt_gates_the_write(self, runner: CliRunner):
+        summaries = [_summary("1", "A"), _summary("2", "B")]
+        tracks = [_flow_track(1, "A", 0.2), _flow_track(2, "B", 0.9)]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks), \
+             patch("djcues.writer.reorder_playlist") as mock_reorder, \
+             patch("click.confirm", return_value=False):
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist"])
+        assert result.exit_code == 0
+        assert "Aborted." in result.output
+        mock_reorder.assert_not_called()
+
+    def test_confirmed_calls_writer_with_full_target_order(self, runner: CliRunner):
+        summaries = [_summary("1", "A"), _summary("2", "B")]
+        tracks = [_flow_track(1, "A", 0.2), _flow_track(2, "B", 0.9)]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist(playlist_id=42)), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks), \
+             patch("djcues.writer.reorder_playlist") as mock_reorder, \
+             patch("click.confirm", return_value=True):
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist"])
+        assert result.exit_code == 0
+        assert "Wrote new order to 'Playlist'." in result.output
+        mock_reorder.assert_called_once_with(42, [1, 2], db=None)
+
+    def test_force_flag_skips_confirmation(self, runner: CliRunner):
+        summaries = [_summary("1", "A")]
+        tracks = [_flow_track(1, "A", 0.5)]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks), \
+             patch("djcues.writer.reorder_playlist") as mock_reorder, \
+             patch("click.confirm") as mock_confirm:
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist", "--force"])
+        assert result.exit_code == 0
+        mock_confirm.assert_not_called()
+        mock_reorder.assert_called_once()
+
+    def test_unscored_tracks_appended_at_end_of_target_order(self, runner: CliRunner):
+        no_phrases = Track(
+            id=3, title="No Phrases Track", artist="Artist", bpm=128.0, duration_ms=200_000.0,
+            analysis_path="", cues=[], phrases=[], beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+        )
+        summaries = [_summary("1", "A"), _summary("2", "B"), _summary("3", "No Phrases Track")]
+        tracks = [_flow_track(1, "A", 0.2), _flow_track(2, "B", 0.9), no_phrases]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist(playlist_id=42)), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks), \
+             patch("djcues.writer.reorder_playlist") as mock_reorder, \
+             patch("click.confirm", return_value=True):
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist"])
+        assert result.exit_code == 0
+        assert "unscored track(s) appended at the end" in result.output
+        mock_reorder.assert_called_once_with(42, [1, 2, 3], db=None)
+
+    def test_cooldown_fraction_passed_through(self, runner: CliRunner):
+        summaries = [_summary("1", "A")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[]), \
+             patch("djcues.cli.suggest_energy_flow") as mock_flow, \
+             patch("click.confirm", return_value=False):
+            mock_flow.return_value = MagicMock(ordered_tracks=[], cooldown_start_index=0, unscored=[])
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist", "--cooldown-fraction", "0.3"])
+        assert result.exit_code == 0
+        _args, kwargs = mock_flow.call_args
+        assert kwargs["cooldown_fraction"] == 0.3
+
+    def test_writer_rekordbox_running_error_passthrough(self, runner: CliRunner):
+        from djcues.writer import RekordboxRunningError
+
+        summaries = [_summary("1", "A")]
+        tracks = [_flow_track(1, "A", 0.5)]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks), \
+             patch(
+                 "djcues.writer.reorder_playlist",
+                 side_effect=RekordboxRunningError("Rekordbox is running."),
+             ), \
+             patch("click.confirm", return_value=True):
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist", "--force"])
+        assert result.exit_code == 1
+        assert "Rekordbox is running" in result.output
+
+    def test_writer_value_error_passthrough(self, runner: CliRunner):
+        summaries = [_summary("1", "A")]
+        tracks = [_flow_track(1, "A", 0.5)]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=tracks), \
+             patch(
+                 "djcues.writer.reorder_playlist",
+                 side_effect=ValueError("the playlist changed since this order was computed"),
+             ), \
+             patch("click.confirm", return_value=True):
+            result = runner.invoke(cli, ["playlist", "reorder", "Playlist", "--force"])
+        assert result.exit_code == 1
+        assert "changed since this order was computed" in result.output
+
+
+# ---------------------------------------------------------------------------
+# clash -- vocal-clash detection. djcues.clash's own logic (the pairwise
+# algorithm, the real anchored pairs) has its own exhaustive tests in
+# test_clash.py; these only cover cli.py's own resolution/loading/
+# reordering/dispatch/presentation layer.
+# ---------------------------------------------------------------------------
+
+
+_CLASH_PHRASES = [
+    Phrase(beat_start=1, beat_end=2, kind=1, label="Intro", position_ms=0.0, duration_ms=20_000.0),
+    Phrase(beat_start=2, beat_end=3, kind=5, label="Chorus", position_ms=20_000.0, duration_ms=130_000.0),
+    Phrase(beat_start=3, beat_end=4, kind=6, label="Outro", position_ms=150_000.0, duration_ms=50_000.0),
+]
+
+
+def _clash_vocal_track(windows: tuple[tuple[float, float], ...] = ()) -> list[int]:
+    frame_ms = 1024 / 22050 * 1000
+    n_frames = int(200_000.0 / frame_ms) + 1
+    vt = [0] * n_frames
+    for start_ms, end_ms in windows:
+        i0, i1 = int(start_ms / frame_ms), int(end_ms / frame_ms)
+        for i in range(i0, min(i1, n_frames)):
+            vt[i] = 4
+    return vt
+
+
+def _clash_track(id_: int, title: str, *, vocal_windows: tuple[tuple[float, float], ...] = ()) -> Track:
+    """A 200s track with a standard Intro (0-20s)/Outro (150-200s)
+    structure -- mirrors test_clash.py's own _scorable_track helper."""
+    return Track(
+        id=id_, title=title, artist="Artist", bpm=128.0, duration_ms=200_000.0,
+        analysis_path="", cues=[], phrases=list(_CLASH_PHRASES), beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+        vocal_track=_clash_vocal_track(vocal_windows),
+    )
+
+
+class TestClash:
+    def test_playlist_not_found(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=None):
+            result = runner.invoke(cli, ["clash", "Nope"])
+        assert result.exit_code == 1
+        assert "'Nope' not found" in result.output
+
+    def test_empty_playlist_errors_before_expensive_load(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[]), \
+             patch("djcues.cli.load_playlist_tracks") as mock_load:
+            result = runner.invoke(cli, ["clash", "Playlist"])
+        assert result.exit_code == 1
+        assert "no tracks found" in result.output
+        mock_load.assert_not_called()
+
+    def test_loading_message_shows_track_count(self, runner: CliRunner):
+        summaries = [_summary("1", "A"), _summary("2", "B")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[]):
+            result = runner.invoke(cli, ["clash", "Playlist"])
+        assert result.exit_code == 0
+        assert "Loading 2 track(s) from 'Playlist'" in result.output
+
+    def test_tracks_are_reordered_to_match_list_playlist_tracks(self, runner: CliRunner):
+        # The real bug this command must work around: load_playlist_tracks()
+        # does not guarantee TrackNo order. Here it deliberately returns
+        # tracks in the OPPOSITE order from list_playlist_tracks()'s real
+        # (TrackNo-sorted) order -- find_vocal_clashes() must still be
+        # called with the corrected, summaries-matching order.
+        summaries = [_summary("1", "First"), _summary("2", "Second")]
+        track_1 = _clash_track(1, "First")
+        track_2 = _clash_track(2, "Second")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track_2, track_1]), \
+             patch("djcues.cli.find_vocal_clashes") as mock_clash:
+            mock_clash.return_value = MagicMock(scanned_pairs=1, findings=[], unscorable=[])
+            result = runner.invoke(cli, ["clash", "Playlist"])
+        assert result.exit_code == 0
+        mock_clash.assert_called_once()
+        args, _kwargs = mock_clash.call_args
+        assert [t.id for t in args[0]] == [1, 2]
+
+    def test_min_vocal_region_ms_passthrough(self, runner: CliRunner):
+        summaries = [_summary("1", "A")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[_clash_track(1, "A")]), \
+             patch("djcues.cli.find_vocal_clashes") as mock_clash:
+            mock_clash.return_value = MagicMock(scanned_pairs=0, findings=[], unscorable=[])
+            result = runner.invoke(cli, ["clash", "Playlist", "--min-vocal-region-ms", "500"])
+        assert result.exit_code == 0
+        mock_clash.assert_called_once()
+        _args, kwargs = mock_clash.call_args
+        assert kwargs["min_vocal_region_ms"] == 500.0
+
+    def test_no_findings_message(self, runner: CliRunner):
+        summaries = [_summary("1", "A"), _summary("2", "B")]
+        a, b = _clash_track(1, "A"), _clash_track(2, "B")  # both clean
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[a, b]):
+            result = runner.invoke(cli, ["clash", "Playlist"])
+        assert result.exit_code == 0
+        assert "No vocal clashes found." in result.output
+
+    def test_finding_output_formatting(self, runner: CliRunner):
+        # Built from a real ClashResult/ClashFinding/VocalRegion (not a
+        # MagicMock) so _print_clash_report's actual formatting code path
+        # -- including _format_time -- runs for real.
+        from djcues.clash import ClashFinding, ClashResult
+        from djcues.models import VocalRegion
+
+        summaries = [_summary("1", "Track A"), _summary("2", "Track B")]
+        a, b = _clash_track(1, "Track A"), _clash_track(2, "Track B")
+        finding = ClashFinding(
+            track_a=a, track_b=b, position_a=1, position_b=2,
+            regions_a=[VocalRegion(start_ms=160_000.0, end_ms=165_000.0)],
+            regions_b=[VocalRegion(start_ms=2_000.0, end_ms=7_000.0)],
+        )
+        fake_result = ClashResult(scanned_pairs=1, findings=[finding], unscorable=[])
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[a, b]), \
+             patch("djcues.cli.find_vocal_clashes", return_value=fake_result):
+            result = runner.invoke(cli, ["clash", "Playlist"])
+        assert result.exit_code == 0
+        assert "[1] Track A → [2] Track B" in result.output
+        assert "2:40.0-2:45.0" in result.output  # 160_000ms-165_000ms
+        assert "0:02.0-0:07.0" in result.output  # 2_000ms-7_000ms
+
+    def test_unscorable_tracks_skipped_with_reason(self, runner: CliRunner):
+        no_phrases = Track(
+            id=1, title="No Phrases Track", artist="Artist", bpm=128.0, duration_ms=200_000.0,
+            analysis_path="", cues=[], phrases=[], beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+            vocal_track=_clash_vocal_track(),
+        )
+        summaries = [_summary("1", "No Phrases Track")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[no_phrases]):
+            result = runner.invoke(cli, ["clash", "Playlist"])
+        assert result.exit_code == 0
+        assert "Skipping No Phrases Track (no phrase data)" in result.output

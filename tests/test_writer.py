@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import click
 import pytest
@@ -796,6 +796,186 @@ def test_move_track_between_playlists_failure_rolls_back_and_reraises(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# reorder_playlist -- djcues's first write that reorders tracks WITHIN a
+# playlist. db is always a MagicMock; backup_database is real (not mocked),
+# same reasoning as every other write test above.
+# ---------------------------------------------------------------------------
+
+
+def _song_row(content_id: str, track_no: int) -> MagicMock:
+    row = MagicMock()
+    row.ContentID = content_id
+    row.TrackNo = track_no
+    return row
+
+
+def _make_fake_move_song_in_playlist(rows: list):
+    """A side_effect for a mocked db.move_song_in_playlist mimicking
+    pyrekordbox's real TrackNo-shifting behavior (db6/database.py:1051-
+    1074) closely enough for reorder_playlist's own guard
+    (`row.TrackNo != target_track_no`) to see a realistic in-between
+    state across the loop -- later positions can become correct "for
+    free" from an earlier move's shift, which is exactly the behavior
+    the guard is designed to skip."""
+    def _move(playlist, song, new_track_no):
+        old_track_no = song.TrackNo
+        if new_track_no > old_track_no:
+            for other in rows:
+                if old_track_no < other.TrackNo <= new_track_no:
+                    other.TrackNo -= 1
+        elif new_track_no < old_track_no:
+            for other in rows:
+                if new_track_no <= other.TrackNo < old_track_no:
+                    other.TrackNo += 1
+        song.TrackNo = new_track_no
+    return _move
+
+
+def test_reorder_playlist_rekordbox_running_raises_before_backup(tmp_path):
+    from djcues.writer import RekordboxRunningError, reorder_playlist
+
+    playlist = MagicMock(ID="pl1")
+    db = _fake_playlist_db(tmp_path, source=playlist)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=99999):
+        with pytest.raises(RekordboxRunningError):
+            reorder_playlist("pl1", ["A"], db=db)
+
+    assert not list(tmp_path.glob("master-backup-*.db"))
+    db.get_playlist_songs.assert_not_called()
+
+
+def test_reorder_playlist_unknown_playlist_raises_before_backup(tmp_path):
+    from djcues.writer import reorder_playlist
+
+    db = _fake_playlist_db(tmp_path)  # no playlists registered
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(ValueError, match="not found"):
+            reorder_playlist("pl1", ["A"], db=db)
+
+    assert not list(tmp_path.glob("master-backup-*.db"))
+
+
+def test_reorder_playlist_permutation_mismatch_raises_before_backup(tmp_path):
+    from djcues.writer import reorder_playlist
+
+    playlist = MagicMock(ID="pl1")
+    db = _fake_playlist_db(tmp_path, source=playlist)
+    db.get_playlist_songs.return_value = [_song_row("A", 1), _song_row("B", 2)]
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(ValueError, match="changed since this order was computed"):
+            reorder_playlist("pl1", ["A", "C"], db=db)  # C isn't really in the playlist
+
+    assert not list(tmp_path.glob("master-backup-*.db"))
+    db.move_song_in_playlist.assert_not_called()
+
+
+def test_reorder_playlist_correct_sequence_and_positions_skipping_free_matches(tmp_path):
+    """Hand-verified scenario: current [D,B,A,C] at TrackNo 1-4, target
+    [A,B,C,D] -- exactly 3 real moves land on [A,B,C,D]; the 4th (D,
+    already at position 4 after the third move's own shift) must be
+    skipped by the TrackNo != i guard, not called "just to be safe"."""
+    from djcues.writer import reorder_playlist
+
+    playlist = MagicMock(ID="pl1")
+    d, b, a, c = _song_row("D", 1), _song_row("B", 2), _song_row("A", 3), _song_row("C", 4)
+    rows = [d, b, a, c]
+    db = _fake_playlist_db(tmp_path, source=playlist)
+    db.get_playlist_songs.return_value = rows
+    db.move_song_in_playlist.side_effect = _make_fake_move_song_in_playlist(rows)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        reorder_playlist("pl1", ["A", "B", "C", "D"], db=db)
+
+    assert db.move_song_in_playlist.call_args_list == [
+        call(playlist, a, 1), call(playlist, b, 2), call(playlist, c, 3),
+    ]
+    assert [row.TrackNo for row in (a, b, c, d)] == [1, 2, 3, 4]
+    assert len(list(tmp_path.glob("master-backup-*.db"))) == 1
+    db.commit.assert_called_once()
+
+
+def test_reorder_playlist_already_correct_order_makes_zero_move_calls(tmp_path):
+    """Directly enforces no "helpful" special-casing of the last
+    position: everything already correct must mean move_song_in_playlist
+    is called ZERO times, not once "just to be sure" -- calling it even
+    once when new_track_no == old_track_no hits the confirmed
+    pyrekordbox tracking-disable bug."""
+    from djcues.writer import reorder_playlist
+
+    playlist = MagicMock(ID="pl1")
+    db = _fake_playlist_db(tmp_path, source=playlist)
+    db.get_playlist_songs.return_value = [_song_row("A", 1), _song_row("B", 2), _song_row("C", 3)]
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        reorder_playlist("pl1", ["A", "B", "C"], db=db)
+
+    db.move_song_in_playlist.assert_not_called()
+    db.commit.assert_called_once()
+    assert list(tmp_path.glob("master-backup-*.db"))
+
+
+def test_reorder_playlist_handles_track_appearing_twice_in_one_playlist(tmp_path):
+    """A track can legally appear more than once in one playlist (see
+    resolve_playlist_entry's own docstring). Confirms each occurrence of
+    a repeated content ID resolves to a DISTINCT real row, in original
+    TrackNo order -- not silently collapsed onto the same row (a real
+    bug a naive content_id -> single row dict would have)."""
+    from djcues.writer import reorder_playlist
+
+    playlist = MagicMock(ID="pl1")
+    a1 = _song_row("A", 1)  # first "A" entry
+    b = _song_row("B", 2)
+    a2 = _song_row("A", 3)  # second "A" entry -- same content ID as a1
+    rows = [a1, b, a2]
+    db = _fake_playlist_db(tmp_path, source=playlist)
+    db.get_playlist_songs.return_value = rows
+    db.move_song_in_playlist.side_effect = _make_fake_move_song_in_playlist(rows)
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        # position1=A(1st occurrence->a1), position2=A(2nd occurrence->a2), position3=B
+        reorder_playlist("pl1", ["A", "A", "B"], db=db)
+
+    # Only a2 should move (to position 2) -- a1 stays at 1, b becomes
+    # correct "for free" via a2's shift. A buggy flat dict would instead
+    # try to move a1 twice and never touch a2 at all.
+    assert db.move_song_in_playlist.call_args_list == [call(playlist, a2, 2)]
+    assert a1.TrackNo == 1 and a2.TrackNo == 2 and b.TrackNo == 3
+
+
+def test_reorder_playlist_commit_runtime_error_rolls_back_and_reraises(tmp_path):
+    from djcues.writer import RekordboxRunningError, reorder_playlist
+
+    playlist = MagicMock(ID="pl1")
+    db = _fake_playlist_db(tmp_path, source=playlist)
+    db.get_playlist_songs.return_value = [_song_row("A", 1), _song_row("B", 2)]
+    db.commit.side_effect = RuntimeError("Rekordbox is running.")
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(RekordboxRunningError):
+            reorder_playlist("pl1", ["B", "A"], db=db)
+
+    db.rollback.assert_called_once()
+
+
+def test_reorder_playlist_unexpected_error_rolls_back_and_reraises(tmp_path):
+    from djcues.writer import reorder_playlist
+
+    playlist = MagicMock(ID="pl1")
+    db = _fake_playlist_db(tmp_path, source=playlist)
+    db.get_playlist_songs.return_value = [_song_row("A", 1), _song_row("B", 2)]
+    db.move_song_in_playlist.side_effect = ValueError("boom")
+
+    with patch("pyrekordbox.utils.get_rekordbox_pid", return_value=None):
+        with pytest.raises(ValueError, match="boom"):
+            reorder_playlist("pl1", ["B", "A"], db=db)
+
+    db.rollback.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Real, opt-in integration tests -- genuinely write to the real rekordbox
 # database (`pytest -m destructive` to run; excluded from a normal
 # `pytest` run by pyproject.toml's addopts). Everything above this line
@@ -881,6 +1061,60 @@ def test_add_and_remove_real_track_roundtrip_against_scratch_playlist():
         # Runs even if the assertions above failed, so a real assertion
         # failure can't leave the scratch playlist non-empty for the
         # next run of this same test.
+        remaining = list_playlist_tracks(scratch.ID)
+        for t in remaining:
+            remove_track_from_playlist(scratch.ID, t.id)
+
+    assert list_playlist_tracks(scratch.ID) == []
+
+
+@requires_rekordbox
+@requires_rekordbox_closed
+@pytest.mark.destructive
+def test_reorder_real_track_roundtrip_against_scratch_playlist():
+    """The one real, live confirmation reorder_playlist's whole write
+    path (backup -> pyrekordbox move_song_in_playlist calls -> commit)
+    works end to end against the real installed pyrekordbox package and
+    this real library -- not just mocks. A genuinely new test precedent:
+    no prior djcues write reorders tracks WITHIN a playlist.
+
+    Populates the scratch playlist with 3 real tracks from 'Tech House'
+    (via the already-covered add_track_to_playlist), captures the real
+    resulting order, applies a fully reversed target order via
+    reorder_playlist, and asserts the real resulting order via a fresh
+    list_playlist_tracks() read matches exactly. Cleans up in a finally
+    block so a failed assertion can't leave the scratch playlist dirty.
+    """
+    from djcues.db import find_playlist, list_playlist_tracks
+    from djcues.writer import add_track_to_playlist, reorder_playlist, remove_track_from_playlist
+
+    scratch = find_playlist(SCRATCH_PLAYLIST_NAME)
+    assert scratch is not None, f"expected a real '{SCRATCH_PLAYLIST_NAME}' playlist in this library"
+    assert list_playlist_tracks(scratch.ID) == [], (
+        f"'{SCRATCH_PLAYLIST_NAME}' is expected to stay empty between test runs -- "
+        "it has tracks in it right now, so this test won't touch it"
+    )
+
+    source = find_playlist("Tech House")
+    assert source is not None, "expected a real 'Tech House' playlist in this library"
+    tech_house_tracks = list_playlist_tracks(source.ID)
+    assert len(tech_house_tracks) >= 3, "expected 'Tech House' to have at least 3 real tracks"
+    chosen = tech_house_tracks[:3]
+
+    try:
+        for t in chosen:
+            add_track_to_playlist(scratch.ID, t.id)
+
+        before = list_playlist_tracks(scratch.ID)
+        assert len(before) == 3
+        assert {t.id for t in before} == {t.id for t in chosen}
+
+        reversed_order = [t.id for t in reversed(before)]
+        reorder_playlist(scratch.ID, reversed_order)
+
+        after = list_playlist_tracks(scratch.ID)
+        assert [t.id for t in after] == reversed_order
+    finally:
         remaining = list_playlist_tracks(scratch.ID)
         for t in remaining:
             remove_track_from_playlist(scratch.ID, t.id)

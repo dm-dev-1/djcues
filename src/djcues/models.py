@@ -80,6 +80,21 @@ class WaveformPoint:
         return f"#{r:02x}{g:02x}{b:02x}"
 
 
+@dataclass(frozen=True)
+class VocalRegion:
+    """One sustained vocal-presence region (strategy.find_vocal_regions()'s
+    output) -- start_ms/end_ms mark where PVDI confidence stayed "on"
+    (see find_vocal_regions()'s own docstring for the exact thresholds).
+    Frozen, unlike its file-mates above (Phrase/WaveformPoint, both
+    plain, mutable dataclasses read straight off Rekordbox's own ANLZ
+    data) -- this is instead a computed value derived from that data,
+    same convention as this codebase's other pure-computation dataclasses
+    (flow.TrackEnergy, audit.CommentHintFinding, harmony.CamelotKey)."""
+
+    start_ms: float
+    end_ms: float
+
+
 @dataclass
 class Track:
     """A rekordbox track with analysis data."""

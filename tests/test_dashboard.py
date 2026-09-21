@@ -98,6 +98,28 @@ class TestRenderDashboardHtml:
         assert "function renderFlow" in result
         assert "/flow-jobs" in result
 
+    def test_clash_panel_is_present(self):
+        """Vocal-clash detection -- POST /api/playlists/<id>/clash-jobs
+        + GET /api/jobs/<id> polling, see djcues.clash/server.py's
+        _run_clash_job. A playlist-wide, background-job-backed view, same
+        shape as flow's own panel, with no library-wide mode (adjacency
+        only means something within one ordered playlist)."""
+        result = render_dashboard_html()
+        assert 'id="clash-panel"' in result
+        assert 'id="clash-playlist-btn"' in result
+        assert "function renderClash" in result
+        assert "/clash-jobs" in result
+
+    def test_flow_apply_button_is_present(self):
+        """Apply this order to Rekordbox -- POST /api/playlists/<id>/reorder,
+        see server.py's _handle_playlist_reorder_post. Hidden by default
+        in the static markup, shown only once a flow scan produces a
+        result (see renderFlowResult's own visibility toggle)."""
+        result = render_dashboard_html()
+        assert 'id="flow-apply-btn"' in result
+        assert 'id="flow-apply-status"' in result
+        assert "/reorder" in result
+
     def test_never_embeds_a_server_url(self):
         # Same-origin like auth_web.py's page (served BY the local server
         # it talks to), unlike review.py's file://-opened page, which
