@@ -110,6 +110,19 @@ class TestRenderDashboardHtml:
         assert "function renderClash" in result
         assert "/clash-jobs" in result
 
+    def test_transition_panel_is_present(self):
+        """Transition point suggestions -- POST /api/playlists/<id>/
+        transition-jobs + GET /api/jobs/<id> polling, see djcues.
+        transition/server.py's _run_transition_job. A playlist-wide,
+        background-job-backed view, same shape as flow's/clash's own
+        panels, with no library-wide mode and no write-back button
+        (suggestion-only, unlike flow)."""
+        result = render_dashboard_html()
+        assert 'id="transition-panel"' in result
+        assert 'id="transition-playlist-btn"' in result
+        assert "function renderTransition" in result
+        assert "/transition-jobs" in result
+
     def test_flow_apply_button_is_present(self):
         """Apply this order to Rekordbox -- POST /api/playlists/<id>/reorder,
         see server.py's _handle_playlist_reorder_post. Hidden by default

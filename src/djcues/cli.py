@@ -24,11 +24,15 @@ from djcues.harmony import (
     BPM_RELATION_LABELS,
     DEFAULT_BPM_TOLERANCE_PCT,
     KEY_RELATION_LABELS,
+    camelot_relationship,
+    classify_bpm_relation,
+    parse_camelot_key,
     suggest_compatible_tracks,
 )
 from djcues.metrics import compare_cues, merge_pad_stats, overall_stats
 from djcues.models import CueProposal
 from djcues.strategy import CueStrategy, DEFAULT_MIN_VOCAL_REGION_MS, build_cue_points
+from djcues.transition import suggest_transitions
 
 
 def _format_time(ms: float) -> str:
@@ -2108,3 +2112,106 @@ def clash(playlist_name, min_vocal_region_ms):
         click.echo(f"  Skipping {u.track.title} ({_UNSCORABLE_LABELS[u.reason]})", err=True)
 
     _print_clash_report(result, playlist_name)
+
+
+_TRANSITION_UNSCORABLE_LABELS = {
+    "no_phrase_data": "no phrase data",
+    "no_intro_phrase": "no Intro phrase",
+    "no_outro_phrase": "no Outro phrase",
+}
+
+
+def _print_transition_report(result, playlist_name: str, key_map: dict) -> None:
+    click.echo(f"\n{'=' * 60}")
+    click.echo(f"  Transitions: {playlist_name}")
+    click.echo(f"  {result.scanned_pairs} pair(s) scanned, {len(result.unscorable)} track(s) unscorable")
+    click.echo(f"{'=' * 60}")
+
+    if not result.suggestions:
+        click.echo("\n  No transition suggestions.")
+    else:
+        click.echo(f"\n  {len(result.suggestions)} suggestion(s):")
+        for s in result.suggestions:
+            click.echo(f"\n    [{s.position_a}] {s.track_a.title} → [{s.position_b}] {s.track_b.title}")
+            limiter = "B's intro" if s.limiting_side == "b_head" else "A's outro"
+            click.echo(
+                f"      Mix out A at {_format_time(s.mix_out_ms)} (Outro) — "
+                f"Mix in B at {_format_time(s.mix_in_ms)} (first beat)"
+            )
+            click.echo(f"      Blend window: {s.overlap_ms / 1000:.1f}s (limited by {limiter})")
+
+            a_key = parse_camelot_key(key_map.get(str(s.track_a.id)))
+            b_key = parse_camelot_key(key_map.get(str(s.track_b.id)))
+            key_relation = camelot_relationship(a_key, b_key) if a_key and b_key else None
+            bpm_relation = classify_bpm_relation(s.track_a.bpm, s.track_b.bpm)
+            key_str = KEY_RELATION_LABELS[key_relation] if key_relation else "no key data"
+            bpm_str = (
+                f"{BPM_RELATION_LABELS[bpm_relation.kind]} ({bpm_relation.pitch_shift_pct:.1f}% pitch)"
+                if bpm_relation else "tempo outside tolerance"
+            )
+            click.echo(
+                f"      Key: {key_map.get(str(s.track_a.id)) or '?'} → {key_map.get(str(s.track_b.id)) or '?'} "
+                f"({key_str}) — BPM: {s.track_a.bpm:.1f} → {s.track_b.bpm:.1f} ({bpm_str})"
+            )
+
+            if s.vocal_regions_a:
+                regions = ", ".join(f"{_format_time(r.start_ms)}-{_format_time(r.end_ms)}" for r in s.vocal_regions_a)
+                click.echo(f"      Vocal risk (A tail): {regions}")
+            if s.vocal_regions_b:
+                regions = ", ".join(f"{_format_time(r.start_ms)}-{_format_time(r.end_ms)}" for r in s.vocal_regions_b)
+                click.echo(f"      Vocal risk (B head): {regions}")
+
+    if result.unscorable:
+        counts = {
+            reason: sum(1 for u in result.unscorable if u.reason == reason)
+            for reason in _TRANSITION_UNSCORABLE_LABELS
+        }
+        parts = [f"{counts[reason]} {label}" for reason, label in _TRANSITION_UNSCORABLE_LABELS.items() if counts[reason]]
+        click.echo(f"\n  (unscorable: {', '.join(parts)})")
+
+
+@cli.command()
+@click.argument("playlist_name")
+@click.option(
+    "--min-vocal-region-ms", default=DEFAULT_MIN_VOCAL_REGION_MS, show_default=True,
+    help="Minimum sustained vocal-confidence duration (ms) to count as a real vocal region.",
+)
+def transition(playlist_name, min_vocal_region_ms):
+    """Suggest a mix-out/mix-in point for every adjacent track pair in one playlist.
+
+    For each pair, suggests where in the outgoing track to start mixing
+    out (its Outro-phrase start) and where in the incoming track to mix
+    in (its first beat), plus the resulting blend window and any vocal-
+    clash risk within that window. Also annotates each pair with key/BPM
+    compatibility (see `suggest`/`audit`). Read-only -- never writes to
+    the database. Scoped to PLAYLIST_NAME only, with no --library
+    option: needs real per-track phrase/vocal data (same cost as
+    `flow`/`clash`, ~266ms/track measured live), and "adjacent" is only
+    a meaningful concept within one ordered playlist.
+    """
+    playlist = find_playlist(playlist_name)
+    if playlist is None:
+        click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
+        raise SystemExit(1)
+
+    summaries = list_playlist_tracks(playlist.ID)
+    if not summaries:
+        click.echo(f"Error: no tracks found in playlist '{playlist_name}'.", err=True)
+        raise SystemExit(1)
+    key_map = {str(s.id): s.key for s in summaries}
+
+    click.echo(
+        f"Loading {len(summaries)} track(s) from '{playlist_name}'... "
+        "(this may take a while for large playlists)"
+    )
+    loaded = load_playlist_tracks(playlist.ID)
+    # load_playlist_tracks() does not guarantee TrackNo order -- reorder
+    # to match summaries' real playlist order, same guard flow/clash use.
+    tracks_by_id = {str(t.id): t for t in loaded}
+    tracks = [tracks_by_id[str(s.id)] for s in summaries if str(s.id) in tracks_by_id]
+
+    result = suggest_transitions(tracks, min_vocal_region_ms=min_vocal_region_ms)
+    for u in result.unscorable:
+        click.echo(f"  Skipping {u.track.title} ({_TRANSITION_UNSCORABLE_LABELS[u.reason]})", err=True)
+
+    _print_transition_report(result, playlist_name, key_map)

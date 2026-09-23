@@ -15,9 +15,8 @@ Read-only diagnostic report, same category as audit.py: flags problems,
 never suggests a new order, never writes to the database.
 
 Zones are anchored on real PSSI phrase labels, not a fixed time window
--- a track's "tail" is from its (first) Outro-labeled phrase's start to
-the track's end; a track's "head" is from 0ms to the end of its (first)
-Intro-labeled phrase. Rekordbox's own phrase structure already marks a
+-- see strategy.tail_zone()/strategy.head_zone()'s own docstrings for
+the exact anchors. Rekordbox's own phrase structure already marks a
 meaningful, per-track-appropriate boundary; a fixed "last/first 30
 seconds" window was considered and rejected as an arbitrary magic
 number when a better, already-computed anchor exists (live-verified:
@@ -43,7 +42,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from djcues.strategy import DEFAULT_MIN_VOCAL_REGION_MS, find_vocal_regions
+from djcues.strategy import (
+    DEFAULT_MIN_VOCAL_REGION_MS,
+    find_vocal_regions,
+    head_zone,
+    regions_overlapping,
+    tail_zone,
+)
 
 if TYPE_CHECKING:
     from djcues.models import Track, VocalRegion
@@ -111,30 +116,6 @@ def _is_unscorable(track: "Track") -> str | None:
     return None
 
 
-def _tail_zone(track: "Track") -> tuple[float, float]:
-    """track's tail zone: from its (first) Outro-labeled phrase's start
-    to the track's end. Caller must have already confirmed an Outro
-    phrase exists (_is_unscorable)."""
-    outro = next(p for p in track.phrases if p.label == "Outro")
-    return outro.position_ms, track.duration_ms
-
-
-def _head_zone(track: "Track") -> tuple[float, float]:
-    """track's head zone: from 0ms to the end of its (first) Intro-
-    labeled phrase. Caller must have already confirmed an Intro phrase
-    exists (_is_unscorable)."""
-    intro = next(p for p in track.phrases if p.label == "Intro")
-    return 0.0, intro.position_ms + intro.duration_ms
-
-
-def _regions_overlapping(
-    regions: list["VocalRegion"], zone_start: float, zone_end: float
-) -> list["VocalRegion"]:
-    """Regions from `regions` that overlap [zone_start, zone_end) --
-    simple interval-overlap check."""
-    return [r for r in regions if r.start_ms < zone_end and r.end_ms > zone_start]
-
-
 def find_vocal_clashes(
     tracks: list["Track"], *, min_vocal_region_ms: float = DEFAULT_MIN_VOCAL_REGION_MS
 ) -> ClashResult:
@@ -172,12 +153,12 @@ def find_vocal_clashes(
         if i in reasons or (i + 1) in reasons:
             continue
         track_a, track_b = tracks[i], tracks[i + 1]
-        tail_start, tail_end = _tail_zone(track_a)
-        head_start, head_end = _head_zone(track_b)
-        regions_a = _regions_overlapping(
+        tail_start, tail_end = tail_zone(track_a)
+        head_start, head_end = head_zone(track_b)
+        regions_a = regions_overlapping(
             find_vocal_regions(track_a, min_vocal_region_ms), tail_start, tail_end
         )
-        regions_b = _regions_overlapping(
+        regions_b = regions_overlapping(
             find_vocal_regions(track_b, min_vocal_region_ms), head_start, head_end
         )
         if regions_a and regions_b:

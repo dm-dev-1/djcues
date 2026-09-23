@@ -2094,3 +2094,118 @@ class TestClash:
             result = runner.invoke(cli, ["clash", "Playlist"])
         assert result.exit_code == 0
         assert "Skipping No Phrases Track (no phrase data)" in result.output
+
+
+class TestTransition:
+    def test_playlist_not_found(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=None):
+            result = runner.invoke(cli, ["transition", "Nope"])
+        assert result.exit_code == 1
+        assert "'Nope' not found" in result.output
+
+    def test_empty_playlist_errors_before_expensive_load(self, runner: CliRunner):
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=[]), \
+             patch("djcues.cli.load_playlist_tracks") as mock_load:
+            result = runner.invoke(cli, ["transition", "Playlist"])
+        assert result.exit_code == 1
+        assert "no tracks found" in result.output
+        mock_load.assert_not_called()
+
+    def test_loading_message_shows_track_count(self, runner: CliRunner):
+        summaries = [_summary("1", "A"), _summary("2", "B")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[]):
+            result = runner.invoke(cli, ["transition", "Playlist"])
+        assert result.exit_code == 0
+        assert "Loading 2 track(s) from 'Playlist'" in result.output
+
+    def test_tracks_are_reordered_to_match_list_playlist_tracks(self, runner: CliRunner):
+        # Same ordering bug/guard as clash -- load_playlist_tracks() does
+        # not guarantee TrackNo order, so suggest_transitions() must be
+        # called with the corrected, summaries-matching order.
+        summaries = [_summary("1", "First"), _summary("2", "Second")]
+        track_1 = _clash_track(1, "First")
+        track_2 = _clash_track(2, "Second")
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[track_2, track_1]), \
+             patch("djcues.cli.suggest_transitions") as mock_transition:
+            mock_transition.return_value = MagicMock(scanned_pairs=1, suggestions=[], unscorable=[])
+            result = runner.invoke(cli, ["transition", "Playlist"])
+        assert result.exit_code == 0
+        mock_transition.assert_called_once()
+        args, _kwargs = mock_transition.call_args
+        assert [t.id for t in args[0]] == [1, 2]
+
+    def test_min_vocal_region_ms_passthrough(self, runner: CliRunner):
+        summaries = [_summary("1", "A")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[_clash_track(1, "A")]), \
+             patch("djcues.cli.suggest_transitions") as mock_transition:
+            mock_transition.return_value = MagicMock(scanned_pairs=0, suggestions=[], unscorable=[])
+            result = runner.invoke(cli, ["transition", "Playlist", "--min-vocal-region-ms", "500"])
+        assert result.exit_code == 0
+        mock_transition.assert_called_once()
+        _args, kwargs = mock_transition.call_args
+        assert kwargs["min_vocal_region_ms"] == 500.0
+
+    def test_no_suggestions_message(self, runner: CliRunner):
+        summaries = [_summary("1", "A")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[_clash_track(1, "A")]):
+            result = runner.invoke(cli, ["transition", "Playlist"])
+        assert result.exit_code == 0
+        assert "No transition suggestions." in result.output
+
+    def test_suggestion_output_formatting(self, runner: CliRunner):
+        # Built from a real TransitionResult/TransitionSuggestion (not a
+        # MagicMock) so _print_transition_report's actual formatting code
+        # path -- including _format_time and the key/BPM annotation --
+        # runs for real.
+        from djcues.models import VocalRegion
+        from djcues.transition import TransitionResult, TransitionSuggestion
+
+        summaries = [_summary("1", "Track A", key="8A"), _summary("2", "Track B", key="9A")]
+        a, b = _clash_track(1, "Track A"), _clash_track(2, "Track B")
+        suggestion = TransitionSuggestion(
+            track_a=a, track_b=b, position_a=1, position_b=2,
+            mix_out_ms=150_000.0, mix_in_ms=0.0,
+            a_tail_available_ms=50_000.0, b_head_available_ms=20_000.0,
+            overlap_ms=20_000.0, limiting_side="b_head",
+            vocal_regions_a=[VocalRegion(start_ms=160_000.0, end_ms=165_000.0)],
+            vocal_regions_b=[VocalRegion(start_ms=2_000.0, end_ms=7_000.0)],
+        )
+        fake_result = TransitionResult(scanned_pairs=1, suggestions=[suggestion], unscorable=[])
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[a, b]), \
+             patch("djcues.cli.suggest_transitions", return_value=fake_result):
+            result = runner.invoke(cli, ["transition", "Playlist"])
+        assert result.exit_code == 0
+        assert "[1] Track A → [2] Track B" in result.output
+        assert "Mix out A at 2:30.0" in result.output  # 150_000ms
+        assert "Mix in B at 0:00.0" in result.output  # 0ms
+        assert "Blend window: 20.0s (limited by B's intro)" in result.output
+        assert "8A → 9A" in result.output
+        assert "Energy boost (+1)" in result.output
+        assert "Same tempo" in result.output
+        assert "2:40.0-2:45.0" in result.output  # A tail vocal risk
+        assert "0:02.0-0:07.0" in result.output  # B head vocal risk
+
+    def test_unscorable_tracks_skipped_with_reason(self, runner: CliRunner):
+        no_phrases = Track(
+            id=1, title="No Phrases Track", artist="Artist", bpm=128.0, duration_ms=200_000.0,
+            analysis_path="", cues=[], phrases=[], beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+            vocal_track=_clash_vocal_track(),
+        )
+        summaries = [_summary("1", "No Phrases Track"), _summary("2", "B")]
+        with patch("djcues.cli.find_playlist", return_value=_mock_playlist()), \
+             patch("djcues.cli.list_playlist_tracks", return_value=summaries), \
+             patch("djcues.cli.load_playlist_tracks", return_value=[no_phrases, _clash_track(2, "B")]):
+            result = runner.invoke(cli, ["transition", "Playlist"])
+        assert result.exit_code == 0
+        assert "Skipping No Phrases Track (no phrase data)" in result.output

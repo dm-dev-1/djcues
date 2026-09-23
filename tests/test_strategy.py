@@ -1,6 +1,13 @@
 import pytest
-from djcues.models import BeatGrid, CuePoint, Phrase, Track, CueProposal, WaveformPoint
-from djcues.strategy import CueStrategy, DEFAULT_MIN_VOCAL_REGION_MS, find_vocal_regions
+from djcues.models import BeatGrid, CuePoint, Phrase, Track, CueProposal, VocalRegion, WaveformPoint
+from djcues.strategy import (
+    CueStrategy,
+    DEFAULT_MIN_VOCAL_REGION_MS,
+    find_vocal_regions,
+    head_zone,
+    regions_overlapping,
+    tail_zone,
+)
 
 
 @pytest.fixture
@@ -508,3 +515,85 @@ def test_matches_agentics_own_vocal_onset_detection():
 
     assert [(r.start_ms, r.end_ms) for r in regions] == [(o["start_ms"], o["end_ms"]) for o in onsets]
     assert len(regions) == 2  # sanity: the fixture above is genuinely exercising two regions
+
+
+# ---------------------------------------------------------------------------
+# tail_zone / head_zone / regions_overlapping -- promoted here from clash.py
+# so transition.py can share the same zone concept rather than each module
+# inventing its own (see either function's own docstring). Caller is
+# responsible for confirming the relevant phrase exists first -- these
+# tests assume it does, matching both real callers' own preconditions.
+# ---------------------------------------------------------------------------
+
+
+def _track_with_phrases(phrases: list[Phrase], duration_ms: float = 200_000.0) -> Track:
+    return Track(
+        id=1, title="Zone Test", artist="Test", bpm=128.0, duration_ms=duration_ms,
+        analysis_path="", cues=[], phrases=phrases, beat_grid=BeatGrid(first_beat_ms=0.0, bpm=128.0),
+    )
+
+
+def test_tail_zone_spans_outro_start_to_track_end():
+    phrases = [
+        Phrase(beat_start=1, beat_end=2, kind=1, label="Intro", position_ms=0.0, duration_ms=20_000.0),
+        Phrase(beat_start=2, beat_end=3, kind=2, label="Chorus", position_ms=20_000.0, duration_ms=130_000.0),
+        Phrase(beat_start=3, beat_end=4, kind=3, label="Outro", position_ms=150_000.0, duration_ms=50_000.0),
+    ]
+    track = _track_with_phrases(phrases)
+    assert tail_zone(track) == (150_000.0, 200_000.0)
+
+
+def test_tail_zone_uses_the_first_outro_when_more_than_one():
+    phrases = [
+        Phrase(beat_start=1, beat_end=2, kind=1, label="Outro", position_ms=100_000.0, duration_ms=20_000.0),
+        Phrase(beat_start=2, beat_end=3, kind=2, label="Chorus", position_ms=120_000.0, duration_ms=30_000.0),
+        Phrase(beat_start=3, beat_end=4, kind=3, label="Outro", position_ms=150_000.0, duration_ms=50_000.0),
+    ]
+    track = _track_with_phrases(phrases)
+    assert tail_zone(track) == (100_000.0, 200_000.0)
+
+
+def test_head_zone_spans_zero_to_intro_end():
+    phrases = [
+        Phrase(beat_start=1, beat_end=2, kind=1, label="Intro", position_ms=0.0, duration_ms=20_000.0),
+        Phrase(beat_start=2, beat_end=3, kind=2, label="Chorus", position_ms=20_000.0, duration_ms=130_000.0),
+    ]
+    track = _track_with_phrases(phrases)
+    assert head_zone(track) == (0.0, 20_000.0)
+
+
+def test_head_zone_uses_the_first_intro_when_more_than_one():
+    phrases = [
+        Phrase(beat_start=1, beat_end=2, kind=1, label="Intro", position_ms=0.0, duration_ms=15_000.0),
+        Phrase(beat_start=2, beat_end=3, kind=2, label="Up", position_ms=15_000.0, duration_ms=10_000.0),
+        Phrase(beat_start=3, beat_end=4, kind=3, label="Intro", position_ms=25_000.0, duration_ms=5_000.0),
+    ]
+    track = _track_with_phrases(phrases)
+    assert head_zone(track) == (0.0, 15_000.0)
+
+
+def test_regions_overlapping_includes_a_region_fully_inside_the_zone():
+    regions = [VocalRegion(start_ms=10_000.0, end_ms=15_000.0)]
+    assert regions_overlapping(regions, 5_000.0, 20_000.0) == regions
+
+
+def test_regions_overlapping_excludes_a_region_entirely_before_the_zone():
+    regions = [VocalRegion(start_ms=0.0, end_ms=3_000.0)]
+    assert regions_overlapping(regions, 5_000.0, 20_000.0) == []
+
+
+def test_regions_overlapping_excludes_a_region_entirely_after_the_zone():
+    regions = [VocalRegion(start_ms=25_000.0, end_ms=30_000.0)]
+    assert regions_overlapping(regions, 5_000.0, 20_000.0) == []
+
+
+def test_regions_overlapping_includes_a_region_straddling_the_zone_end():
+    regions = [VocalRegion(start_ms=18_000.0, end_ms=25_000.0)]
+    assert regions_overlapping(regions, 5_000.0, 20_000.0) == regions
+
+
+def test_regions_overlapping_excludes_a_region_starting_exactly_at_zone_end():
+    # Half-open interval: a region that starts exactly where the zone ends
+    # does not overlap it (r.start_ms < zone_end is False at equality).
+    regions = [VocalRegion(start_ms=20_000.0, end_ms=25_000.0)]
+    assert regions_overlapping(regions, 5_000.0, 20_000.0) == []

@@ -1146,6 +1146,115 @@ def _run_clash_job(
             jobs[job_id].update(result)
 
 
+def _run_transition_job(
+    job_id: str, playlist_id: str, params: dict, jobs: dict, jobs_lock: threading.Lock
+) -> None:
+    """Runs suggest_transitions() for one playlist on its own thread,
+    with its own short-lived, dedicated Rekordbox6Database connection --
+    mirrors _run_clash_job's shape and rationale exactly (see its
+    docstring, and _run_flow_job's/_DbWorker's, for why neither the
+    shared djcues.db singleton nor _DbWorker is used here).
+
+    Like _run_clash_job, list_playlist_tracks() does double duty: the
+    fast-fail + TrackNo-sorted id order the loaded Track objects get
+    reordered to match (load_playlist_tracks() alone does not guarantee
+    that order -- see clash.py's/transition.py's own module docstrings).
+    It also supplies the id -> Key map used for the harmony (key/BPM
+    compatibility) annotation computed here at the job layer -- same
+    reason flow.py's own key_map is built at this layer rather than
+    inside the pure transition.suggest_transitions() itself (see
+    transition.py's own module docstring).
+    """
+    import time as time_module
+
+    from pyrekordbox import Rekordbox6Database
+
+    from djcues import db as db_module
+    from djcues import harmony as harmony_module
+    from djcues import transition as transition_module
+
+    started = time_module.monotonic()
+    dedicated_db = Rekordbox6Database()
+    result: dict
+
+    try:
+        summaries = db_module.list_playlist_tracks(playlist_id, db=dedicated_db)
+        if not summaries:
+            raise ValueError(f"playlist {playlist_id!r} has no tracks")
+        key_map = {str(s.id): s.key for s in summaries}
+        loaded = db_module.load_playlist_tracks(playlist_id, db=dedicated_db)
+        tracks_by_id = {str(t.id): t for t in loaded}
+        tracks = [tracks_by_id[str(s.id)] for s in summaries if str(s.id) in tracks_by_id]
+
+        transition_result = transition_module.suggest_transitions(
+            tracks, min_vocal_region_ms=params["min_vocal_region_ms"]
+        )
+
+        def _track_json(t):
+            return {"id": t.id, "title": t.title, "artist": t.artist, "bpm": t.bpm, "key": key_map.get(str(t.id))}
+
+        def _region_json(r):
+            return {"start_ms": r.start_ms, "end_ms": r.end_ms}
+
+        def _suggestion_json(s):
+            a_key = harmony_module.parse_camelot_key(key_map.get(str(s.track_a.id)))
+            b_key = harmony_module.parse_camelot_key(key_map.get(str(s.track_b.id)))
+            key_relation = harmony_module.camelot_relationship(a_key, b_key) if a_key and b_key else None
+            bpm_relation = harmony_module.classify_bpm_relation(s.track_a.bpm, s.track_b.bpm)
+            return {
+                "track_a": _track_json(s.track_a), "track_b": _track_json(s.track_b),
+                "position_a": s.position_a, "position_b": s.position_b,
+                "mix_out_ms": s.mix_out_ms, "mix_in_ms": s.mix_in_ms,
+                "a_tail_available_ms": s.a_tail_available_ms, "b_head_available_ms": s.b_head_available_ms,
+                "overlap_ms": s.overlap_ms, "limiting_side": s.limiting_side,
+                "vocal_regions_a": (
+                    [_region_json(r) for r in s.vocal_regions_a] if s.vocal_regions_a is not None else None
+                ),
+                "vocal_regions_b": (
+                    [_region_json(r) for r in s.vocal_regions_b] if s.vocal_regions_b is not None else None
+                ),
+                "key_relation": key_relation,
+                "key_relation_label": harmony_module.KEY_RELATION_LABELS.get(key_relation),
+                "bpm_relation": (
+                    {
+                        "kind": bpm_relation.kind,
+                        "label": harmony_module.BPM_RELATION_LABELS[bpm_relation.kind],
+                        "target_bpm": bpm_relation.target_bpm,
+                        "pitch_shift_pct": bpm_relation.pitch_shift_pct,
+                    }
+                    if bpm_relation else None
+                ),
+            }
+
+        unscorable_summary = {"no_phrase_data": 0, "no_intro_phrase": 0, "no_outro_phrase": 0}
+        for u in transition_result.unscorable:
+            unscorable_summary[u.reason] = unscorable_summary.get(u.reason, 0) + 1
+
+        result = {
+            "status": "done",
+            "result": {
+                "scanned_pairs": transition_result.scanned_pairs,
+                "suggestions": [_suggestion_json(s) for s in transition_result.suggestions],
+                "unscorable": [
+                    {"id": u.track.id, "title": u.track.title, "artist": u.track.artist, "reason": u.reason}
+                    for u in transition_result.unscorable
+                ],
+                "unscorable_summary": unscorable_summary,
+            },
+            "error": None,
+        }
+    except Exception as e:  # noqa: BLE001 -- surfaced to the dashboard UI, not swallowed
+        result = {"status": "error", "result": None, "error": str(e)}
+    finally:
+        dedicated_db.close()
+
+    result["finished_at"] = datetime.now().replace(microsecond=0).isoformat()
+    result["elapsed_seconds"] = round(time_module.monotonic() - started, 1)
+    with jobs_lock:
+        if job_id in jobs:
+            jobs[job_id].update(result)
+
+
 class DashboardHandler(_LocalJsonHandler):
     """Serves the analysis dashboard: browse rekordbox playlists/tracks
     and run propose/compare/beatgrid against a selected track, or launch
@@ -1529,6 +1638,8 @@ class DashboardHandler(_LocalJsonHandler):
             self._handle_flow_job_post(parts[2])
         elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "clash-jobs":
             self._handle_clash_job_post(parts[2])
+        elif len(parts) == 4 and parts[0:2] == ["api", "playlists"] and parts[3] == "transition-jobs":
+            self._handle_transition_job_post(parts[2])
         elif len(parts) == 5 and parts[0:2] == ["api", "tracks"] and parts[3] == "launch":
             self._handle_launch_post(parts[2], parts[4])
         elif path == "/api/devices":
@@ -1863,6 +1974,40 @@ class DashboardHandler(_LocalJsonHandler):
 
         thread = threading.Thread(
             target=_run_clash_job,
+            args=(job_id, playlist_id, params, self._jobs, self._jobs_lock),
+            daemon=True,
+        )
+        thread.start()
+        self._send_json({"job_id": job_id, "status": "running"}, status=202)
+
+    def _handle_transition_job_post(self, playlist_id: str) -> None:
+        """POST /api/playlists/<playlist_id>/transition-jobs -- start a
+        transition-point-suggestion job for one playlist. Body:
+        {"min_vocal_region_ms": float}. Runs on its own thread/connection
+        (_run_transition_job, not _db_worker); poll GET /api/jobs/<job_id>
+        for the result. _handle_job_get is fully generic and needs no
+        changes to serve this job kind too."""
+        from djcues.strategy import DEFAULT_MIN_VOCAL_REGION_MS
+
+        body = self._read_body()
+        try:
+            min_vocal_region_ms = float(body.get("min_vocal_region_ms", DEFAULT_MIN_VOCAL_REGION_MS))
+        except (TypeError, ValueError):
+            self._send_json({"error": "min_vocal_region_ms must be a number"}, status=400)
+            return
+
+        params = {"min_vocal_region_ms": min_vocal_region_ms}
+        job_id = uuid.uuid4().hex
+        job = {
+            "job_id": job_id, "playlist_id": playlist_id, "kind": "transition", "status": "running",
+            "started_at": datetime.now().replace(microsecond=0).isoformat(), "finished_at": None,
+            "elapsed_seconds": None, "result": None, "error": None,
+        }
+        with self._jobs_lock:
+            self._jobs[job_id] = job
+
+        thread = threading.Thread(
+            target=_run_transition_job,
             args=(job_id, playlist_id, params, self._jobs, self._jobs_lock),
             daemon=True,
         )

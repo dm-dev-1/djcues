@@ -71,6 +71,7 @@ def render_dashboard_html(
         <button id="audit-playlist-btn" class="btn btn-ghost hidden" type="button">Audit this playlist</button>
         <button id="flow-playlist-btn" class="btn btn-ghost hidden" type="button">Suggest set order</button>
         <button id="clash-playlist-btn" class="btn btn-ghost hidden" type="button">Check vocal clashes</button>
+        <button id="transition-playlist-btn" class="btn btn-ghost hidden" type="button">Suggest transitions</button>
       </div>
       <div id="track-list" class="track-list">
         <p class="meta">Pick a playlist on the left to see its tracks.</p>
@@ -129,6 +130,20 @@ def render_dashboard_html(
       <div id="clash-status" class="job-status"></div>
       <div id="clash-findings-list" class="suggestions-list"></div>
       <p id="clash-unscorable-summary" class="meta small"></p>
+    </div>
+
+    <div id="transition-panel" class="panel hidden">
+      <div class="panel-header">
+        <button id="transition-back" class="btn btn-ghost" type="button">&larr; Back</button>
+        <h2 id="transition-scope-title"></h2>
+      </div>
+      <div class="flags-row">
+        <label>Min vocal region (ms) <input type="number" id="transition-min-vocal-region-ms" value="2000" step="100" min="0" class="flag-num"></label>
+        <button id="transition-run-btn" class="btn btn-primary" type="button">Scan for transitions</button>
+      </div>
+      <div id="transition-status" class="job-status"></div>
+      <div id="transition-results-list" class="suggestions-list"></div>
+      <p id="transition-unscorable-summary" class="meta small"></p>
     </div>
 
     <div id="track-detail-panel" class="panel hidden">
@@ -516,6 +531,15 @@ const clashRunBtn = document.getElementById('clash-run-btn');
 const clashStatusEl = document.getElementById('clash-status');
 const clashFindingsListEl = document.getElementById('clash-findings-list');
 const clashUnscorableSummaryEl = document.getElementById('clash-unscorable-summary');
+const transitionPlaylistBtn = document.getElementById('transition-playlist-btn');
+const transitionPanelEl = document.getElementById('transition-panel');
+const transitionBackBtn = document.getElementById('transition-back');
+const transitionScopeTitleEl = document.getElementById('transition-scope-title');
+const transitionMinVocalRegionMsEl = document.getElementById('transition-min-vocal-region-ms');
+const transitionRunBtn = document.getElementById('transition-run-btn');
+const transitionStatusEl = document.getElementById('transition-status');
+const transitionResultsListEl = document.getElementById('transition-results-list');
+const transitionUnscorableSummaryEl = document.getElementById('transition-unscorable-summary');
 
 let currentPlaylistId = null;
 let currentTracks = [];
@@ -565,6 +589,16 @@ let clashJobStartedAt = null;
 let lastClashResult = null;
 let lastClashResultPlaylistId = null;
 let lastClashElapsedSeconds = null;
+// The transition view's own scope -- always playlist-scoped, same
+// reasoning as flow's/clash's above.
+let transitionPlaylistId = null;
+let transitionPlaylistName = null;
+let transitionPollTimer = null;
+let transitionJobStartedAt = null;
+// Same in-memory result cache as flow's/clash's above, same reason.
+let lastTransitionResult = null;
+let lastTransitionResultPlaylistId = null;
+let lastTransitionElapsedSeconds = null;
 // Declared here, not inline near refreshEstimate() below, so it's
 // already initialized by the time updateActionFlags()'s own initial
 // call (which runs before this file's later `let` statements would
@@ -618,6 +652,14 @@ function stateToUrl(state) {{
     params.set('playlist_name', state.playlistName || '');
     return '?' + params.toString();
   }}
+  // Same reasoning as flow's/clash's own branches above -- transition
+  // also has no library-wide mode, playlist_id is always present here.
+  if (state.view === 'transition') {{
+    params.set('view', 'transition');
+    params.set('playlist_id', state.playlistId);
+    params.set('playlist_name', state.playlistName || '');
+    return '?' + params.toString();
+  }}
   if (state.playlistId) {{
     params.set('playlist_id', state.playlistId);
     params.set('playlist_name', state.playlistName || '');
@@ -644,6 +686,9 @@ function urlToState() {{
   if (params.get('view') === 'clash') {{
     return {{ view: 'clash', playlistId: params.get('playlist_id'), playlistName: params.get('playlist_name') }};
   }}
+  if (params.get('view') === 'transition') {{
+    return {{ view: 'transition', playlistId: params.get('playlist_id'), playlistName: params.get('playlist_name') }};
+  }}
   const playlistId = params.get('playlist_id');
   const trackId = params.get('track_id');
   if (trackId) {{
@@ -669,6 +714,8 @@ async function renderState(state) {{
     renderFlow(state.playlistId, state.playlistName);
   }} else if (state.view === 'clash') {{
     renderClash(state.playlistId, state.playlistName);
+  }} else if (state.view === 'transition') {{
+    renderTransition(state.playlistId, state.playlistName);
   }} else {{
     renderLanding();
   }}
@@ -805,15 +852,18 @@ function renderLanding() {{
   auditPlaylistBtn.classList.add('hidden');
   flowPlaylistBtn.classList.add('hidden');
   clashPlaylistBtn.classList.add('hidden');
+  transitionPlaylistBtn.classList.add('hidden');
   trackListEl.innerHTML = '<p class="meta">Pick a playlist on the left to see its tracks.</p>';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.add('hidden');
   clashPanelEl.classList.add('hidden');
+  transitionPanelEl.classList.add('hidden');
   stopPolling();
   stopFlowPolling();
   stopClashPolling();
+  stopTransitionPolling();
   document.title = 'djcues \\u2014 Analysis dashboard';
 }}
 
@@ -826,15 +876,18 @@ async function renderPlaylistTracks(playlistId, playlistName) {{
   auditPlaylistBtn.classList.remove('hidden');
   flowPlaylistBtn.classList.remove('hidden');
   clashPlaylistBtn.classList.remove('hidden');
+  transitionPlaylistBtn.classList.remove('hidden');
   trackListEl.innerHTML = 'Loading&hellip;';
   trackListPanelEl.classList.remove('hidden');
   trackDetailPanelEl.classList.add('hidden');
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.add('hidden');
   clashPanelEl.classList.add('hidden');
+  transitionPanelEl.classList.add('hidden');
   stopPolling();
   stopFlowPolling();
   stopClashPolling();
+  stopTransitionPolling();
   document.title = 'djcues \\u2014 ' + playlistName;
 
   try {{
@@ -902,12 +955,14 @@ async function renderTrackDetail(playlistId, playlistName, trackId, trackTitle) 
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.add('hidden');
   clashPanelEl.classList.add('hidden');
+  transitionPanelEl.classList.add('hidden');
   resultsPanelEl.classList.add('hidden');
   jobOutputWrapEl.classList.add('hidden');
   jobHtmlFragmentEl.innerHTML = '';
   stopPolling();
   stopFlowPolling();
   stopClashPolling();
+  stopTransitionPolling();
   document.title = 'djcues \\u2014 ' + trackTitle;
 
   // Reached directly (a bookmark, a refresh, or Back/Forward hopping
@@ -1436,6 +1491,7 @@ function renderAudit(playlistId, playlistName, library) {{
   auditPanelEl.classList.remove('hidden');
   flowPanelEl.classList.add('hidden');
   clashPanelEl.classList.add('hidden');
+  transitionPanelEl.classList.add('hidden');
   if (!playlistId) {{
     // Reached via the library-only entry point -- nothing else to
     // scope to, so force it and don't let the user uncheck it.
@@ -1449,6 +1505,7 @@ function renderAudit(playlistId, playlistName, library) {{
   stopPolling();
   stopFlowPolling();
   stopClashPolling();
+  stopTransitionPolling();
   document.title = 'djcues \\u2014 Audit';
   loadAuditFindings();
 }}
@@ -1577,11 +1634,13 @@ function renderFlow(playlistId, playlistName) {{
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.remove('hidden');
   clashPanelEl.classList.add('hidden');
+  transitionPanelEl.classList.add('hidden');
   flowScopeTitleEl.textContent = 'Energy Flow: ' + (playlistName || playlistId);
   flowUnscoredSummaryEl.textContent = '';
   stopPolling();
   stopFlowPolling();
   stopClashPolling();
+  stopTransitionPolling();
   document.title = 'djcues \\u2014 Energy Flow';
   // Restore the last completed result for this SAME playlist instead of
   // showing a blank panel -- e.g. after clicking into a track and back.
@@ -1781,11 +1840,13 @@ function renderClash(playlistId, playlistName) {{
   auditPanelEl.classList.add('hidden');
   flowPanelEl.classList.add('hidden');
   clashPanelEl.classList.remove('hidden');
+  transitionPanelEl.classList.add('hidden');
   clashScopeTitleEl.textContent = 'Vocal Clash: ' + (playlistName || playlistId);
   clashUnscorableSummaryEl.textContent = '';
   stopPolling();
   stopFlowPolling();
   stopClashPolling();
+  stopTransitionPolling();
   document.title = 'djcues \\u2014 Vocal Clash';
   // Same restore-on-return behavior as renderFlow's own cache, same reason.
   if (lastClashResultPlaylistId === playlistId && lastClashResult) {{
@@ -1917,6 +1978,170 @@ clashPlaylistBtn.addEventListener('click', () => navigateTo(
   {{ view: 'clash', playlistId: currentPlaylistId, playlistName: currentPlaylistNameEl.textContent }}, 'push'
 ));
 clashBackBtn.addEventListener('click', () => history.back());
+
+// --- Transition point suggestions --------------------------------------
+//
+// Its own top-level view, like flow/clash -- playlist-scoped only, no
+// library mode (adjacency only means something within one ordered
+// playlist). Same background-job reasoning as flow/clash (see
+// _run_transition_job's docstring in server.py): a fourth sibling of
+// pollJob/pollFlowJob/pollClashJob with the same polling semantics (2s
+// interval, running/error/done) targeting #transition-panel's own
+// elements. Read-only, suggestion-only -- unlike flow, there is no
+// "apply to Rekordbox" button here (see transition.py's own module
+// docstring for why).
+
+function renderTransition(playlistId, playlistName) {{
+  transitionPlaylistId = playlistId;
+  transitionPlaylistName = playlistName;
+  trackListPanelEl.classList.add('hidden');
+  trackDetailPanelEl.classList.add('hidden');
+  auditPanelEl.classList.add('hidden');
+  flowPanelEl.classList.add('hidden');
+  clashPanelEl.classList.add('hidden');
+  transitionPanelEl.classList.remove('hidden');
+  transitionScopeTitleEl.textContent = 'Transitions: ' + (playlistName || playlistId);
+  transitionUnscorableSummaryEl.textContent = '';
+  stopPolling();
+  stopFlowPolling();
+  stopClashPolling();
+  stopTransitionPolling();
+  document.title = 'djcues \\u2014 Transitions';
+  // Same restore-on-return behavior as renderFlow's/renderClash's own cache, same reason.
+  if (lastTransitionResultPlaylistId === playlistId && lastTransitionResult) {{
+    transitionStatusEl.textContent = 'Done \\u00b7 computed in ' + lastTransitionElapsedSeconds + 's';
+    transitionStatusEl.className = 'job-status success';
+    renderTransitionResult(lastTransitionResult);
+  }} else {{
+    transitionStatusEl.textContent = '';
+    transitionStatusEl.className = 'job-status';
+    transitionResultsListEl.innerHTML = '';
+  }}
+}}
+
+transitionRunBtn.addEventListener('click', async () => {{
+  if (!transitionPlaylistId) return;
+  const body = {{ min_vocal_region_ms: parseFloat(transitionMinVocalRegionMsEl.value) || 2000 }};
+  transitionRunBtn.disabled = true;
+  transitionStatusEl.textContent = 'Starting&hellip;';
+  transitionStatusEl.className = 'job-status info';
+  transitionResultsListEl.innerHTML = '';
+  transitionUnscorableSummaryEl.textContent = '';
+  try {{
+    const data = await fetchJson('/api/playlists/' + encodeURIComponent(transitionPlaylistId) + '/transition-jobs', {{
+      method: 'POST',
+      headers: {{ 'Content-Type': 'application/json' }},
+      body: JSON.stringify(body),
+    }});
+    pollTransitionJob(data.job_id);
+  }} catch (err) {{
+    transitionStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+    transitionStatusEl.className = 'job-status error';
+    transitionRunBtn.disabled = false;
+  }}
+}});
+
+function stopTransitionPolling() {{
+  if (transitionPollTimer) {{ clearTimeout(transitionPollTimer); transitionPollTimer = null; }}
+}}
+
+function pollTransitionJob(jobId) {{
+  stopTransitionPolling();
+  transitionJobStartedAt = Date.now();
+  const tick = async () => {{
+    try {{
+      const job = await fetchJson('/api/jobs/' + jobId);
+      if (job.status === 'running') {{
+        const elapsed = Math.round((Date.now() - transitionJobStartedAt) / 1000);
+        transitionStatusEl.textContent = 'Running&hellip; (' + elapsed + 's)';
+        transitionStatusEl.className = 'job-status info';
+        transitionPollTimer = setTimeout(tick, 2000);
+        return;
+      }}
+      transitionRunBtn.disabled = false;
+      if (job.status === 'error') {{
+        transitionStatusEl.textContent = 'Error: ' + job.error;
+        transitionStatusEl.className = 'job-status error';
+      }} else {{
+        transitionStatusEl.textContent = 'Done \\u00b7 computed in ' + job.elapsed_seconds + 's';
+        transitionStatusEl.className = 'job-status success';
+        renderTransitionResult(job.result);
+        lastTransitionResult = job.result;
+        lastTransitionResultPlaylistId = transitionPlaylistId;
+        lastTransitionElapsedSeconds = job.elapsed_seconds;
+      }}
+    }} catch (err) {{
+      transitionStatusEl.textContent = 'Error: ' + friendlyErrorMessage(err);
+      transitionStatusEl.className = 'job-status error';
+      transitionRunBtn.disabled = false;
+    }}
+  }};
+  tick();
+}}
+
+function renderTransitionResult(result) {{
+  transitionResultsListEl.innerHTML = '';
+  if (result.suggestions.length === 0) {{
+    transitionResultsListEl.innerHTML = '<p class="meta small">No transition suggestions.</p>';
+  }}
+  result.suggestions.forEach(s => {{
+    const row = document.createElement('div');
+    row.className = 'suggestion-row';
+
+    const posSpan = document.createElement('span');
+    posSpan.className = 'suggestion-bpm';
+    posSpan.textContent = s.position_a + ' \\u2192 ' + s.position_b;
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'suggestion-title';
+    titleSpan.textContent = s.track_a.title + ' \\u2192 ' + s.track_b.title;
+
+    const artistSpan = document.createElement('span');
+    artistSpan.className = 'suggestion-artist';
+    artistSpan.textContent = s.track_a.artist + ' / ' + s.track_b.artist;
+
+    const detailSpan = document.createElement('span');
+    detailSpan.className = 'suggestion-relation';
+    const detailParts = [
+      formatDuration(s.mix_out_ms) + '\\u2192' + formatDuration(s.mix_in_ms),
+      (s.overlap_ms / 1000).toFixed(1) + 's blend',
+    ];
+    if (s.key_relation_label) detailParts.push(s.key_relation_label);
+    if (s.bpm_relation) detailParts.push(s.bpm_relation.label + ' ' + s.bpm_relation.pitch_shift_pct.toFixed(1) + '%');
+    const hasVocalRisk = (s.vocal_regions_a && s.vocal_regions_a.length > 0) || (s.vocal_regions_b && s.vocal_regions_b.length > 0);
+    if (hasVocalRisk) detailParts.push('vocal risk');
+    detailSpan.textContent = detailParts.join(' \\u00b7 ');
+
+    row.appendChild(posSpan);
+    row.appendChild(titleSpan);
+    row.appendChild(artistSpan);
+    row.appendChild(detailSpan);
+
+    row.addEventListener('click', () => navigateTo({{
+      view: 'track', playlistId: transitionPlaylistId, playlistName: transitionPlaylistName,
+      trackId: s.track_a.id, trackTitle: s.track_a.title,
+    }}, 'push'));
+
+    transitionResultsListEl.appendChild(row);
+  }});
+
+  const u = result.unscorable_summary;
+  const total = u.no_phrase_data + u.no_intro_phrase + u.no_outro_phrase;
+  if (total > 0) {{
+    const parts = [];
+    if (u.no_phrase_data) parts.push(u.no_phrase_data + ' no phrase data');
+    if (u.no_intro_phrase) parts.push(u.no_intro_phrase + ' no Intro phrase');
+    if (u.no_outro_phrase) parts.push(u.no_outro_phrase + ' no Outro phrase');
+    transitionUnscorableSummaryEl.textContent = '(unscorable: ' + parts.join(', ') + ')';
+  }}
+}}
+
+// Entry point into the transition view -- always from a selected
+// playlist, same reasoning as flow's/clash's own entry points above.
+transitionPlaylistBtn.addEventListener('click', () => navigateTo(
+  {{ view: 'transition', playlistId: currentPlaylistId, playlistName: currentPlaylistNameEl.textContent }}, 'push'
+));
+transitionBackBtn.addEventListener('click', () => history.back());
 
 // Called after INITIAL_PLAYLIST (server-embedded, from a
 // `djcues dashboard "Playlist Name"` argument) is defined -- see the

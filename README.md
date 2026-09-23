@@ -168,6 +168,18 @@ djcues clash "Tech House" --min-vocal-region-ms 3000
 
 Scans every pair of adjacent tracks in a playlist's real current order and flags pairs where track A still has vocals overlapping its Outro-anchored tail and track B already has vocals overlapping its Intro-anchored head — a real risk of two vocals clashing at once when mixed together. Reuses the same vocal-onset detection already used for cue placement (Rekordbox's own PVDI vocal-confidence data, no Demucs/`--deep` needed). Read-only diagnostic report, same category as `audit` — flags problems, never suggests a new order, never writes to the database. Playlist-scoped only, with no `--library` option: "adjacent" is only a meaningful concept within one ordered playlist. Also available from the dashboard as its own "Check vocal clashes" view.
 
+### Transition point suggestions
+
+```bash
+# Suggest a mix-out/mix-in point for every adjacent track pair in a playlist
+djcues transition "Tech House"
+
+# Adjust how long a vocal has to sustain to count as a real risk within the blend window
+djcues transition "Tech House" --min-vocal-region-ms 3000
+```
+
+For every adjacent pair in a playlist's real current order, suggests where in the outgoing track to start mixing out (its Outro-phrase start, the same anchor `clash`'s tail zone uses) and where in the incoming track to mix in (its first beat), plus the resulting blend window — however much of the outgoing track's outro and the incoming track's intro are both available, whichever is shorter, never a fixed-length window. Each pair is also annotated with key/BPM compatibility (same logic as `suggest`) and flagged for vocal-clash risk within that specific blend window, reusing `clash`'s own vocal-region detection but scoped to the real suggested window rather than the whole tail/head zone. Read-only suggestion, same category as `audit`/`flow`/`clash` — never writes to the database. Playlist-scoped only, with no `--library` option, same reasoning as `flow`/`clash`. Also available from the dashboard as its own "Suggest transitions" view.
+
 ### Analysis dashboard
 
 ```bash
@@ -340,12 +352,13 @@ src/djcues/
     audit.py        # BPM/Key comment-hint cross-checking + unusable-key detection (djcues audit)
     flow.py         # Energy-flow set ordering -- peak-then-cooldown track sequencing (djcues flow)
     clash.py        # Vocal-clash detection -- adjacent-pair vocal-overlap scan (djcues clash)
+    transition.py   # Transition point suggestions -- mix-out/mix-in points + blend window per adjacent pair (djcues transition)
     viz.py          # HTML timeline visualizer
     review.py       # Interactive review HTML + session management
     dashboard.py    # Analysis dashboard HTML/CSS/JS (browse playlists/tracks, run propose/compare/beatgrid)
     server.py       # Local HTTP server for review sessions, the BYOK setup wizard, and the dashboard
     writer.py       # DB backup, cue writes, and playlist add/remove/move/reorder
-    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, audit, flow, clash, auth, history, cache)
+    cli.py          # Click CLI (propose, compare, viz, review, dashboard, apply, beatgrid, playlist, suggest, audit, flow, clash, transition, auth, history, cache)
 ```
 
 ## License

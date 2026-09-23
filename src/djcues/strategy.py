@@ -206,6 +206,41 @@ def find_vocal_regions(
     return regions
 
 
+def tail_zone(track: Track) -> tuple[float, float]:
+    """track's tail zone: from its (first) Outro-labeled phrase's start
+    to the track's end. Caller must have already confirmed an Outro
+    phrase exists.
+
+    Shared by clash.py (vocal-clash tail-zone check) and transition.py
+    (mix-out point anchor) -- promoted here rather than duplicated in
+    both, same "don't invent a second copy of an existing signal"
+    reasoning as find_vocal_regions() above.
+    """
+    outro = next(p for p in track.phrases if p.label == "Outro")
+    return outro.position_ms, track.duration_ms
+
+
+def head_zone(track: Track) -> tuple[float, float]:
+    """track's head zone: from 0ms to the end of its (first) Intro-
+    labeled phrase. Caller must have already confirmed an Intro phrase
+    exists.
+
+    Shared by clash.py (vocal-clash head-zone check) and transition.py
+    -- see tail_zone()'s own docstring for why this is promoted here.
+    """
+    intro = next(p for p in track.phrases if p.label == "Intro")
+    return 0.0, intro.position_ms + intro.duration_ms
+
+
+def regions_overlapping(
+    regions: list[VocalRegion], zone_start: float, zone_end: float
+) -> list[VocalRegion]:
+    """Regions from `regions` that overlap [zone_start, zone_end) --
+    simple interval-overlap check. Shared by clash.py and transition.py,
+    see tail_zone()'s own docstring for why this is promoted here."""
+    return [r for r in regions if r.start_ms < zone_end and r.end_ms > zone_start]
+
+
 def build_cue_points(
     positions: dict[str, float],
     confidence: dict[str, float],

@@ -2132,6 +2132,117 @@ class TestDashboardClashJobs:
 
 
 @requires_rekordbox
+class TestDashboardTransitionJobs:
+    """POST /api/playlists/<id>/transition-jobs -- same dedicated-
+    connection/thread shape as clash/flow (_run_transition_job, not
+    _DbWorker), so gated on @requires_rekordbox like TestDashboardClashJobs
+    rather than _DbWorker.run-mocked. djcues.transition's own logic has
+    its own exhaustive tests in test_transition.py.
+    """
+
+    @staticmethod
+    def _tech_house_playlist_id(base_url: str) -> str:
+        _, tree = _get(base_url + "/api/playlists")
+        tech_house = next(n for n in tree["tree"] if n["name"] == "Tech House")
+        return tech_house["id"]
+
+    def _run_transition_job_to_completion(
+        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = 20.0
+    ) -> dict:
+        status, data = _post(base_url + f"/api/playlists/{playlist_id}/transition-jobs", body or {})
+        assert status == 202, data
+        job_id = data["job_id"]
+
+        deadline = time.monotonic() + timeout
+        job: dict = {}
+        while time.monotonic() < deadline:
+            status, job = _get(base_url + f"/api/jobs/{job_id}")
+            assert status == 200
+            if job["status"] != "running":
+                return job
+            time.sleep(0.2)
+        raise AssertionError(f"transition job {job_id} did not finish within {timeout}s: {job}")
+
+    def test_invalid_min_vocal_region_ms_is_400(self, dashboard_server):
+        base_url, _server = dashboard_server
+        status, _data = _post(
+            base_url + "/api/playlists/pl1/transition-jobs", {"min_vocal_region_ms": "not-a-number"}
+        )
+        assert status == 400
+
+    def test_unknown_playlist_id_produces_error_job(self, dashboard_server):
+        base_url, _server = dashboard_server
+        job = self._run_transition_job_to_completion(base_url, "not-a-real-playlist-id")
+        assert job["status"] == "error"
+        assert job["error"]
+
+    def test_transition_job_completes_for_real(self, dashboard_server):
+        # No mocking needed -- suggest_transitions is pure, cheap
+        # arithmetic over data load_playlist_tracks already reads for
+        # real; this runs genuinely end to end, same spirit as
+        # TestDashboardClashJobs's own analogous test.
+        base_url, _server = dashboard_server
+        playlist_id = self._tech_house_playlist_id(base_url)
+
+        job = self._run_transition_job_to_completion(base_url, playlist_id)
+
+        assert job["status"] == "done"
+        assert job["error"] is None
+        result = job["result"]
+        assert result["scanned_pairs"] >= 0
+        for s in result["suggestions"]:
+            assert s["position_b"] == s["position_a"] + 1
+            assert s["overlap_ms"] >= 0
+            assert s["vocal_regions_a"] is None or isinstance(s["vocal_regions_a"], list)
+            assert s["vocal_regions_b"] is None or isinstance(s["vocal_regions_b"], list)
+            assert s["key_relation"] is None or isinstance(s["key_relation"], str)
+            assert s["bpm_relation"] is None or "pitch_shift_pct" in s["bpm_relation"]
+        assert all(
+            u["reason"] in ("no_phrase_data", "no_intro_phrase", "no_outro_phrase") for u in result["unscorable"]
+        )
+
+    def test_browsing_stays_responsive_while_a_transition_job_is_running(self, dashboard_server):
+        """Same proof as TestDashboardClashJobs's own analogous test, for
+        this feature's separate dedicated-connection job path."""
+        base_url, _server = dashboard_server
+        playlist_id = self._tech_house_playlist_id(base_url)
+
+        def slow_suggest_transitions(tracks, *, min_vocal_region_ms=2000.0):
+            time.sleep(1.5)
+            from djcues.transition import TransitionResult
+            return TransitionResult(scanned_pairs=0, suggestions=[], unscorable=[])
+
+        with patch("djcues.transition.suggest_transitions", side_effect=slow_suggest_transitions):
+            status, data = _post(base_url + f"/api/playlists/{playlist_id}/transition-jobs", {})
+            assert status == 202
+            job_id = data["job_id"]
+
+            start = time.monotonic()
+            status, _tree = _get(base_url + "/api/playlists")
+            elapsed = time.monotonic() - start
+
+            assert status == 200
+            assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running transition job"
+
+            # 20s, not clash's own analogous test's 10s: matches this
+            # class's own _run_transition_job_to_completion default
+            # timeout -- real per-track ANLZ I/O timing on this machine
+            # has been observed to occasionally exceed 10s (confirmed
+            # live: clash's own equivalent test intermittently fails the
+            # same way at 10s), so this uses the more realistic figure
+            # already established elsewhere in this file rather than
+            # inheriting a tight deadline that isn't reliable here.
+            deadline = time.monotonic() + 20
+            job = {}
+            while time.monotonic() < deadline:
+                status, job = _get(base_url + f"/api/jobs/{job_id}")
+                if job["status"] != "running":
+                    break
+                time.sleep(0.2)
+            assert job["status"] == "done"
+
+
+@requires_rekordbox
 class TestDashboardHandlerLaunch:
     @staticmethod
     def _tech_house_playlist_and_track(base_url: str) -> tuple[str, str]:
