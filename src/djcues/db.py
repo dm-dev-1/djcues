@@ -136,6 +136,12 @@ def _track_summary_from_content(content: Any, track_no: int | None) -> TrackSumm
     )
 
 
+def summarize_content(content: Any) -> TrackSummary:
+    """Public form of the cheap, ANLZ-free TrackSummary extraction, for
+    callers that already hold a DjmdContent row (e.g. tag_analysis.py)."""
+    return _track_summary_from_content(content, track_no=None)
+
+
 def list_playlist_tracks(playlist_id: str, db: Rekordbox6Database | None = None) -> list[TrackSummary]:
     """Cheap track listing for one playlist -- title/artist/bpm/duration/key/
     comment straight from DjmdContent via the DjmdSongPlaylist relationship, zero
@@ -246,6 +252,32 @@ def extract_raw_beat_grid(
     except Exception as e:
         logger.warning("Could not read raw beat grid for %s: %s", track_content.Title, e)
     return None
+
+
+def fingerprint_anlz(track_content: Any, db: Rekordbox6Database | None = None) -> str:
+    """Cheap change-detector for a track's analysis inputs -- BPM,
+    length, and each ANLZ file's mtime/size (a stat() per file, no
+    parsing).
+
+    Exists because analysis_cache.fingerprint_track_analysis() hashes an
+    already-loaded Track, i.e. only after the ~266ms/track ANLZ parse
+    it would be used to avoid. This one is computed from the content
+    row alone, so a cache keyed on it can skip load_track() entirely
+    for an unchanged track.
+    """
+    import hashlib
+
+    db = db if db is not None else get_db()
+    parts = [str(track_content.ID), str(track_content.BPM), str(track_content.Length)]
+    try:
+        for kind, path in sorted(db.get_anlz_paths(track_content).items()):
+            if path is not None and path.exists():
+                st = path.stat()
+                parts.append(f"{kind}:{st.st_mtime_ns}:{st.st_size}")
+    except Exception as e:  # unreadable analysis dir -- fingerprint what we have
+        logger.warning("Could not stat ANLZ files for %s: %s", track_content.Title, e)
+        parts.append("anlz-unreadable")
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()
 
 
 def _extract_phrases(

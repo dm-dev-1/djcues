@@ -2215,3 +2215,9 @@ def transition(playlist_name, min_vocal_region_ms):
         click.echo(f"  Skipping {u.track.title} ({_TRANSITION_UNSCORABLE_LABELS[u.reason]})", err=True)
 
     _print_transition_report(result, playlist_name, key_map)
+
+
+# Smart tagging lives in its own module to keep this file from growing further.
+from djcues.tags_cli import tags  # noqa: E402
+
+cli.add_command(tags)
