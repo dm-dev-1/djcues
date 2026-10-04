@@ -141,7 +141,9 @@ def tags_rules():
 
 @tags.command("calibrate")
 @click.option("--no-cache", is_flag=True, help="Re-read every track's analysis instead of using cached features.")
-def tags_calibrate(no_cache):
+@click.option("--under", default=None, type=click.Path(file_okay=False),
+              help="Only calibrate on local files inside this folder (skips streaming-linked tracks).")
+def tags_calibrate(no_cache, under):
     """Compute library-wide energy bands from every track in the collection.
 
     Reads every track's analysis (~0.3-0.6s/track on first run -- minutes
@@ -150,9 +152,9 @@ def tags_calibrate(no_cache):
     to Rekordbox.
     """
     db = get_db()
-    n = len(tag_analysis.library_contents(db))
+    n = len(tag_analysis.library_contents(db, under))
     if n == 0:
-        click.echo("Error: the library has no tracks.", err=True)
+        click.echo("Error: the library has no tracks" + (f" under '{under}'." if under else "."), err=True)
         raise SystemExit(1)
     click.echo(f"Analysing {n} track(s) (cached tracks are instant)...")
 
@@ -160,7 +162,7 @@ def tags_calibrate(no_cache):
         try:
             calibration, run = _progress(
                 "Calibrating", n,
-                lambda cb: tag_analysis.calibrate_library(db, store, use_cache=not no_cache, progress=cb),
+                lambda cb: tag_analysis.calibrate_library(db, store, use_cache=not no_cache, progress=cb, under=under),
             )
         except ValueError as e:
             click.echo(f"Error: {e}", err=True)
@@ -180,9 +182,15 @@ def tags_calibrate(no_cache):
     click.echo("\nNext: `djcues tags stats` to check how common each tag is before trusting the thresholds.")
 
 
-def _scope_contents(db, playlist_name: str | None):
+def _scope_contents(db, playlist_name: str | None, under: str | None = None):
     if playlist_name is None:
-        return tag_analysis.library_contents(db), "whole library"
+        contents = tag_analysis.library_contents(db, under)
+        if under is None:
+            return contents, "whole library"
+        if not contents:
+            click.echo(f"Error: no local tracks found under '{under}'.", err=True)
+            raise SystemExit(1)
+        return contents, f"library folder {under}"
     playlist = find_playlist(playlist_name, db)
     if playlist is None:
         click.echo(f"Error: playlist '{playlist_name}' not found.", err=True)
@@ -307,9 +315,10 @@ def _proposal_to_session(proposals, playlist_name, calibration, categories=None)
 
 
 @tags.command("propose")
-@click.argument("playlist_name")
+@click.argument("playlist_name", required=False)
 @click.argument("track_name", required=False)
 @click.option("--all", "all_tracks", is_flag=True, help="Propose tags for every track in the playlist.")
+@click.option("--library", is_flag=True, help="Propose tags for every track in the whole collection (no playlist name).")
 @click.option(
     "--categories", default=None,
     help=f"Comma-separated categories to evaluate (default: all). One of: {', '.join(CATEGORY_NAMES)}.",
@@ -317,9 +326,12 @@ def _proposal_to_session(proposals, playlist_name, calibration, categories=None)
 @click.option("--evidence", is_flag=True, help="Show why each tag was chosen (always on for a single track).")
 @click.option("--out", "out_path", type=click.Path(dir_okay=False), default=None,
               help="Also save the proposal as a session JSON file.")
+@click.option("--under", default=None, type=click.Path(file_okay=False),
+              help="With --library: only local files inside this folder (skips streaming-linked tracks).")
 @click.option("--no-cache", is_flag=True, help="Re-read analysis instead of using cached features.")
-def tags_propose(playlist_name, track_name, all_tracks, categories, evidence, out_path, no_cache):
-    """Propose tags for tracks in a playlist. Read-only -- writes nothing to Rekordbox."""
+def tags_propose(playlist_name, track_name, all_tracks, library, categories, evidence, out_path, under, no_cache):
+    """Propose tags for tracks in a playlist (or the whole collection with
+    --library). Read-only -- writes nothing to Rekordbox."""
     wanted = None
     if categories:
         wanted = [c.strip() for c in categories.split(",") if c.strip()]
@@ -327,12 +339,22 @@ def tags_propose(playlist_name, track_name, all_tracks, categories, evidence, ou
         if unknown:
             click.echo(f"Error: unknown category {', '.join(unknown)}. Choose from: {', '.join(CATEGORY_NAMES)}.", err=True)
             raise SystemExit(1)
-    if not track_name and not all_tracks:
+    if library:
+        if playlist_name or track_name:
+            click.echo("Error: --library covers the whole collection -- don't give a playlist or track name.", err=True)
+            raise SystemExit(1)
+    elif not playlist_name:
+        click.echo("Error: give a playlist name, or use --library for the whole collection.", err=True)
+        raise SystemExit(1)
+    elif not track_name and not all_tracks:
         click.echo("Error: provide a track name or use --all.", err=True)
+        raise SystemExit(1)
+    if under and not library:
+        click.echo("Error: --under only applies with --library.", err=True)
         raise SystemExit(1)
 
     db = get_db()
-    contents, scope = _scope_contents(db, playlist_name)
+    contents, scope = _scope_contents(db, None if library else playlist_name, under)
     if track_name:
         matches = _match_track(contents, track_name)
         if not matches:
@@ -364,7 +386,14 @@ def tags_propose(playlist_name, track_name, all_tracks, categories, evidence, ou
 
     click.echo(f"\n{'=' * 60}\n  Proposed tags: {scope}\n{'=' * 60}")
     totals: Counter[str] = Counter()
+    # A whole-library run would print ~900 tracks; summarise unless the
+    # per-track detail was asked for (the session file has it either way).
+    list_tracks = evidence or not library
     for i, p in enumerate(proposals, start=1):
+        for d in p.tags.decisions:
+            totals[d.tag] += 1
+        if not list_tracks:
+            continue
         click.echo(f"\n  {i:>3d}. {p.title} — {p.artist}")
         if evidence:
             for d in p.tags.decisions:
@@ -375,15 +404,14 @@ def tags_propose(playlist_name, track_name, all_tracks, categories, evidence, ou
                 click.echo(f"        [{s.category}] skipped: {_SKIP_LABELS.get(s.reason, s.reason)}")
         else:
             click.echo(f"        {_grouped_line(p.tags)}")
-        for d in p.tags.decisions:
-            totals[d.tag] += 1
 
     click.echo(f"\n  {len(proposals)} track(s); " + (
         "  ".join(f"{tag}={n}" for tag, n in sorted(totals.items())) if totals else "no tags proposed"
     ))
 
     if out_path:
-        session = _proposal_to_session(proposals, playlist_name, calibration, wanted)
+        # scope is the playlist name, or "whole library" for --library
+        session = _proposal_to_session(proposals, scope, calibration, wanted)
         Path(out_path).write_text(json.dumps(session, indent=2), encoding="utf-8")
         click.echo(f"  Saved session: {out_path}  (nothing has been written to Rekordbox)")
 
@@ -584,3 +612,111 @@ def tags_status():
     if overrides:
         by_cat = Counter(o["category"] for o in overrides)
         click.echo(f"\n  Overrides logged so far: " + ", ".join(f"{c}={n}" for c, n in sorted(by_cat.items())))
+
+
+def _resolve_tag_ids(db, names: list[str]) -> dict[str, str]:
+    """{tag name: My Tag ID} for djcues tags, looked up in each tag's own
+    column. Errors clearly if the columns haven't been set up yet."""
+    from djcues.tagging import category_of, column_for
+
+    ids = {}
+    rows = list(db.get_my_tag())
+    for name in names:
+        category = category_of(name)
+        if category is None:
+            all_tags = [t for c in TAG_CATALOG for t in c.tags]
+            click.echo(f"Error: unknown tag '{name}'. Choose from: {', '.join(all_tags)}.", err=True)
+            raise SystemExit(1)
+        column_id = column_for(category).category_id
+        row = next((r for r in rows if r.Name == name and str(r.ParentID) == column_id), None)
+        if row is None:
+            click.echo(f"Error: tag '{name}' isn't in Rekordbox yet -- run `djcues tags apply` "
+                       "on a session first (it sets up the My Tag columns).", err=True)
+            raise SystemExit(1)
+        ids[name] = str(row.ID)
+    return ids
+
+
+@tags.command("smartlist")
+@click.argument("name")
+@click.option("--with", "with_tags", multiple=True, help="Tag the tracks must have (repeatable).")
+@click.option("--without", "without_tags", multiple=True,
+              help="Tag the tracks must NOT have (repeatable; only with --match all).")
+@click.option("--match", type=click.Choice(["all", "any"]), default="all", show_default=True,
+              help="all = every condition must hold; any = at least one.")
+@click.option("--folder", default=None, help="Create it inside this existing playlist folder (default: top level).")
+@click.option("--dry-run", is_flag=True, help="Show the conditions, matching tracks and XML without writing.")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def tags_smartlist(name, with_tags, without_tags, match, folder, dry_run, yes):
+    """Create a Rekordbox Intelligent Playlist from djcues tags.
+
+    It updates itself in Rekordbox as tags change. Example:
+
+      djcues tags smartlist "Peak, easy in" --with "Energy 5" --with "Long Intro" --without "Vocal Intro"
+
+    Rekordbox must be closed; master.db and masterPlaylists6.xml are
+    backed up first. Read-only with --dry-run.
+    """
+    from djcues.db import read_tag_links
+    from djcues.tag_smartlist import (
+        MATCH_ALL,
+        MATCH_ANY,
+        TagCondition,
+        build_smartlist_xml,
+        matching_tracks,
+    )
+    from djcues.writer import PlaylistWriteError, create_tag_smart_playlist
+
+    if not with_tags and not without_tags:
+        click.echo("Error: give at least one --with or --without tag.", err=True)
+        raise SystemExit(1)
+    if without_tags and match == "any":
+        click.echo("Error: --without only makes sense with --match all.", err=True)
+        raise SystemExit(1)
+
+    db = get_db()
+    ids = _resolve_tag_ids(db, list(with_tags) + list(without_tags))
+    conditions = [TagCondition(ids[t], t, True) for t in with_tags] + [
+        TagCondition(ids[t], t, False) for t in without_tags
+    ]
+    match_code = MATCH_ALL if match == "all" else MATCH_ANY
+
+    folder_id = None
+    if folder is not None:
+        folder_row = find_playlist(folder, db)
+        if folder_row is None or folder_row.Attribute != 1:
+            click.echo(f"Error: '{folder}' is not an existing playlist folder.", err=True)
+            raise SystemExit(1)
+        folder_id = str(folder_row.ID)
+
+    contents = list(db.get_content())
+    titles = {str(c.ID): c.Title for c in contents}
+    hits = matching_tracks(read_tag_links(db=db), conditions, match_code, list(titles))
+
+    joiner = " AND " if match == "all" else " OR "
+    rule = joiner.join(f"{'has' if c.present else 'not'} '{c.tag_name}'" for c in conditions)
+    click.echo(f"Intelligent Playlist '{name}': {rule}")
+    click.echo(f"  Matches {len(hits)} track(s) right now:")
+    for track_id in hits[:15]:
+        click.echo(f"    {titles[track_id]}")
+    if len(hits) > 15:
+        click.echo(f"    ... and {len(hits) - 15} more")
+
+    if dry_run:
+        # The real ID is only known once Rekordbox's row exists.
+        xml_text = build_smartlist_xml(1, conditions, match_code).replace('Id="1"', 'Id="<new playlist id>"', 1)
+        click.echo(f"\n  XML: {xml_text}")
+        click.echo("Dry run -- nothing written.")
+        return
+    if not yes and not click.confirm(
+        "\nCreate this Intelligent Playlist in Rekordbox? (Rekordbox must be closed; master.db is backed up first)"
+    ):
+        click.echo("Aborted.")
+        return
+
+    try:
+        playlist_id = create_tag_smart_playlist(name, conditions, match_code, folder_id=folder_id, db=db)
+    except (PlaylistWriteError, ValueError) as e:
+        click.echo(f"Error: {e}", err=True)
+        raise SystemExit(1)
+    click.echo(f"Created Intelligent Playlist '{name}' (ID {playlist_id}).")

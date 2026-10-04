@@ -757,3 +757,143 @@ def apply_tag_changes(changes: list[dict], *, db=None) -> dict:
         db.rollback()
         raise
     return {"added": added, "removed": removed, "backup": backup_path}
+
+# --- Intelligent Playlists from djcues tags ----------------------------------
+
+
+def create_tag_smart_playlist(
+    name: str, conditions: list, match: int, *, folder_id=None, db=None,
+):
+    """Create a Rekordbox Intelligent Playlist selecting tracks by djcues
+    My Tags (tag_smartlist.TagCondition list, match ALL/ANY).
+
+    Same envelope as the other playlist writes: Rekordbox must be closed,
+    master.db is backed up first, one commit, rollback on any failure.
+    pyrekordbox creates the playlist row and registers it in
+    masterPlaylists6.xml (which Rekordbox 7 keeps alongside master.db and
+    which this backs up too, since creating a playlist changes it); the
+    SmartList XML is then replaced with tag_smartlist.build_smartlist_xml()
+    because pyrekordbox's own XML doesn't match what Rekordbox writes
+    (see that module). Appended at the end of its folder, so no other
+    playlist is renumbered. Refuses a name already used in that folder.
+    Returns the new playlist's ID.
+    """
+    from pyrekordbox.db6.smartlist import SmartList
+
+    from djcues.db import get_db
+    from djcues.tag_smartlist import build_smartlist_xml
+
+    ensure_rekordbox_closed()
+    db = db if db is not None else get_db()
+
+    parent_id = "root" if folder_id is None else str(folder_id)
+    if folder_id is not None:
+        folder = db.get_playlist(ID=parent_id)
+        if folder is None or folder.Attribute != 1:
+            raise ValueError(f"{folder_id} is not a playlist folder")
+    if any(p.Name == name for p in db.get_playlist(ParentID=parent_id)):
+        raise ValueError(f"a playlist named {name!r} already exists there")
+    build_smartlist_xml("1", conditions, match)  # raises on bad input before any backup
+
+    backup_database(db.db_directory / "master.db")
+    playlists_xml = db.db_directory / "masterPlaylists6.xml"
+    if playlists_xml.exists():
+        shutil.copy2(playlists_xml, playlists_xml.with_name(
+            f"masterPlaylists6-backup-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xml"
+        ))
+
+    try:
+        smart = SmartList(logical_operator=match)
+        for c in conditions:
+            smart.add_condition("myTag", 8 if c.present else 9, value_left=str(c.tag_id))
+        playlist = db.create_smart_playlist(
+            name, smart, parent=None if folder_id is None else parent_id
+        )
+        playlist.SmartList = build_smartlist_xml(playlist.ID, conditions, match)
+        playlist_id = str(playlist.ID)
+        db.commit()
+    except RuntimeError as e:
+        db.rollback()
+        raise RekordboxRunningError(str(e)) from e
+    except Exception:
+        db.rollback()
+        raise
+    return playlist_id
+
+
+# --- Realign First Beat / Loop In cues to bar 1.1 ------------------------
+#
+# Before the bar-1.1 change (see models.BeatGrid), djcues put the First
+# Beat (A) and Loop In (B) cues on the grid's first beat -- 1-3 beats off
+# Rekordbox's own 1.1 on tracks whose grid starts mid-bar. This moves
+# those already-written cues; new proposals are already correct.
+
+
+def plan_bar_one_realignment(db, tolerance_ms: int = 2) -> list[dict]:
+    """Existing djcues cues that sit off bar 1.1.
+
+    Targets every "First Beat" cue (hot A and memory), plus any "Loop In"
+    cue that sits exactly with a First Beat cue of the same track (djcues
+    always places them together; a Loop In you moved yourself is left
+    alone). A loop keeps its length. Read-only.
+    """
+    from collections import defaultdict
+
+    from djcues.db import _extract_beat_grid
+
+    by_track: dict[str, list] = defaultdict(list)
+    for cue in db.get_cue():
+        by_track[str(cue.ContentID)].append(cue)
+
+    changes: list[dict] = []
+    for content_id, cues in by_track.items():
+        first_beats = [c for c in cues if c.Comment == "First Beat"]
+        if not first_beats:
+            continue
+        content = db.get_content(ID=int(content_id))
+        try:
+            grid = _extract_beat_grid(content, db)
+        except Exception:
+            continue
+        if grid.bpm <= 0 or grid.first_downbeat_beat == 1:
+            continue
+        bar_one = int(round(grid.bar_one_ms))
+        anchors = [c.InMsec for c in first_beats]
+        targets = list(first_beats) + [
+            c for c in cues
+            if c.Comment == "Loop In" and any(abs(c.InMsec - a) <= tolerance_ms for a in anchors)
+        ]
+        for cue in targets:
+            if abs(cue.InMsec - bar_one) <= tolerance_ms:
+                continue
+            new_out = cue.OutMsec
+            if cue.OutMsec is not None and cue.OutMsec > 0:
+                new_out = bar_one + (cue.OutMsec - cue.InMsec)
+            changes.append({
+                "cue": cue, "title": content.Title, "label": cue.Comment,
+                "hot": cue.Kind > 0, "old_in": cue.InMsec, "new_in": bar_one,
+                "old_out": cue.OutMsec, "new_out": new_out,
+            })
+    return changes
+
+
+def apply_bar_one_realignment(changes: list[dict], *, db) -> int:
+    """Write plan_bar_one_realignment's changes in place (cue IDs kept):
+    closed check -> backup -> one transaction -> rollback on any failure.
+    Returns the number of cues moved."""
+    if not changes:
+        return 0
+    ensure_rekordbox_closed()
+    backup_path = backup_database(db.db_directory / "master.db")
+    try:
+        for c in changes:
+            c["cue"].InMsec = c["new_in"]
+            c["cue"].OutMsec = c["new_out"]
+        db.commit()
+    except RuntimeError as e:
+        db.rollback()
+        raise RekordboxRunningError(str(e)) from e
+    except Exception:
+        db.rollback()
+        raise
+    return len(changes)

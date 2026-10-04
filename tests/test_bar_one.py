@@ -217,3 +217,62 @@ def test_review_session_and_html_carry_bar_one():
     assert 'data-bar-one-ms="1500.0"' in page
     # Bar numbering in the editor counts from 1.1
     assert "function msToBar(ms, barOneMs, msPerBeat)" in page
+
+
+# --- realigning cues djcues already wrote -----------------------------------
+
+
+def _cue(kind, comment, in_ms, out_ms=-1, content_id="1"):
+    return SimpleNamespace(ContentID=content_id, Kind=kind, Comment=comment, InMsec=in_ms, OutMsec=out_ms)
+
+
+def _realign_db(cues, grid):
+    from unittest.mock import MagicMock
+
+    db = MagicMock()
+    db.get_cue.return_value = cues
+    db.get_content.return_value = SimpleNamespace(Title="t")
+    return db, grid
+
+
+def test_realign_moves_first_beat_and_loop_in_keeping_loop_length(monkeypatch):
+    from djcues import db as db_module
+    from djcues.writer import plan_bar_one_realignment
+
+    grid = _grid()  # 1.1 = 1500ms
+    cues = [
+        _cue(1, "First Beat", 500), _cue(0, "First Beat", 500),
+        _cue(2, "Loop In", 500, 4500), _cue(0, "Loop In", 500, 4500),
+        _cue(3, "Drop", 20000),
+    ]
+    db, _ = _realign_db(cues, grid)
+    monkeypatch.setattr(db_module, "_extract_beat_grid", lambda content, db=None: grid)
+    changes = plan_bar_one_realignment(db)
+    assert len(changes) == 4  # the Drop is untouched
+    assert {c["new_in"] for c in changes} == {1500}
+    loops = [c for c in changes if c["label"] == "Loop In"]
+    assert {(c["new_in"], c["new_out"]) for c in loops} == {(1500, 5500)}  # still 4000ms long
+
+
+def test_realign_leaves_a_loop_in_the_user_moved_and_grids_that_start_on_a_bar(monkeypatch):
+    from djcues import db as db_module
+    from djcues.writer import plan_bar_one_realignment
+
+    grid = _grid()
+    db, _ = _realign_db([_cue(1, "First Beat", 500), _cue(2, "Loop In", 9000, 13000)], grid)
+    monkeypatch.setattr(db_module, "_extract_beat_grid", lambda content, db=None: grid)
+    assert [c["label"] for c in plan_bar_one_realignment(db)] == ["First Beat"]
+
+    on_bar = _grid(first_downbeat_beat=1)
+    monkeypatch.setattr(db_module, "_extract_beat_grid", lambda content, db=None: on_bar)
+    assert plan_bar_one_realignment(db) == []
+
+
+def test_realign_is_a_noop_once_cues_are_on_bar_one(monkeypatch):
+    from djcues import db as db_module
+    from djcues.writer import plan_bar_one_realignment
+
+    grid = _grid()
+    db, _ = _realign_db([_cue(1, "First Beat", 1500), _cue(2, "Loop In", 1501, 5500)], grid)
+    monkeypatch.setattr(db_module, "_extract_beat_grid", lambda content, db=None: grid)
+    assert plan_bar_one_realignment(db) == []

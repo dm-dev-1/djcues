@@ -332,9 +332,18 @@ class TestTagWriteIntegration:
 
         from djcues.tagging import REKORDBOX_DEFAULT_TAGS
 
+        # The live library may already have had its defaults tidied away by
+        # a real apply, so recreate two in the copy: one a track will use,
+        # one nothing uses.
+        for name in ("Peak Time", "Lounge"):
+            if not any(t.Name == name for t in db_copy.get_my_tag()):
+                db_copy.add(tables.DjmdMyTag.create(
+                    ID=str(db_copy.generate_unused_id(tables.DjmdMyTag, is_28_bit=False)),
+                    Seq=50, Name=name, Attribute=0, ParentID="3", UUID=str(uuid4()),
+                ))
+                db_copy.flush()
+        db_copy.commit()
         tags = {t.Name: t for t in db_copy.get_my_tag()}
-        if "Peak Time" not in tags:
-            pytest.skip("this library's Situation column no longer has Rekordbox's defaults")
         content_id = str(next(iter(db_copy.get_content())).ID)
         # A default tag that a track uses, and a tag the user created.
         db_copy.add(tables.DjmdSongMyTag.create(

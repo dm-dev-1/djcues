@@ -13,6 +13,7 @@ Read-only with respect to Rekordbox: nothing here writes to master.db.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable
 
@@ -58,8 +59,24 @@ def playlist_contents(db: Any, playlist_id: Any) -> list[Any]:
     return [s.Content for s in songs if s.Content is not None]
 
 
-def library_contents(db: Any) -> list[Any]:
-    return list(db.get_content())
+def library_contents(db: Any, under: str | None = None) -> list[Any]:
+    contents = list(db.get_content())
+    return contents if under is None else contents_under(contents, under)
+
+
+def contents_under(contents: list[Any], folder: str) -> list[Any]:
+    """Only the local files inside folder (at any depth). Streaming-linked
+    tracks (FolderPath like 'spotify:track:...') never match."""
+    base = os.path.normcase(os.path.normpath(folder))
+    kept = []
+    for c in contents:
+        path = c.FolderPath or ""
+        if not path:
+            continue
+        p = os.path.normcase(os.path.normpath(path))
+        if p.startswith(base.rstrip(os.sep) + os.sep):
+            kept.append(c)
+    return kept
 
 
 def collect_features(
@@ -119,11 +136,13 @@ def calibrate_library(
     thresholds: TagThresholds = DEFAULT_THRESHOLDS,
     use_cache: bool = True,
     progress: ProgressFn | None = None,
+    under: str | None = None,
 ) -> tuple[Calibration, FeatureRun]:
     """Compute and store library-wide energy cutpoints over every
-    eligible track (not a loop/sample, has energy data). Raises
-    ValueError if too few tracks are eligible (tagging.MIN_CALIBRATION_TRACKS)."""
-    run = collect_features(library_contents(db), db, store, use_cache=use_cache, progress=progress)
+    eligible track (not a loop/sample, has energy data), or only those
+    inside the folder `under`. Raises ValueError if too few tracks are
+    eligible (tagging.MIN_CALIBRATION_TRACKS)."""
+    run = collect_features(library_contents(db, under), db, store, use_cache=use_cache, progress=progress)
     eligible = [f for f in run.features.values() if is_calibration_eligible(f, thresholds)]
     cutpoints = compute_energy_cutpoints(f.mean_energy for f in eligible)
     n_excluded = len(run.features) - len(eligible)
