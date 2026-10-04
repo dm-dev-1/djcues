@@ -611,51 +611,100 @@ class TagWriteError(PlaylistWriteError):
     """A My Tag write couldn't proceed (missing column, unknown tag...)."""
 
 
-def ensure_tag_columns(db) -> dict[str, str]:
-    """Rename Rekordbox's 4 My Tag columns to djcues's names and make sure
-    every catalog tag exists in its column. Stages only -- the caller
-    commits. Returns {tag name: My Tag ID}.
+def plan_tag_columns(db) -> list[dict]:
+    """What ensure_tag_columns() would do, without staging anything --
+    so a dry run can show it, from the very same logic the real write
+    uses (ensure_tag_columns() executes this plan; the two can't drift).
 
-    Never removes anything: Rekordbox's default tags (and any the user
-    created) stay where they are.
+    One dict per column: {"column": row, "catalog": [djcues tag names
+    for this column], "rename_to": str | None, "remove": [default tag
+    rows with no tracks], "create": [catalog tag names missing],
+    "kept": [rows staying, in Seq order]}.
+
+    Removal is deliberately narrow: only names in
+    tagging.REKORDBOX_DEFAULT_TAGS for that column, and only while they
+    have zero links. A default tag on even one track, and every tag the
+    user created, is left exactly as it is.
     """
-    from pyrekordbox.db6 import tables
-
-    from djcues.tagging import REKORDBOX_COLUMNS, TAG_CATALOG
+    from djcues.tagging import REKORDBOX_COLUMNS, REKORDBOX_DEFAULT_TAGS, TAG_CATALOG
 
     rows = list(db.get_my_tag())
     by_id = {str(r.ID): r for r in rows}
+    linked = {str(link.MyTagID) for link in db.get_my_tag_songs()}
     tags_by_name = {cat.name: cat.tags for cat in TAG_CATALOG}
-    ids: dict[str, str] = {}
 
+    plan = []
     for col in REKORDBOX_COLUMNS:
         column = by_id.get(col.category_id)
         if column is None or column.Attribute != 1:
             raise TagWriteError(
                 f"My Tag column {col.category_id} ({col.default_name}) not found in this library"
             )
-        if column.Name != col.name:
-            column.Name = col.name
-        children = [r for r in rows if str(r.ParentID) == col.category_id and r.Attribute == 0]
-        existing = {r.Name: r for r in children}
-        next_seq = max((r.Seq or 0 for r in children), default=0) + 1
-        for category in col.categories:
-            for tag in tags_by_name[category]:
-                row = existing.get(tag)
-                if row is None:
-                    row = tables.DjmdMyTag.create(
-                        ID=str(db.generate_unused_id(tables.DjmdMyTag, is_28_bit=False)),
-                        Seq=next_seq,
-                        Name=tag,
-                        Attribute=0,
-                        ParentID=col.category_id,
-                        UUID=str(uuid4()),
-                    )
-                    db.add(row)
-                    db.flush()  # so the next generate_unused_id() sees this ID as taken
-                    next_seq += 1
-                    existing[tag] = row
-                ids[tag] = str(row.ID)
+        children = sorted(
+            (r for r in rows if str(r.ParentID) == col.category_id and r.Attribute == 0),
+            key=lambda r: (r.Seq or 0),
+        )
+        defaults = set(REKORDBOX_DEFAULT_TAGS.get(col.category_id, ()))
+        remove = [r for r in children if r.Name in defaults and str(r.ID) not in linked]
+        kept = [r for r in children if r not in remove]
+        present = {r.Name for r in kept}
+        catalog = [t for c in col.categories for t in tags_by_name[c]]
+        create = [t for t in catalog if t not in present]
+        plan.append({
+            "column": column,
+            "catalog": catalog,
+            "rename_to": col.name if column.Name != col.name else None,
+            "remove": remove,
+            "create": create,
+            "kept": kept,
+        })
+    return plan
+
+
+def ensure_tag_columns(db) -> dict[str, str]:
+    """Set up Rekordbox's 4 My Tag columns for djcues (see
+    plan_tag_columns() for exactly what changes). Stages only -- the
+    caller commits. Returns {tag name: My Tag ID}.
+
+    Per column: rename it (Genre -> Energy, ...), remove the unused
+    Rekordbox default tags in it (the user agreed to this when choosing
+    to repurpose the columns), create missing catalog tags, then
+    renumber Seq gap-free. Rekordbox itself hard-deletes a tag row (no
+    rb_local_deleted flag) -- confirmed by a before/after diff of the
+    user deleting one in the app -- which is what db.delete() does, and
+    renumbered the remaining playlists' Seq gap-free after a playlist
+    delete in that same diff.
+    """
+    from pyrekordbox.db6 import tables
+
+    ids: dict[str, str] = {}
+    for col in plan_tag_columns(db):
+        column = col["column"]
+        if col["rename_to"]:
+            column.Name = col["rename_to"]
+        for row in col["remove"]:
+            db.delete(row)
+        kept = list(col["kept"])
+        for tag in col["create"]:
+            row = tables.DjmdMyTag.create(
+                ID=str(db.generate_unused_id(tables.DjmdMyTag, is_28_bit=False)),
+                Seq=len(kept) + 1,
+                Name=tag,
+                Attribute=0,
+                ParentID=str(column.ID),
+                UUID=str(uuid4()),
+            )
+            db.add(row)
+            db.flush()  # so the next generate_unused_id() sees this ID as taken
+            kept.append(row)
+        catalog = set(col["catalog"])
+        for seq, row in enumerate(kept, start=1):
+            if row.Seq != seq:
+                row.Seq = seq
+            # Only djcues's own tags -- a user tag that happens to share a
+            # catalog name in another column must never be mistaken for it.
+            if row.Name in catalog:
+                ids[row.Name] = str(row.ID)
     return ids
 
 

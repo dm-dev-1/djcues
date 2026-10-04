@@ -335,8 +335,9 @@ def fake_rekordbox_tags(monkeypatch):
     from djcues import db as db_module
     from djcues import writer
 
-    state = SimpleNamespace(links=[], writes=[])
+    state = SimpleNamespace(links=[], writes=[], column_plan=[])
     monkeypatch.setattr(db_module, "read_tag_links", lambda ids=None, db=None: list(state.links))
+    monkeypatch.setattr(writer, "plan_tag_columns", lambda db: list(state.column_plan))
     monkeypatch.setattr(
         writer, "apply_tag_changes",
         lambda changes, db=None: state.writes.append(changes)
@@ -422,3 +423,21 @@ def test_status_after_apply_and_a_user_edit(env, runner, fake_rekordbox_tags):
     assert result.exit_code == 0, result.output
     assert "djcues has tagged 10 track(s)" in result.output
     assert "track 10 [Energy]: djcues wrote ['Energy 5'], now ['Energy 1']" in result.output
+
+
+def test_apply_shows_the_column_setup_before_the_first_write(env, runner, fake_rekordbox_tags):
+    session = _write_session(env, runner)
+    fake_rekordbox_tags.column_plan = [{
+        "column": SimpleNamespace(Name="Genre"), "catalog": [], "rename_to": "Energy",
+        "remove": [SimpleNamespace(Name="Acid House"), SimpleNamespace(Name="Techno")],
+        "create": ["Energy 1", "Energy 2"], "kept": [],
+    }]
+    result = runner.invoke(cli, ["tags", "apply", str(session), "--dry-run"])
+    assert "My Tag columns will be set up first:" in result.output
+    assert "rename 'Genre' -> 'Energy'; add 2 tag(s); remove unused Rekordbox defaults: Acid House, Techno" in result.output
+
+
+def test_apply_says_nothing_about_columns_once_they_are_set_up(env, runner, fake_rekordbox_tags):
+    session = _write_session(env, runner)
+    result = runner.invoke(cli, ["tags", "apply", str(session), "--dry-run"])
+    assert "columns will be set up" not in result.output

@@ -456,6 +456,26 @@ def _plan_line(plan) -> str:
     return "  ".join(parts)
 
 
+def _column_setup_lines(db) -> list[str]:
+    """Human-readable summary of writer.plan_tag_columns() -- empty once
+    the columns are already set up."""
+    from djcues.writer import plan_tag_columns
+
+    lines = []
+    for col in plan_tag_columns(db):
+        parts = []
+        if col["rename_to"]:
+            parts.append(f"rename '{col['column'].Name}' -> '{col['rename_to']}'")
+        if col["create"]:
+            parts.append(f"add {len(col['create'])} tag(s)")
+        if col["remove"]:
+            names = ", ".join(r.Name for r in col["remove"])
+            parts.append(f"remove unused Rekordbox defaults: {names}")
+        if parts:
+            lines.append("; ".join(parts))
+    return lines
+
+
 @tags.command("apply")
 @click.argument("session_file", type=click.Path(exists=True, dir_okay=False))
 @click.option("--dry-run", is_flag=True, help="Show exactly what would change without writing anything.")
@@ -501,6 +521,11 @@ def tags_apply(session_file, dry_run, force, yes):
             )
         for p, c in forced:
             click.echo(f"  overwriting your edit (--force): {p.title[:40]} [{c.category}]")
+        column_lines = _column_setup_lines(db) if changing else []
+        if column_lines:
+            click.echo("\n  My Tag columns will be set up first:")
+            for line in column_lines:
+                click.echo(f"    {line}")
         click.echo(f"\n  {len(changing)} track(s) to change: {n_add} tag(s) added, {n_remove} removed; "
                    f"{len(edited)} category edit(s) of yours left alone.")
 

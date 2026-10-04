@@ -324,3 +324,37 @@ class TestTagWriteIntegration:
         db_copy.commit()
         assert first == second
         assert len(list(db_copy.get_my_tag())) == n_tags  # nothing duplicated
+
+    def test_unused_defaults_are_removed_but_used_ones_and_user_tags_kept(self, db_copy):
+        from uuid import uuid4
+
+        from pyrekordbox.db6 import tables
+
+        from djcues.tagging import REKORDBOX_DEFAULT_TAGS
+
+        tags = {t.Name: t for t in db_copy.get_my_tag()}
+        if "Peak Time" not in tags:
+            pytest.skip("this library's Situation column no longer has Rekordbox's defaults")
+        content_id = str(next(iter(db_copy.get_content())).ID)
+        # A default tag that a track uses, and a tag the user created.
+        db_copy.add(tables.DjmdSongMyTag.create(
+            ID=str(uuid4()), MyTagID=str(tags["Peak Time"].ID), ContentID=content_id,
+            TrackNo=None, UUID=str(uuid4()),
+        ))
+        db_copy.add(tables.DjmdMyTag.create(
+            ID="123456789", Seq=99, Name="my own tag", Attribute=0, ParentID="3", UUID=str(uuid4()),
+        ))
+        db_copy.commit()
+
+        writer.ensure_tag_columns(db_copy)
+        db_copy.commit()
+
+        after = list(db_copy.get_my_tag())
+        names = {t.Name for t in after}
+        assert "Peak Time" in names           # default, but in use -> kept
+        assert "my own tag" in names          # user's own -> kept
+        unused_defaults = set(REKORDBOX_DEFAULT_TAGS["3"]) - {"Peak Time"}
+        assert not (unused_defaults & names)  # unused defaults -> removed
+        for column in ("1", "2", "3", "4"):
+            seqs = sorted(t.Seq for t in after if str(t.ParentID) == column and t.Attribute == 0)
+            assert seqs == list(range(1, len(seqs) + 1))  # gap-free, like Rekordbox
