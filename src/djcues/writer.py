@@ -1000,3 +1000,31 @@ def apply_loop_out_realignment(changes: list[dict], *, db) -> int:
         db.rollback()
         raise
     return len(changes)
+
+
+def plan_pre_bar_one_buildup(db, tolerance_ms: int = 2) -> list[dict]:
+    """Memory "Buildup" cues sitting before bar 1.1 on mid-bar grids -- the
+    old code clamped them to the grid's first beat; they belong on 1.1.
+    Same change shape as plan_bar_one_realignment, so
+    apply_bar_one_realignment writes them. Read-only."""
+    from djcues.db import _extract_beat_grid
+
+    changes: list[dict] = []
+    for cue in db.get_cue():
+        if cue.Comment != "Buildup" or cue.Kind != 0:
+            continue
+        content = db.get_content(ID=int(cue.ContentID))
+        try:
+            grid = _extract_beat_grid(content, db)
+        except Exception:
+            continue
+        if grid.bpm <= 0 or grid.first_downbeat_beat == 1:
+            continue
+        bar_one = int(round(grid.bar_one_ms))
+        if cue.InMsec < bar_one - tolerance_ms:
+            changes.append({
+                "cue": cue, "title": content.Title, "label": cue.Comment, "hot": False,
+                "old_in": cue.InMsec, "new_in": bar_one,
+                "old_out": cue.OutMsec, "new_out": cue.OutMsec,
+            })
+    return changes
