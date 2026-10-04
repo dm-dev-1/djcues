@@ -339,7 +339,8 @@ def _shape_proposal_for_cache(proposal, refinements=None):
     _apply_cache) records what --refine-drops actually found, so a
     future `cache status`-style inspection isn't blind to it."""
     positions = {KIND_TO_PAD.get(c.kind, str(c.kind)): c.position_ms for c in proposal.hot_cues}
-    result = {"positions": positions, "confidence": proposal.confidence, "notes": proposal.notes}
+    result = {"positions": positions, "confidence": proposal.confidence, "notes": proposal.notes,
+              "loop_bars": loop_bars_by_pad(proposal.hot_cues, proposal.track)}
     if refinements:
         result["refinements"] = [
             {
@@ -359,7 +360,8 @@ def _rehydrate_proposal(result, track, offset, loop_bars):
     memory-cue offset/loop math stays consistent instead of being
     hand-rolled a second time."""
     hot_cues, memory_cues = build_cue_points(
-        result["positions"], result["confidence"], track, offset, loop_bars
+        result["positions"], result["confidence"], track, offset, loop_bars,
+        loop_bars_by_pad=result.get("loop_bars"),
     )
     return CueProposal(
         track=track, hot_cues=hot_cues, memory_cues=memory_cues,
@@ -2221,3 +2223,7 @@ def transition(playlist_name, min_vocal_region_ms):
 from djcues.tags_cli import tags  # noqa: E402
 
 cli.add_command(tags)
+
+from djcues.loopout_cli import loopout  # noqa: E402
+
+cli.add_command(loopout)

@@ -897,3 +897,106 @@ def apply_bar_one_realignment(changes: list[dict], *, db) -> int:
         db.rollback()
         raise
     return len(changes)
+
+
+# --- Re-place Loop Out cues with the drums-no-vocals search --------------
+#
+# Moves Loop Out cues djcues wrote under the old rule (Outro marker, 4
+# bars) to loop_out.find_loop_out()'s choice. Conservative on purpose: a
+# loop you moved or resized yourself, and tracks where the search found no
+# clean drums-only stretch, are left exactly as they are.
+
+
+def plan_loop_out_realignment(db, under: str | None = None, tolerance_ms: int = 2) -> dict:
+    """{"changes": [...], "skipped": {reason: [title, ...]}}. Read-only.
+
+    A track qualifies when its hot and memory "Loop Out" cues still sit
+    exactly where the old rule put them (the first Outro phrase's start,
+    or the last phrase's if there is none; 4 bars long).
+    """
+    from collections import defaultdict
+
+    from djcues.db import load_track
+    from djcues.loop_out import find_loop_out
+
+    by_track: dict[str, list] = defaultdict(list)
+    for cue in db.get_cue():
+        if cue.Comment == "Loop Out":
+            by_track[str(cue.ContentID)].append(cue)
+
+    changes: list[dict] = []
+    skipped: dict[str, list[str]] = defaultdict(list)
+    for content_id, cues in by_track.items():
+        content = db.get_content(ID=int(content_id))
+        if under is not None and not _is_under(content.FolderPath, under):
+            continue
+        title = content.Title
+        try:
+            track = load_track(content, db)
+        except Exception:
+            skipped["unreadable analysis"].append(title)
+            continue
+        if not track.phrases or track.beat_grid.bpm <= 0:
+            skipped["no phrase/tempo data"].append(title)
+            continue
+        outros = [p for p in track.phrases if p.label == "Outro"]
+        old_start = (outros[0] if outros else track.phrases[-1]).position_ms
+        old_len = track.beat_grid.bars_to_ms(4)
+        pristine = all(
+            abs(c.InMsec - old_start) <= tolerance_ms
+            and c.OutMsec is not None and abs((c.OutMsec - c.InMsec) - old_len) <= tolerance_ms + 1
+            for c in cues
+        )
+        if not pristine:
+            skipped["hand-edited or already re-placed"].append(title)
+            continue
+        choice = find_loop_out(track, old_start)
+        if choice is None:
+            skipped["no waveform to search"].append(title)
+            continue
+        if not choice.clean:
+            skipped["no clean drums-only stretch"].append(title)
+            continue
+        new_in = int(round(choice.start_ms))
+        new_out = int(round(choice.start_ms + track.beat_grid.bars_to_ms(choice.bars)))
+        if abs(new_in - cues[0].InMsec) <= tolerance_ms and choice.bars == 4:
+            skipped["already the best loop"].append(title)
+            continue
+        for cue in cues:
+            changes.append({
+                "cue": cue, "title": title, "hot": cue.Kind > 0, "bars": choice.bars,
+                "old_in": cue.InMsec, "new_in": new_in,
+                "old_out": cue.OutMsec, "new_out": new_out, "note": choice.note,
+            })
+    return {"changes": changes, "skipped": dict(skipped)}
+
+
+def _is_under(path: str | None, folder: str) -> bool:
+    import os
+
+    if not path:
+        return False
+    base = os.path.normcase(os.path.normpath(folder)).rstrip(os.sep) + os.sep
+    return os.path.normcase(os.path.normpath(path)).startswith(base)
+
+
+def apply_loop_out_realignment(changes: list[dict], *, db) -> int:
+    """Write plan_loop_out_realignment's changes in place (cue IDs kept):
+    closed check -> backup -> one transaction -> rollback on any failure.
+    Returns the number of cues moved."""
+    if not changes:
+        return 0
+    ensure_rekordbox_closed()
+    backup_database(db.db_directory / "master.db")
+    try:
+        for c in changes:
+            c["cue"].InMsec = c["new_in"]
+            c["cue"].OutMsec = c["new_out"]
+        db.commit()
+    except RuntimeError as e:
+        db.rollback()
+        raise RekordboxRunningError(str(e)) from e
+    except Exception:
+        db.rollback()
+        raise
+    return len(changes)

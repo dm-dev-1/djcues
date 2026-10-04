@@ -109,6 +109,10 @@ class AnalysisKey:
     tolerance_ms: float = 0.0
 
 
+# v2: Loop Out (pad H) is searched for drums instead of fixed at the Outro.
+HEURISTIC_VERSION = "heuristic-v2"
+
+
 def cue_proposal_key(
     *,
     agentic: bool,
@@ -130,7 +134,11 @@ def cue_proposal_key(
         kind="cue_proposal",
         engine="agentic" if agentic else "heuristic",
         provider=(provider or "n/a") if agentic else "n/a",
-        model=(model or "n/a") if agentic else "n/a",
+        # The heuristic has no model, so its algorithm version rides in this
+        # slot: bump HEURISTIC_VERSION when its output changes so cached
+        # proposals from the old logic aren't served (agentic keys are
+        # untouched -- their LLM spend stays cached).
+        model=(model or "n/a") if agentic else HEURISTIC_VERSION,
         skip_critic=bool(skip_critic) if agentic else False,
         refine_drops=bool(refine_drops),
         deep=bool(deep),

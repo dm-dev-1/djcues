@@ -241,12 +241,29 @@ def regions_overlapping(
     return [r for r in regions if r.start_ms < zone_end and r.end_ms > zone_start]
 
 
+def loop_bars_by_pad(hot_cues: list[CuePoint], track: Track) -> dict[str, int]:
+    """Each loop pad's length in bars, read back from already-built hot
+    cues -- so a rebuild via build_cue_points() (drop refinement, cache
+    rehydration) keeps Loop Out's own length instead of resetting it to
+    the global one."""
+    from djcues.constants import KIND_TO_PAD
+
+    bar_ms = track.beat_grid.bars_to_ms(1)
+    out: dict[str, int] = {}
+    for c in hot_cues:
+        pad = KIND_TO_PAD.get(c.kind)
+        if pad is not None and c.loop_end_ms is not None and bar_ms > 0:
+            out[pad] = max(1, round((c.loop_end_ms - c.position_ms) / bar_ms))
+    return out
+
+
 def build_cue_points(
     positions: dict[str, float],
     confidence: dict[str, float],
     track: Track,
     memory_offset_bars: int,
     loop_length_bars: int,
+    loop_bars_by_pad: dict[str, int] | None = None,
 ) -> tuple[list[CuePoint], list[CuePoint]]:
     """Turn a positions/confidence dict into (hot_cues, memory_cues).
 
@@ -255,6 +272,8 @@ def build_cue_points(
     on how a pad/position pair becomes real CuePoint objects. Pads with
     no entry in `positions` are silently skipped, matching the
     heuristic's existing "omit on zero confidence" behavior.
+    loop_bars_by_pad overrides loop_length_bars for individual loop pads
+    (the heuristic gives Loop Out its own length).
     """
     bg = track.beat_grid
     hot_cues: list[CuePoint] = []
@@ -266,9 +285,10 @@ def build_cue_points(
             continue
 
         pos_ms = positions[pad]
+        slot_loop_bars = (loop_bars_by_pad or {}).get(pad, loop_length_bars)
         loop_end = None
         if slot.is_loop:
-            loop_end = pos_ms + bg.bars_to_ms(loop_length_bars)
+            loop_end = pos_ms + bg.bars_to_ms(slot_loop_bars)
 
         hot_cues.append(CuePoint(
             kind=slot.kind,
@@ -296,7 +316,7 @@ def build_cue_points(
 
         mem_loop_end = None
         if slot.is_loop:
-            mem_loop_end = mem_pos + bg.bars_to_ms(loop_length_bars)
+            mem_loop_end = mem_pos + bg.bars_to_ms(slot_loop_bars)
 
         memory_cues.append(CuePoint(
             kind=0,
@@ -539,36 +559,32 @@ class CueStrategy:
             confidence["G"] = 0.0
             notes.append("G (Outro): no phrases at all")
 
-        # --- H: Loop Out (same as Outro) ---
-        # Position-overriding with spectral similarity hurt accuracy (see
-        # _spectral_similarity's docstring) — position stays phrase-anchored.
-        # Used here only to modulate confidence: a clean, stable loop should
-        # have similar spectral content in both halves; a poor match doesn't
-        # mean the position is wrong (it's still anchored to a real Outro),
-        # just that it's less likely to be a clean loop point.
+        # --- H: Loop Out (best drums-no-vocals stretch of the outro) ---
+        # Searched, not fixed at the Outro marker: see loop_out.py. Without
+        # a waveform it can't judge, so it stays at the Outro marker.
+        loop_bars_by_pad: dict[str, int] = {}
         if "G" in positions:
-            positions["H"] = positions["G"]
-            base_confidence = confidence["G"]
-            similarity = None
-            if track.waveform and track.duration_ms > 0:
-                n_wf = len(track.waveform)
-                loop_ms = bg.bars_to_ms(self.loop_length_bars)
-                i0 = int(n_wf * positions["H"] / track.duration_ms)
-                i1 = int(n_wf * (positions["H"] + loop_ms) / track.duration_ms)
-                i_mid = (i0 + i1) // 2
-                if i1 - i0 >= 4:
-                    similarity = _spectral_similarity(track.waveform, i0, i_mid, i1)
-            if similarity is None:
-                confidence["H"] = base_confidence
+            from djcues.loop_out import find_loop_out
+
+            choice = find_loop_out(track, positions["G"])
+            if choice is None:
+                positions["H"] = positions["G"]
+                confidence["H"] = confidence["G"]
+                notes.append("H (Loop Out): same position as Outro (no waveform to search)")
             else:
-                confidence["H"] = base_confidence * (0.5 + 0.5 * similarity)
-            notes.append("H (Loop Out): same position as Outro")
+                positions["H"] = choice.start_ms
+                loop_bars_by_pad["H"] = choice.bars
+                quality = 0.4 + 0.6 * min(1.0, choice.score)
+                confidence["H"] = confidence["G"] * quality * (1.0 if choice.clean else 0.5)
+                flag = "" if choice.clean else " -- no clean drums-only stretch, best available"
+                notes.append(f"H (Loop Out): {choice.note}{flag}")
         else:
             confidence["H"] = 0.0
             notes.append("H (Loop Out): no Outro to anchor from")
 
         hot_cues, memory_cues = build_cue_points(
-            positions, confidence, track, self.memory_offset_bars, self.loop_length_bars
+            positions, confidence, track, self.memory_offset_bars, self.loop_length_bars,
+            loop_bars_by_pad=loop_bars_by_pad,
         )
 
         return CueProposal(

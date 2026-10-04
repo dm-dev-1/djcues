@@ -41,7 +41,7 @@ import numpy as np
 from djcues.audio import AudioExtraUnavailableError, load_audio, resolve_audio_path
 from djcues.constants import KIND_TO_PAD
 from djcues.models import CueProposal, DropRefinement, Track
-from djcues.strategy import build_cue_points
+from djcues.strategy import build_cue_points, loop_bars_by_pad
 
 # None of these are tuned against real data yet -- a documented sketch
 # per the plan, not measured thresholds. There's no automated ground
@@ -423,7 +423,8 @@ def enhance_proposal_drops(
         )
 
     hot_cues, memory_cues = build_cue_points(
-        positions, confidence, track, memory_offset_bars, loop_length_bars
+        positions, confidence, track, memory_offset_bars, loop_length_bars,
+        loop_bars_by_pad=loop_bars_by_pad(proposal.hot_cues, track),
     )
     refined_proposal = CueProposal(
         track=track, hot_cues=hot_cues, memory_cues=memory_cues,
