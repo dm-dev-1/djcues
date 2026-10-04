@@ -36,7 +36,7 @@ class LoopOutThresholds:
     preferred_bars: int = 8
     fallback_bars: int = 4
     max_vocal_overlap: float = 0.05  # fraction of the window; above this the window is rejected
-    min_drum_score: float = 0.25  # mean bar score below this isn't "drums" at all
+    min_drum_score: float = 0.15  # mean bar score below this isn't "drums" at all
     early_bias: float = 0.05  # score discount for the latest start vs the earliest
 
 
