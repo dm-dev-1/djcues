@@ -39,6 +39,18 @@ from djcues.server import _DbWorker
 from djcues.analysis_cache import store_result as _real_store_result
 from tests.conftest import requires_rekordbox
 
+# How long a real dashboard job (its own dedicated Rekordbox6Database
+# connection + real load_playlist_tracks() ANLZ I/O) gets to finish.
+# Deliberately generous: Tech House's 11-track load was measured at
+# ~11.6s on a cold OneDrive/disk file cache vs ~4s warm, so the old 10s
+# deadline was shorter than one cold load. This bounds only how long a
+# genuinely hung job takes to report -- the responsiveness tests' real
+# claim is their separate `elapsed < 1.0` browsing bound, which is
+# deliberately left tight. Loading is kept real (not mocked) because the
+# browsing request lands while the job is mid-load on its dedicated
+# connection, which is the stronger version of what those tests prove.
+REAL_JOB_DEADLINE_S = 60.0
+
 
 # ---------------------------------------------------------------------------
 # Minimal stdlib HTTP client helpers
@@ -1225,7 +1237,9 @@ class TestDashboardHandlerJobs:
         assert status == 400
         assert "deep" in data["error"].lower()
 
-    def _run_job_to_completion(self, base_url: str, track_id: str, body: dict, timeout: float = 20.0) -> dict:
+    def _run_job_to_completion(
+        self, base_url: str, track_id: str, body: dict, timeout: float = REAL_JOB_DEADLINE_S
+    ) -> dict:
         status, data = _post(base_url + f"/api/tracks/{track_id}/jobs", body)
         assert status == 202, data
         job_id = data["job_id"]
@@ -1338,7 +1352,7 @@ class TestDashboardHandlerJobs:
             assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running job"
 
             # Drain the job so the test doesn't leave a stray thread mid-sleep.
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + REAL_JOB_DEADLINE_S
             while time.monotonic() < deadline:
                 status, job = _get(base_url + f"/api/jobs/{job_id}")
                 if job["status"] != "running":
@@ -1935,7 +1949,7 @@ class TestDashboardFlowJobs:
         return tech_house["id"]
 
     def _run_flow_job_to_completion(
-        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = 20.0
+        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = REAL_JOB_DEADLINE_S
     ) -> dict:
         status, data = _post(base_url + f"/api/playlists/{playlist_id}/flow-jobs", body or {})
         assert status == 202, data
@@ -2009,7 +2023,7 @@ class TestDashboardFlowJobs:
             assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running flow job"
 
             # Drain the job so the test doesn't leave a stray thread mid-sleep.
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + REAL_JOB_DEADLINE_S
             job = {}
             while time.monotonic() < deadline:
                 status, job = _get(base_url + f"/api/jobs/{job_id}")
@@ -2037,7 +2051,7 @@ class TestDashboardClashJobs:
         return tech_house["id"]
 
     def _run_clash_job_to_completion(
-        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = 20.0
+        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = REAL_JOB_DEADLINE_S
     ) -> dict:
         status, data = _post(base_url + f"/api/playlists/{playlist_id}/clash-jobs", body or {})
         assert status == 202, data
@@ -2121,7 +2135,7 @@ class TestDashboardClashJobs:
             assert status == 200
             assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running clash job"
 
-            deadline = time.monotonic() + 10
+            deadline = time.monotonic() + REAL_JOB_DEADLINE_S
             job = {}
             while time.monotonic() < deadline:
                 status, job = _get(base_url + f"/api/jobs/{job_id}")
@@ -2147,7 +2161,7 @@ class TestDashboardTransitionJobs:
         return tech_house["id"]
 
     def _run_transition_job_to_completion(
-        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = 20.0
+        self, base_url: str, playlist_id: str, body: dict | None = None, timeout: float = REAL_JOB_DEADLINE_S
     ) -> dict:
         status, data = _post(base_url + f"/api/playlists/{playlist_id}/transition-jobs", body or {})
         assert status == 202, data
@@ -2224,15 +2238,7 @@ class TestDashboardTransitionJobs:
             assert status == 200
             assert elapsed < 1.0, f"browsing blocked for {elapsed:.2f}s behind a running transition job"
 
-            # 20s, not clash's own analogous test's 10s: matches this
-            # class's own _run_transition_job_to_completion default
-            # timeout -- real per-track ANLZ I/O timing on this machine
-            # has been observed to occasionally exceed 10s (confirmed
-            # live: clash's own equivalent test intermittently fails the
-            # same way at 10s), so this uses the more realistic figure
-            # already established elsewhere in this file rather than
-            # inheriting a tight deadline that isn't reliable here.
-            deadline = time.monotonic() + 20
+            deadline = time.monotonic() + REAL_JOB_DEADLINE_S
             job = {}
             while time.monotonic() < deadline:
                 status, job = _get(base_url + f"/api/jobs/{job_id}")

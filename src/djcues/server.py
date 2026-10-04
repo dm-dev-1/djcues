@@ -169,6 +169,7 @@ class _LocalJsonHandler(BaseHTTPRequestHandler):
         from a written .html file -- a different origin from this
         server); same-origin server-served pages (auth-setup, dashboard)
         don't need them and don't send them."""
+        self._drain_unread_body()
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -184,7 +185,25 @@ class _LocalJsonHandler(BaseHTTPRequestHandler):
         """Read and parse the request body as JSON."""
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
+        self._body_consumed = True
         return json.loads(raw) if raw else {}
+
+    def _drain_unread_body(self) -> None:
+        """Consume a request body no handler read (e.g. a POST answered
+        with a 404/400 before _read_body()). On Windows, closing a socket
+        with unread bytes still in its receive buffer sends a RST instead
+        of a FIN, which can reach the client before it has read the
+        response -- measured at ~15% of POSTs to an unknown path failing
+        with ConnectionAbortedError, vs 0% for routes that read the body."""
+        if getattr(self, "_body_consumed", False):
+            return
+        self._body_consumed = True
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            return
+        if length > 0:
+            self.rfile.read(length)
 
 
 class ReviewServer(socketserver.ThreadingMixIn, HTTPServer):
