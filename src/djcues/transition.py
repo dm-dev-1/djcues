@@ -15,12 +15,13 @@ to the database, never places a real cue.
 NOTE on the two anchors:
 - Mix-out point in A is strategy.tail_zone(track_a)[0] -- the same
   Outro-phrase-start anchor pad G and clash.py's tail zone already use.
-- Mix-in point in B is track_b.beat_grid.beat_to_ms(1) -- pad A's own
-  "First Beat" formula, NOT the literal 0.0 that clash.py's head_zone()
-  starts from. head_zone()'s 0.0 start is correct for clash's purpose
-  (a risk *window* that should include any lead-in silence); it is the
-  wrong anchor for "the point a DJ actually cues B in from," which is
-  beat 1 and can sit meaningfully after real lead-in silence.
+- Mix-in point in B is track_b.beat_grid.bar_one_ms -- pad A's own
+  "First Beat" formula (Rekordbox's bar 1.1, the first downbeat), NOT
+  the literal 0.0 that clash.py's head_zone() starts from. head_zone()'s
+  0.0 start is correct for clash's purpose (a risk *window* that should
+  include any lead-in silence); it is the wrong anchor for "the point a
+  DJ actually cues B in from," which is bar 1.1 and can sit
+  meaningfully after real lead-in silence.
 
 NOTE on ordering: suggest_transitions() trusts `tracks`' own list order
 as the playlist's real current order -- it does not re-sort. Getting
@@ -156,8 +157,8 @@ def suggest_transitions(
     2. For each adjacent pair (tracks[i], tracks[i+1]) where NEITHER is
        unscorable:
        - mix_out_ms = tail_zone(track_a)[0] (the Outro-phrase start).
-       - mix_in_ms = track_b.beat_grid.beat_to_ms(1) (pad A's own
-         "First Beat" formula -- NOT head_zone(track_b)'s 0.0 start,
+       - mix_in_ms = track_b.beat_grid.bar_one_ms (pad A's own
+         "First Beat" formula, bar 1.1 -- NOT head_zone(track_b)'s 0.0 start,
          see this module's own docstring for why).
        - a_tail_available_ms = tail_zone(track_a)[1] - mix_out_ms.
        - b_head_available_ms = head_zone(track_b)[1] - mix_in_ms,
@@ -200,7 +201,7 @@ def suggest_transitions(
         a_tail_available_ms = tail_end - mix_out_ms
 
         _head_start, head_end = head_zone(track_b)
-        mix_in_ms = track_b.beat_grid.beat_to_ms(1)
+        mix_in_ms = track_b.beat_grid.bar_one_ms
         b_head_available_ms = max(0.0, head_end - mix_in_ms)
 
         overlap_ms = max(0.0, min(a_tail_available_ms, b_head_available_ms))

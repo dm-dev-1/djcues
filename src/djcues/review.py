@@ -82,6 +82,9 @@ def create_session(
             "has_vocal_data": track.vocal_track is not None,
             "has_waveform_data": track.waveform is not None,
             "first_beat_ms": track.beat_grid.first_beat_ms,
+            # Rekordbox's bar 1.1 (first downbeat) -- the origin for
+            # bar numbering and the floor for memory cues (see BeatGrid).
+            "bar_one_ms": track.beat_grid.bar_one_ms,
             "status": "pending",
             "has_existing_cues": has_existing_cues,
             "cues": cues_dict,
@@ -153,6 +156,7 @@ def render_review_html(
             f'data-track-id="{track.id}" '
             f'data-bpm="{track.bpm}" '
             f'data-first-beat-ms="{track.beat_grid.first_beat_ms}" '
+            f'data-bar-one-ms="{track.beat_grid.bar_one_ms}" '
             f'data-duration-ms="{track.duration_ms}" '
             f'data-has-audio="{str(has_audio).lower()}" '
             f'data-audio-format="{audio_format}" '
@@ -747,6 +751,7 @@ function getSelectedCueInfo() {{
   const trackId = card.getAttribute('data-track-id');
   const bpm = parseFloat(card.getAttribute('data-bpm'));
   const firstBeatMs = parseFloat(card.getAttribute('data-first-beat-ms'));
+  const barOneMs = parseFloat(card.getAttribute('data-bar-one-ms'));
   const durationMs = parseFloat(card.getAttribute('data-duration-ms'));
   const msPerBeat = 60000 / bpm;
   const msPerBar = msPerBeat * 4;
@@ -760,7 +765,7 @@ function getSelectedCueInfo() {{
   const cueInfo = cuesData[pad];
   if (!cueInfo) return null;
 
-  return {{ card, trackId, bpm, firstBeatMs, durationMs, msPerBeat, msPerBar, pad, cuesData, cueInfo, marker: selectedMarker }};
+  return {{ card, trackId, bpm, firstBeatMs, barOneMs, durationMs, msPerBeat, msPerBar, pad, cuesData, cueInfo, marker: selectedMarker }};
 }}
 
 // The one place a cue's position actually gets moved: updates the
@@ -933,25 +938,27 @@ function parseTimeInput(str) {{
   return (parseInt(m[1], 10) * 60 + parseFloat(m[2])) * 1000;
 }}
 
-function msToBar(ms, firstBeatMs, msPerBeat) {{
-  const beat = Math.max(1, Math.round((ms - firstBeatMs) / msPerBeat + 1));
-  return Math.floor((beat - 1) / 4) + 1;
+// Bars are numbered from Rekordbox's 1.1 (the first downbeat), which is
+// not the grid's first beat when the grid starts mid-bar -- matches the
+// bar counter Rekordbox itself shows.
+function msToBar(ms, barOneMs, msPerBeat) {{
+  const beatOffset = Math.round((ms - barOneMs) / msPerBeat);
+  return Math.max(1, Math.floor(beatOffset / 4) + 1);
 }}
 
-function barToMs(bar, firstBeatMs, msPerBeat) {{
-  const beat = (bar - 1) * 4 + 1;
-  return firstBeatMs + (beat - 1) * msPerBeat;
+function barToMs(bar, barOneMs, msPerBeat) {{
+  return barOneMs + (bar - 1) * 4 * msPerBeat;
 }}
 
 function syncEditorFields(cueInfo, card) {{
   const popover = document.getElementById('cue-editor-popover');
   if (popover.classList.contains('hidden') || selectedTrackCard !== card) return;
-  const firstBeatMs = parseFloat(card.getAttribute('data-first-beat-ms'));
+  const barOneMs = parseFloat(card.getAttribute('data-bar-one-ms'));
   const bpm = parseFloat(card.getAttribute('data-bpm'));
   const msPerBeat = 60000 / bpm;
   const barEl = document.getElementById('editor-bar');
   const timeEl = document.getElementById('editor-time');
-  barEl.value = msToBar(cueInfo.position_ms, firstBeatMs, msPerBeat);
+  barEl.value = msToBar(cueInfo.position_ms, barOneMs, msPerBeat);
   timeEl.value = formatMsAsTime(cueInfo.position_ms);
   // Setting .value programmatically doesn't fire 'input', so any
   // leftover invalid-state styling from a previous bad entry has to be
@@ -1025,7 +1032,7 @@ document.getElementById('editor-bar').addEventListener('keydown', function(e) {{
   const bar = parseBarInput(this.value);
   if (bar === null) {{ this.classList.add('invalid'); return; }}
   this.classList.remove('invalid');
-  const newMs = barToMs(bar, info.firstBeatMs, info.msPerBeat);
+  const newMs = barToMs(bar, info.barOneMs, info.msPerBeat);
   applyCueMove(info.card, info.trackId, info.pad, info.marker, newMs, info.cuesData, info.cueInfo);
 }});
 

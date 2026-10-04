@@ -197,12 +197,15 @@ def find_playlist_song_entries(
 
 
 def _extract_beat_grid(track_content: Any, db: Rekordbox6Database | None = None) -> BeatGrid:
-    """Extract BPM and first beat position from a track's analysis files."""
+    """Extract BPM, first beat position, and which grid beat is
+    Rekordbox's bar 1.1 (see BeatGrid's docstring) from a track's
+    analysis files."""
     db = db if db is not None else get_db()
     bpm = track_content.BPM / 100
 
     # Try to get first beat from ANLZ beat grid
     first_beat_ms = 0.0
+    first_downbeat_beat = 1
     try:
         anlz_files = db.read_anlz_files(track_content)
         for path, af in anlz_files.items():
@@ -213,11 +216,15 @@ def _extract_beat_grid(track_content: Any, db: Rekordbox6Database | None = None)
                         if len(times) > 0:
                             # times are in seconds, convert to ms
                             first_beat_ms = float(times[0]) * 1000
+                            beats = tag.get_beats()
+                            first_downbeat_beat = next(
+                                (i + 1 for i, b in enumerate(beats) if int(b) == 1), 1
+                            )
                         break
     except Exception as e:
         logger.warning("Could not read beat grid for %s: %s", track_content.Title, e)
 
-    return BeatGrid(first_beat_ms=first_beat_ms, bpm=bpm)
+    return BeatGrid(first_beat_ms=first_beat_ms, bpm=bpm, first_downbeat_beat=first_downbeat_beat)
 
 
 def extract_raw_beat_grid(

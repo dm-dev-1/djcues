@@ -512,8 +512,11 @@ class ReviewHandler(_LocalJsonHandler):
                         bpm = tdata.get("bpm", 128.0)
                         bar_ms = (60_000 / bpm) * 4
                         mem_pos = new_position - offset_bars * bar_ms
-                        first_beat = tdata.get("first_beat_ms", 0)
-                        mc["position_ms"] = max(mem_pos, first_beat)
+                        # Floor at Rekordbox's bar 1.1; older session
+                        # files predate bar_one_ms and only carry the
+                        # grid's first beat.
+                        bar_one = tdata.get("bar_one_ms", tdata.get("first_beat_ms", 0))
+                        mc["position_ms"] = max(mem_pos, bar_one)
                         mc["loop_end_ms"] = None
                     mc["status"] = "auto"
 

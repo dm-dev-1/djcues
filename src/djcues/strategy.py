@@ -284,14 +284,15 @@ def build_cue_points(
             mem_pos = pos_ms
         else:
             mem_pos = pos_ms - bg.bars_to_ms(memory_offset_bars)
-            first_beat_ms = bg.beat_to_ms(1)
-            if mem_pos < first_beat_ms:
-                mem_pos = first_beat_ms
+            # Bars count from Rekordbox's 1.1, not the grid's first beat
+            # (see BeatGrid) -- clamping to / snapping from beat 1 put
+            # memory cues 1-3 beats off the bar on mid-bar-start grids.
+            bar_one_ms = bg.bar_one_ms
+            if mem_pos < bar_one_ms:
+                mem_pos = bar_one_ms
             else:
                 # Snap to nearest downbeat (bar start)
-                mem_beat = bg.ms_to_beat(mem_pos)
-                bar_beat = ((mem_beat - 1) // 4) * 4 + 1
-                mem_pos = bg.beat_to_ms(bar_beat)
+                mem_pos = bg.beat_to_ms(bg.bar_start_beat(bg.ms_to_beat(mem_pos)))
 
         mem_loop_end = None
         if slot.is_loop:
@@ -331,9 +332,16 @@ class CueStrategy:
         positions: dict[str, float] = {}
 
         # --- A: First Beat ---
-        positions["A"] = bg.beat_to_ms(1)
+        # Rekordbox's bar 1.1 -- the first downbeat, which is the grid's
+        # first beat only when the grid starts on a bar (see BeatGrid).
+        positions["A"] = bg.bar_one_ms
         confidence["A"] = 1.0
-        notes.append("A (First Beat): beat 1")
+        if bg.first_downbeat_beat == 1:
+            notes.append("A (First Beat): bar 1.1")
+        else:
+            notes.append(
+                f"A (First Beat): bar 1.1 (grid starts mid-bar; 1.1 is grid beat {bg.first_downbeat_beat})"
+            )
 
         # --- B: Loop In (same as First Beat) ---
         # Data shows 88% of the time users loop at the First Beat.
@@ -398,7 +406,7 @@ class CueStrategy:
                             )
                         else:
                             snap_beat = bg.ms_to_beat(region_ms)
-                            bar_beat = ((snap_beat - 1) // 4) * 4 + 1
+                            bar_beat = max(bg.first_downbeat_beat, bg.bar_start_beat(snap_beat))
                             positions["C"] = bg.beat_to_ms(bar_beat)
                             confidence["C"] = 0.8
                             notes.append(

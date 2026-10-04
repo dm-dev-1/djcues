@@ -7,14 +7,39 @@ from dataclasses import dataclass
 
 @dataclass
 class BeatGrid:
-    """Beat timing derived from BPM and first beat position."""
+    """Beat timing derived from BPM and first beat position.
+
+    Beat numbers are 1-indexed positions in Rekordbox's beat grid, so
+    beat 1 is the grid's FIRST beat -- which is not necessarily a
+    downbeat. Rekordbox grids often start mid-bar (on beat 2, 3 or 4 of
+    a bar; 169 of 624 gridded tracks in the real library). Rekordbox's
+    own bar counter starts at "1.1", the first grid beat whose
+    beat-in-bar is 1: first_downbeat_beat is that beat's number, and
+    every bar-level calculation (pad A, bar snapping, bar numbering)
+    must count from it, not from beat 1. Verified against the real
+    library: 94% of PSSI phrase starts fall on this downbeat phase, vs.
+    6% on the first-grid-beat phase.
+    """
 
     first_beat_ms: float
     bpm: float
+    first_downbeat_beat: int = 1
 
     @property
     def ms_per_beat(self) -> float:
         return 60_000 / self.bpm
+
+    @property
+    def bar_one_ms(self) -> float:
+        """Position of Rekordbox's bar 1.1 (the first downbeat)."""
+        return self.beat_to_ms(self.first_downbeat_beat)
+
+    def bar_start_beat(self, beat: int) -> int:
+        """Beat number of the start of the bar containing `beat`, with
+        bars counted from 1.1. Can be < first_downbeat_beat (even < 1)
+        for a beat in the lead-in before 1.1 -- callers clamp."""
+        offset = beat - self.first_downbeat_beat
+        return self.first_downbeat_beat + (offset // 4) * 4
 
     def beat_to_ms(self, beat: int) -> float:
         """Convert a 1-indexed beat number to milliseconds."""

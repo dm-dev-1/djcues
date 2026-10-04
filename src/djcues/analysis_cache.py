@@ -171,6 +171,12 @@ def fingerprint_track_analysis(track: Track) -> str:
             else None
         ),
     }
+    # Rekordbox's bar 1.1 moves pad A/B and bar snapping (see BeatGrid).
+    # Only hashed when the grid starts mid-bar, so fingerprints -- and
+    # cached results, including expensive --deep/--agentic ones -- stay
+    # valid for every track whose 1.1 is already the grid's first beat.
+    if track.beat_grid.first_downbeat_beat != 1:
+        payload["first_downbeat_beat"] = track.beat_grid.first_downbeat_beat
     return _hash(payload)
 
 
