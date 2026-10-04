@@ -51,6 +51,14 @@ from tests.conftest import requires_rekordbox
 # connection, which is the stronger version of what those tests prove.
 REAL_JOB_DEADLINE_S = 60.0
 
+# Socket timeout for every test HTTP request below -- a hang guard only,
+# never a latency assertion (tests that care about speed, like the
+# dashboard responsiveness ones, measure elapsed time explicitly). Was a
+# hard-coded 5s: TestAudioTranscode once timed out at 5s during a full
+# run that took 25m vs the usual ~3m (machine under heavy concurrent
+# load), while the same request measured <=63ms over 300 isolated runs.
+HTTP_CLIENT_TIMEOUT_S = 30
+
 
 # ---------------------------------------------------------------------------
 # Minimal stdlib HTTP client helpers
@@ -77,7 +85,7 @@ def _request(method: str, url: str, body: dict | None = None) -> tuple[int, dict
         if data is not None:
             req.add_header("Content-Type", "application/json")
         try:
-            resp: HTTPResponse = urllib.request.urlopen(req, timeout=5)
+            resp: HTTPResponse = urllib.request.urlopen(req, timeout=HTTP_CLIENT_TIMEOUT_S)
             status = resp.status
             raw = resp.read()
             break
@@ -106,13 +114,13 @@ def _post(url: str, body: dict | None = None) -> tuple[int, dict]:
 
 
 def _get_headers(url: str) -> dict[str, str]:
-    resp = urllib.request.urlopen(url, timeout=5)
+    resp = urllib.request.urlopen(url, timeout=HTTP_CLIENT_TIMEOUT_S)
     return dict(resp.headers.items())
 
 
 def _options_headers(url: str) -> tuple[int, dict[str, str]]:
     req = urllib.request.Request(url, method="OPTIONS")
-    resp = urllib.request.urlopen(req, timeout=5)
+    resp = urllib.request.urlopen(req, timeout=HTTP_CLIENT_TIMEOUT_S)
     return resp.status, dict(resp.headers.items())
 
 
@@ -229,13 +237,13 @@ class TestReviewHandlerGet:
         assert status == 200
 
         req = urllib.request.Request(f"{base_url}/")
-        resp = urllib.request.urlopen(req, timeout=5)
+        resp = urllib.request.urlopen(req, timeout=HTTP_CLIENT_TIMEOUT_S)
         assert resp.headers["Content-Type"] == "text/html; charset=utf-8"
         assert b"review page" in resp.read()
 
     def test_index_html_serves_same_page(self, review_server):
         base_url, _session_path, _pads = review_server
-        resp = urllib.request.urlopen(f"{base_url}/index.html", timeout=5)
+        resp = urllib.request.urlopen(f"{base_url}/index.html", timeout=HTTP_CLIENT_TIMEOUT_S)
         assert resp.status == 200
         assert b"review page" in resp.read()
 
@@ -492,7 +500,7 @@ class TestReviewHandlerPostRouting:
 class TestAuthSetupHandlerGet:
     def test_root_serves_html_body(self, auth_server):
         base_url, _server = auth_server
-        resp = urllib.request.urlopen(f"{base_url}/", timeout=5)
+        resp = urllib.request.urlopen(f"{base_url}/", timeout=HTTP_CLIENT_TIMEOUT_S)
         assert resp.status == 200
         assert resp.headers["Content-Type"] == "text/html; charset=utf-8"
         assert resp.read() == b"<html><body>auth setup</body></html>"
@@ -745,7 +753,7 @@ def _get_raw(url: str, headers: dict | None = None) -> tuple[int, dict, bytes]:
     JSON-parsing the body -- needed for the binary audio endpoint."""
     req = urllib.request.Request(url, headers=headers or {})
     try:
-        resp = urllib.request.urlopen(req, timeout=5)
+        resp = urllib.request.urlopen(req, timeout=HTTP_CLIENT_TIMEOUT_S)
         return resp.status, dict(resp.headers.items()), resp.read()
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers.items()), e.read()
@@ -1150,7 +1158,7 @@ class TestDbWorker:
 class TestDashboardHandlerGet:
     def test_index_serves_html_body(self, dashboard_server):
         base_url, _server = dashboard_server
-        resp = urllib.request.urlopen(base_url + "/", timeout=5)
+        resp = urllib.request.urlopen(base_url + "/", timeout=HTTP_CLIENT_TIMEOUT_S)
         assert resp.status == 200
         assert b"dashboard shell" in resp.read()
 
