@@ -4,8 +4,9 @@ and a per-track cache of ANLZ-derived features.
 Stored at ~/.djcues/tags.db using plain sqlite3, mirroring history.py's
 and analysis_cache.py's convention exactly (deliberately outside
 pyrekordbox's own SQLAlchemy engine, and outside this repo's OneDrive-
-synced checkout). Phase 2 adds the tag ledger (what djcues wrote, what
-the user overrode) to this same database.
+synced checkout), plus the tag ledger: what djcues last wrote to
+Rekordbox for each (track, category), and every time a later apply found
+the user had changed it by hand.
 
 A plain, honest store: I/O errors propagate. Callers (the `tags` CLI
 commands) decide what a cache failure means.
@@ -35,6 +36,22 @@ CREATE TABLE IF NOT EXISTS track_features (
     fingerprint TEXT NOT NULL,
     features_json TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS tag_ledger (
+    track_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    written_at TEXT NOT NULL,
+    PRIMARY KEY (track_id, category)
+);
+CREATE TABLE IF NOT EXISTS tag_overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    track_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    written_json TEXT NOT NULL,
+    found_json TEXT NOT NULL,
+    proposed_json TEXT NOT NULL,
+    seen_at TEXT NOT NULL
 );
 """
 
@@ -152,3 +169,72 @@ class TagStore:
         self._conn.execute("DELETE FROM track_features")
         self._conn.commit()
         return n
+
+    # --- tag ledger --------------------------------------------------------
+    #
+    # One row per (track, category): the exact set of tag names djcues
+    # last wrote there. An empty set is a real, meaningful entry ("djcues
+    # wrote: nothing"), distinct from no row at all ("djcues has never
+    # touched this"). See tag_apply.decide_category() for how it's used.
+
+    def last_written(self, track_id: str, category: str) -> set[str] | None:
+        row = self._conn.execute(
+            "SELECT tags_json FROM tag_ledger WHERE track_id = ? AND category = ?",
+            (str(track_id), category),
+        ).fetchone()
+        return None if row is None else set(json.loads(row[0]))
+
+    def record_written(self, track_id: str, category: str, tags: set[str], *, commit: bool = True) -> None:
+        self._conn.execute(
+            "INSERT INTO tag_ledger (track_id, category, tags_json, written_at) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(track_id, category) DO UPDATE SET tags_json = excluded.tags_json, "
+            "written_at = excluded.written_at",
+            (str(track_id), category, json.dumps(sorted(tags)), _now()),
+        )
+        if commit:
+            self._conn.commit()
+
+    def forget(self, track_id: str, category: str, *, commit: bool = True) -> None:
+        self._conn.execute(
+            "DELETE FROM tag_ledger WHERE track_id = ? AND category = ?", (str(track_id), category)
+        )
+        if commit:
+            self._conn.commit()
+
+    def ledger_entries(self) -> list[tuple[str, str, set[str]]]:
+        """Every (track_id, category, tags) djcues has written."""
+        rows = self._conn.execute(
+            "SELECT track_id, category, tags_json FROM tag_ledger ORDER BY track_id, category"
+        ).fetchall()
+        return [(r[0], r[1], set(json.loads(r[2]))) for r in rows]
+
+    def record_override(
+        self, track_id: str, category: str, *, written: set[str], found: set[str],
+        proposed: set[str], commit: bool = True,
+    ) -> None:
+        """The user changed what djcues wrote: djcues wrote `written`,
+        Rekordbox now has `found`, and djcues wanted `proposed` -- kept
+        as the feedback signal for tuning thresholds later."""
+        self._conn.execute(
+            "INSERT INTO tag_overrides (track_id, category, written_json, found_json, proposed_json, seen_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (str(track_id), category, json.dumps(sorted(written)), json.dumps(sorted(found)),
+             json.dumps(sorted(proposed)), _now()),
+        )
+        if commit:
+            self._conn.commit()
+
+    def overrides(self) -> list[dict]:
+        rows = self._conn.execute(
+            "SELECT track_id, category, written_json, found_json, proposed_json, seen_at "
+            "FROM tag_overrides ORDER BY id"
+        ).fetchall()
+        return [
+            {"track_id": r[0], "category": r[1], "written": json.loads(r[2]), "found": json.loads(r[3]),
+             "proposed": json.loads(r[4]), "seen_at": r[5]}
+            for r in rows
+        ]
+
+
+def _now() -> str:
+    return datetime.now().replace(microsecond=0).isoformat()

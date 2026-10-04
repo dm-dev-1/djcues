@@ -589,3 +589,122 @@ def reorder_playlist(playlist_id, ordered_content_ids: list, db=None) -> None:
     except Exception:
         db.rollback()
         raise
+
+
+# --- My Tags (smart tagging) ------------------------------------------------
+#
+# Row formats copied from rows Rekordbox itself wrote (the plan's Phase 0
+# snapshot diff), not guessed:
+# - djmdSongMyTag link: ID and UUID are two different uuid4 strings,
+#   TrackNo is NULL, and rb_local_usn comes from the shared
+#   localUpdateCount counter -- which pyrekordbox's commit() assigns to
+#   every row passed through db.add() (same mechanism as the cue writes
+#   above). Tagging a track left its djmdContent row untouched.
+# - djmdMyTag tag: ID is a random integer string above 2^28 (Rekordbox's
+#   own were e.g. '2938978579'), UUID a uuid4, Attribute=0, ParentID the
+#   column ('1'..'4'), Seq the next position in that column.
+# Rekordbox allows exactly 4 columns; djcues repurposes them (see
+# tagging.REKORDBOX_COLUMNS) rather than adding any.
+
+
+class TagWriteError(PlaylistWriteError):
+    """A My Tag write couldn't proceed (missing column, unknown tag...)."""
+
+
+def ensure_tag_columns(db) -> dict[str, str]:
+    """Rename Rekordbox's 4 My Tag columns to djcues's names and make sure
+    every catalog tag exists in its column. Stages only -- the caller
+    commits. Returns {tag name: My Tag ID}.
+
+    Never removes anything: Rekordbox's default tags (and any the user
+    created) stay where they are.
+    """
+    from pyrekordbox.db6 import tables
+
+    from djcues.tagging import REKORDBOX_COLUMNS, TAG_CATALOG
+
+    rows = list(db.get_my_tag())
+    by_id = {str(r.ID): r for r in rows}
+    tags_by_name = {cat.name: cat.tags for cat in TAG_CATALOG}
+    ids: dict[str, str] = {}
+
+    for col in REKORDBOX_COLUMNS:
+        column = by_id.get(col.category_id)
+        if column is None or column.Attribute != 1:
+            raise TagWriteError(
+                f"My Tag column {col.category_id} ({col.default_name}) not found in this library"
+            )
+        if column.Name != col.name:
+            column.Name = col.name
+        children = [r for r in rows if str(r.ParentID) == col.category_id and r.Attribute == 0]
+        existing = {r.Name: r for r in children}
+        next_seq = max((r.Seq or 0 for r in children), default=0) + 1
+        for category in col.categories:
+            for tag in tags_by_name[category]:
+                row = existing.get(tag)
+                if row is None:
+                    row = tables.DjmdMyTag.create(
+                        ID=str(db.generate_unused_id(tables.DjmdMyTag, is_28_bit=False)),
+                        Seq=next_seq,
+                        Name=tag,
+                        Attribute=0,
+                        ParentID=col.category_id,
+                        UUID=str(uuid4()),
+                    )
+                    db.add(row)
+                    db.flush()  # so the next generate_unused_id() sees this ID as taken
+                    next_seq += 1
+                    existing[tag] = row
+                ids[tag] = str(row.ID)
+    return ids
+
+
+def apply_tag_changes(changes: list[dict], *, db=None) -> dict:
+    """Write My Tag changes in ONE transaction: all tracks or none.
+
+    changes: [{"content_id": str, "add": [tag names], "remove_link_ids":
+    [djmdSongMyTag IDs]}]. Checks Rekordbox is closed, backs up
+    master.db, ensures the 4 columns are set up, then adds/removes links.
+    Returns {"added": n, "removed": n, "backup": path}.
+    """
+    from pyrekordbox.db6 import tables
+
+    from djcues.db import get_db
+
+    ensure_rekordbox_closed()
+    db = db if db is not None else get_db()
+
+    # Validate before the backup -- nothing to undo yet if this raises.
+    for change in changes:
+        if db.get_content(ID=change["content_id"]) is None:
+            raise ValueError(f"track {change['content_id']} not found")
+
+    backup_path = backup_database(db.db_directory / "master.db")
+    added = removed = 0
+    try:
+        ids = ensure_tag_columns(db)
+        for change in changes:
+            for link_id in change.get("remove_link_ids", []):
+                link = db.query(tables.DjmdSongMyTag).filter_by(ID=link_id).one_or_none()
+                if link is not None:
+                    db.delete(link)
+                    removed += 1
+            for tag in change.get("add", []):
+                if tag not in ids:
+                    raise TagWriteError(f"unknown tag {tag!r}")
+                db.add(tables.DjmdSongMyTag.create(
+                    ID=str(uuid4()),
+                    MyTagID=ids[tag],
+                    ContentID=str(change["content_id"]),
+                    TrackNo=None,
+                    UUID=str(uuid4()),
+                ))
+                added += 1
+        db.commit()
+    except RuntimeError as e:
+        db.rollback()
+        raise RekordboxRunningError(str(e)) from e
+    except Exception:
+        db.rollback()
+        raise
+    return {"added": added, "removed": removed, "backup": backup_path}

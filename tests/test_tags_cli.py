@@ -16,7 +16,7 @@ from click.testing import CliRunner
 
 from djcues import tag_analysis, tag_store, tags_cli
 from djcues.cli import cli
-from djcues.models import BeatGrid, Phrase, Track, WaveformPoint
+from djcues.models import BeatGrid, Phrase, TagLink, Track, WaveformPoint
 from djcues.tag_store import TagStore
 
 
@@ -316,3 +316,109 @@ def test_spread_indices():
     assert tags_cli._spread_indices(10, 1) == [5]
     assert tags_cli._spread_indices(10, 3) == [0, 4, 9] or tags_cli._spread_indices(10, 3) == [0, 5, 9]
     assert tags_cli._spread_indices(10, 2) == [0, 9]
+
+
+# --- apply / status ----------------------------------------------------------
+
+
+def _write_session(env, runner, *extra):
+    out = env.tmp_path / "session.json"
+    _calibrate(runner)
+    result = runner.invoke(cli, ["tags", "propose", "Mix", "--all", "--out", str(out), *extra])
+    assert result.exit_code == 0, result.output
+    return out
+
+
+@pytest.fixture
+def fake_rekordbox_tags(monkeypatch):
+    """Current links come from a list; writes are captured, not performed."""
+    from djcues import db as db_module
+    from djcues import writer
+
+    state = SimpleNamespace(links=[], writes=[])
+    monkeypatch.setattr(db_module, "read_tag_links", lambda ids=None, db=None: list(state.links))
+    monkeypatch.setattr(
+        writer, "apply_tag_changes",
+        lambda changes, db=None: state.writes.append(changes)
+        or {"added": sum(len(c["add"]) for c in changes), "removed": 0, "backup": "backup.db"},
+    )
+    return state
+
+
+def test_apply_rejects_a_non_tag_session(env, runner):
+    bad = env.tmp_path / "cues.json"
+    bad.write_text(json.dumps({"tracks": {}}), encoding="utf-8")
+    result = runner.invoke(cli, ["tags", "apply", str(bad)])
+    assert result.exit_code == 1 and "not a tag session" in result.output
+
+
+def test_apply_dry_run_shows_the_plan_and_writes_nothing(env, runner, fake_rekordbox_tags):
+    session = _write_session(env, runner)
+    result = runner.invoke(cli, ["tags", "apply", str(session), "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "+Energy 5" in result.output
+    assert "Dry run" in result.output
+    assert fake_rekordbox_tags.writes == []
+    with TagStore() as store:
+        assert store.ledger_entries() == []
+
+
+def test_apply_writes_and_records_the_ledger(env, runner, fake_rekordbox_tags):
+    session = _write_session(env, runner)
+    result = runner.invoke(cli, ["tags", "apply", str(session), "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "Done: 10 tag(s) added" in result.output  # one Energy band per track
+    assert len(fake_rekordbox_tags.writes) == 1
+    with TagStore() as store:
+        assert store.last_written("10", "Energy") == {"Energy 5"}
+
+
+def test_apply_declined_writes_nothing(env, runner, fake_rekordbox_tags):
+    session = _write_session(env, runner)
+    result = runner.invoke(cli, ["tags", "apply", str(session)], input="n\n")
+    assert "Aborted" in result.output
+    assert fake_rekordbox_tags.writes == []
+
+
+def test_apply_leaves_a_user_edit_alone_and_says_so(env, runner, fake_rekordbox_tags):
+    session = _write_session(env, runner)
+    # Before djcues ever wrote anything, the user tagged track 10 themselves.
+    fake_rekordbox_tags.links = [TagLink("L1", "10", "T", "Energy 2", "1")]
+    result = runner.invoke(cli, ["tags", "apply", str(session), "--yes"])
+    assert "left alone (edited in Rekordbox)" in result.output
+    assert all(c["content_id"] != "10" for c in fake_rekordbox_tags.writes[0])
+
+
+def test_apply_reports_a_running_rekordbox_cleanly(env, runner, monkeypatch, fake_rekordbox_tags):
+    from djcues import writer
+
+    def running(changes, db=None):
+        raise writer.RekordboxRunningError("Rekordbox is running. Close it first.")
+
+    monkeypatch.setattr(writer, "apply_tag_changes", running)
+    session = _write_session(env, runner)
+    result = runner.invoke(cli, ["tags", "apply", str(session), "--yes"])
+    assert result.exit_code == 1 and "Rekordbox is running" in result.output
+
+
+def test_status_before_anything_was_written(env, runner):
+    result = runner.invoke(cli, ["tags", "status"])
+    assert "hasn't written any tags yet" in result.output
+
+
+def test_status_after_apply_and_a_user_edit(env, runner, fake_rekordbox_tags):
+    session = _write_session(env, runner)
+    runner.invoke(cli, ["tags", "apply", str(session), "--yes"])
+    # Rekordbox now has what djcues wrote, except the user changed track 10.
+    with TagStore() as store:
+        written = store.ledger_entries()
+    fake_rekordbox_tags.links = [
+        TagLink(f"L{t}", t, "T", next(iter(tags)), "1") for t, c, tags in written if c == "Energy" and tags
+    ]
+    fake_rekordbox_tags.links = [l for l in fake_rekordbox_tags.links if l.content_id != "10"] + [
+        TagLink("Lx", "10", "T", "Energy 1", "1")
+    ]
+    result = runner.invoke(cli, ["tags", "status"])
+    assert result.exit_code == 0, result.output
+    assert "djcues has tagged 10 track(s)" in result.output
+    assert "track 10 [Energy]: djcues wrote ['Energy 5'], now ['Energy 1']" in result.output

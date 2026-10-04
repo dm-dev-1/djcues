@@ -14,6 +14,7 @@ from djcues.models import (
     Phrase,
     PlaylistNode,
     RawBeatGridEntry,
+    TagLink,
     Track,
     TrackSummary,
     WaveformPoint,
@@ -461,3 +462,28 @@ def load_playlist_tracks(playlist_id: int, db: Rekordbox6Database | None = None)
         except Exception as e:
             logger.warning("Skipping track %s: %s", song.Content.Title, e)
     return tracks
+
+
+def read_tag_links(
+    content_ids: list[str] | None = None, db: Rekordbox6Database | None = None
+) -> list[TagLink]:
+    """Every My Tag link in the library (or only for content_ids),
+    joined with its tag's name and column. One query for the links and
+    one for the tags -- the whole library has at most a few thousand
+    links, so filtering in Python is cheaper than a query per track."""
+    db = db if db is not None else get_db()
+    tags = {str(t.ID): t for t in db.get_my_tag()}
+    wanted = {str(c) for c in content_ids} if content_ids is not None else None
+    links: list[TagLink] = []
+    for link in db.get_my_tag_songs():
+        content_id = str(link.ContentID)
+        if wanted is not None and content_id not in wanted:
+            continue
+        tag = tags.get(str(link.MyTagID))
+        if tag is None:
+            continue  # orphaned link to a deleted tag
+        links.append(TagLink(
+            link_id=str(link.ID), content_id=content_id, tag_id=str(tag.ID),
+            tag_name=tag.Name or "", column_id=str(tag.ParentID),
+        ))
+    return links

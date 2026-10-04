@@ -2,10 +2,11 @@
 
 Registered onto the main CLI from cli.py (cli.add_command(tags)); kept in
 its own module so the already-large cli.py doesn't grow by another
-command group. Phase 1 (this file): everything here is read-only with
-respect to Rekordbox -- it only writes to the local ~/.djcues/tags.db
-store (and a session JSON when --out is given). Writing tags into
-Rekordbox is Phase 2 and deliberately not implemented yet.
+command group. Everything except `tags apply` is read-only with respect
+to Rekordbox (it only writes the local ~/.djcues/tags.db store, and a
+session JSON with --out). `tags apply` is the one write path, with the
+same safety model as cue `apply`: Rekordbox closed, master.db backed up
+first, one transaction, and never overwriting a tag the user edited.
 """
 
 from __future__ import annotations
@@ -56,12 +57,13 @@ _SKIP_LABELS = {
 
 @click.group()
 def tags():
-    """Smart tags for set-list building (read-only so far).
+    """Smart tags for set-list building, written to Rekordbox My Tags.
 
     Derives a small vocabulary of per-track tags -- energy band, intro/
     outro length, vocals in the mix-in/mix-out, key/grid warnings -- from
-    analysis djcues already computes. Nothing here writes to Rekordbox
-    yet; `propose` only prints (and optionally saves a session file).
+    analysis djcues already computes. `propose --out` saves a session;
+    `apply` writes it to Rekordbox (repurposing its 4 My Tag columns as
+    Energy / Mix / Vocals / Check). Every other command is read-only.
     """
 
 
@@ -275,7 +277,7 @@ def _grouped_line(track_tags) -> str:
     return "  ·  ".join(parts) if parts else "(no tags)"
 
 
-def _proposal_to_session(proposals, playlist_name, calibration) -> dict:
+def _proposal_to_session(proposals, playlist_name, calibration, categories=None) -> dict:
     tracks = {}
     for p in proposals:
         by_cat: dict[str, list[dict]] = {}
@@ -297,6 +299,9 @@ def _proposal_to_session(proposals, playlist_name, calibration) -> dict:
         "playlist": playlist_name,
         "calibration_id": calibration.id if calibration else None,
         "thresholds": asdict(DEFAULT_THRESHOLDS),
+        # Which categories this session evaluated: apply only ever touches
+        # these, so a --categories run can't clear the others.
+        "categories": list(categories) if categories else list(CATEGORY_NAMES),
         "tracks": tracks,
     }
 
@@ -378,7 +383,7 @@ def tags_propose(playlist_name, track_name, all_tracks, categories, evidence, ou
     ))
 
     if out_path:
-        session = _proposal_to_session(proposals, playlist_name, calibration)
+        session = _proposal_to_session(proposals, playlist_name, calibration, wanted)
         Path(out_path).write_text(json.dumps(session, indent=2), encoding="utf-8")
         click.echo(f"  Saved session: {out_path}  (nothing has been written to Rekordbox)")
 
@@ -442,3 +447,115 @@ def tags_sample(tag, count, playlist_name):
     for idx in _spread_indices(len(matching), count):
         p, d = matching[idx]
         click.echo(f"\n  {p.title} — {p.artist}\n      {d.evidence}")
+
+
+def _plan_line(plan) -> str:
+    parts = []
+    for c in plan.changes():
+        parts += [f"+{t}" for t in sorted(c.add)] + [f"-{t}" for t in sorted(c.remove)]
+    return "  ".join(parts)
+
+
+@tags.command("apply")
+@click.argument("session_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--dry-run", is_flag=True, help="Show exactly what would change without writing anything.")
+@click.option("--force", is_flag=True,
+              help="Also overwrite categories you've changed by hand in Rekordbox (normally left alone).")
+@click.option("--yes", "-y", is_flag=True, help="Skip the confirmation prompt.")
+def tags_apply(session_file, dry_run, force, yes):
+    """Write a tag session (from `tags propose --out`) to Rekordbox My Tags.
+
+    Rekordbox must be closed; master.db is backed up first and everything
+    is written in one transaction. Only djcues's own tags are touched --
+    and if you've changed a category by hand in Rekordbox since djcues
+    wrote it, that category is left alone (use --force to overwrite).
+    Exclude a track or tag by setting its "status" to "skipped" in the
+    session file.
+    """
+    from djcues.db import read_tag_links
+    from djcues.tag_apply import apply_plans, plan_session
+    from djcues.writer import PlaylistWriteError
+
+    session = json.loads(Path(session_file).read_text(encoding="utf-8"))
+    if session.get("kind") != "tags":
+        click.echo("Error: not a tag session file (expected one saved by `djcues tags propose --out`).", err=True)
+        raise SystemExit(1)
+
+    db = get_db()
+    links = read_tag_links(list(session.get("tracks", {})), db=db)
+    with TagStore() as store:
+        plans = plan_session(session, links, store, force=force)
+        changing = [p for p in plans if p.changes()]
+        edited = [(p, c) for p in plans for c in p.categories if c.action == "user_edited"]
+        forced = [(p, c) for p in plans for c in p.categories if c.forced]
+        n_add = sum(len(c.add) for p in changing for c in p.changes())
+        n_remove = sum(len(c.remove) for p in changing for c in p.changes())
+
+        click.echo(f"Session: {Path(session_file).name} ({session.get('playlist')}, {len(plans)} track(s))")
+        for p in changing:
+            click.echo(f"  {p.title[:50]:<50s} {_plan_line(p)}")
+        for p, c in edited:
+            click.echo(
+                f"  left alone (edited in Rekordbox): {p.title[:40]} [{c.category}] "
+                f"has {sorted(c.current) or 'nothing'}, djcues wrote {sorted(c.written or ()) or 'nothing'}"
+            )
+        for p, c in forced:
+            click.echo(f"  overwriting your edit (--force): {p.title[:40]} [{c.category}]")
+        click.echo(f"\n  {len(changing)} track(s) to change: {n_add} tag(s) added, {n_remove} removed; "
+                   f"{len(edited)} category edit(s) of yours left alone.")
+
+        if dry_run:
+            click.echo("Dry run -- nothing written.")
+            return
+        if not changing and not edited and not forced:
+            click.echo("Nothing to change.")
+            return
+        if changing and not yes and not click.confirm(
+            "\nWrite these tags to Rekordbox? (Rekordbox must be closed; master.db is backed up first)"
+        ):
+            click.echo("Aborted.")
+            return
+
+        try:
+            result = apply_plans(plans, store, db=db)
+        except (PlaylistWriteError, ValueError) as e:
+            click.echo(f"Error: {e}", err=True)
+            raise SystemExit(1)
+
+    if result.get("backup"):
+        click.echo(f"Backup: {result['backup']}")
+    click.echo(f"Done: {result['added']} tag(s) added, {result['removed']} removed.")
+
+
+@tags.command("status")
+def tags_status():
+    """What djcues has written to Rekordbox, and where you've changed it since."""
+    from djcues.db import read_tag_links
+    from djcues.tag_apply import current_tags_by_category
+
+    with TagStore() as store:
+        entries = store.ledger_entries()
+        overrides = store.overrides()
+    if not entries:
+        click.echo("djcues hasn't written any tags yet (see `djcues tags propose --out` then `tags apply`).")
+        return
+
+    tracks = {t for t, _c, _tags in entries}
+    counts: Counter[str] = Counter(tag for _t, _c, tags in entries for tag in tags)
+    click.echo(f"\ndjcues has tagged {len(tracks)} track(s):")
+    for cat in TAG_CATALOG:
+        line = "  ".join(f"{t}={counts[t]}" for t in cat.tags if counts[t])
+        if line:
+            click.echo(f"  {cat.name:<8s} {line}")
+
+    current = current_tags_by_category(read_tag_links(list(tracks), db=get_db()))
+    drift = [(t, c, tags, current.get(t, {}).get(c, set())) for t, c, tags in entries
+             if current.get(t, {}).get(c, set()) != tags]
+    if drift:
+        click.echo(f"\n  {len(drift)} category(ies) changed in Rekordbox since djcues wrote them "
+                   "(kept as-is on the next apply unless --force):")
+        for t, c, wrote, now in drift[:20]:
+            click.echo(f"    track {t} [{c}]: djcues wrote {sorted(wrote) or 'nothing'}, now {sorted(now) or 'nothing'}")
+    if overrides:
+        by_cat = Counter(o["category"] for o in overrides)
+        click.echo(f"\n  Overrides logged so far: " + ", ".join(f"{c}={n}" for c, n in sorted(by_cat.items())))

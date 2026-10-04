@@ -327,3 +327,16 @@ class TrackSummary:
     # note (e.g. "2A - 118"), which can disagree with the actual bpm/key
     # above. See audit.parse_comment_hint.
     comment: str | None = None
+
+
+@dataclass(frozen=True)
+class TagLink:
+    """One track-to-My-Tag link as stored in Rekordbox (djmdSongMyTag),
+    joined with the tag it points at (djmdMyTag). column_id is the tag's
+    parent column ("category" in Rekordbox's schema, '1'..'4')."""
+
+    link_id: str
+    content_id: str
+    tag_id: str
+    tag_name: str
+    column_id: str

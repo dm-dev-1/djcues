@@ -80,6 +80,53 @@ TAG_CATALOG: tuple[CategorySpec, ...] = (
 CATEGORY_NAMES: tuple[str, ...] = tuple(c.name for c in TAG_CATALOG)
 
 
+@dataclass(frozen=True)
+class RekordboxColumn:
+    """One of Rekordbox's My Tag columns ("categories" in its database).
+
+    Rekordbox allows exactly 4 columns -- confirmed by trying to add a
+    5th in the real app (refused) -- and every library starts with the
+    same 4, whose IDs are fixed seeds '1'..'4'. djcues therefore
+    repurposes those 4 (user's choice) rather than adding its own:
+    `categories` are the logical tag categories above stored in each
+    column. Mix In and Mix Out share one column but stay separate
+    logical categories, so rules, stats and single-select semantics
+    don't change -- only where the tags live in Rekordbox.
+    """
+
+    category_id: str
+    default_name: str
+    name: str
+    categories: tuple[str, ...]
+
+
+REKORDBOX_COLUMNS: tuple[RekordboxColumn, ...] = (
+    RekordboxColumn("1", "Genre", "Energy", ("Energy",)),
+    RekordboxColumn("2", "Components", "Mix", ("Mix In", "Mix Out")),
+    RekordboxColumn("3", "Situation", "Vocals", ("Vocals",)),
+    RekordboxColumn("4", "Untitled Column", "Check", ("Check",)),
+)
+
+# The tags Rekordbox ships in each column (read from the real library's
+# untouched template). Only these are ever candidates for removal when a
+# column is repurposed, and only while no track uses them -- a tag the
+# user created, or any tag with a track on it, is never removed.
+REKORDBOX_DEFAULT_TAGS: dict[str, tuple[str, ...]] = {
+    "1": ("Acid House", "Deep House", "Techno", "Nu Disco", "Electro House", "Bass Music", "Trap"),
+    "2": ("Synth", "Vocal", "Beat", "Sub Bass", "Percussion", "Piano", "Dark", "Upper"),
+    "3": ("Main Floor", "Second Floor", "Lounge", "Mid Night", "Morning", "Build up", "Peak Time", "Build down"),
+    "4": ("My Comment",),
+}
+
+
+def column_for(category: str) -> RekordboxColumn:
+    """The Rekordbox column a logical category's tags are stored in."""
+    for col in REKORDBOX_COLUMNS:
+        if category in col.categories:
+            return col
+    raise KeyError(category)
+
+
 def category_of(tag: str) -> str | None:
     """The catalog category a tag name belongs to, or None."""
     for cat in TAG_CATALOG:
