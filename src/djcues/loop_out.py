@@ -24,6 +24,11 @@ from djcues.models import Track
 from djcues.strategy import _spectral_similarity, find_vocal_regions, regions_overlapping
 
 
+# Measured on the real library: the bass (red) channel runs 0-14 in steps of
+# 2, while mids (green) and treble (blue) run 0-7.
+_RED_MAX = 14
+
+
 @dataclass(frozen=True)
 class LoopOutThresholds:
     """Untuned starting points -- tune from listening, not from guesses."""
@@ -54,7 +59,7 @@ def _bar_score(points: list) -> float:
     n = len(points)
     if n == 0:
         return 0.0
-    bass = sum(p.red for p in points) / n / 7
+    bass = sum(p.red for p in points) / n / _RED_MAX
     mid = sum(p.green for p in points) / n / 7
     treble = sum(p.blue for p in points) / n / 7
     height = sum(p.height for p in points) / n
